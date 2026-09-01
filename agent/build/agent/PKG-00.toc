@@ -1,0 +1,176 @@
+('C:\\Users\\Matheus '
+ 'Augusto\\Documents\\mike-monitor\\minimal-monitor\\agent\\build\\agent\\agent.pkg',
+ {'BINARY': True,
+  'DATA': True,
+  'EXECUTABLE': True,
+  'EXTENSION': True,
+  'PYMODULE': True,
+  'PYSOURCE': True,
+  'PYZ': False,
+  'SPLASH': True,
+  'SYMLINK': False},
+ [('pyi-contents-directory _internal', '', 'OPTION'),
+  ('PYZ-00.pyz',
+   'C:\\Users\\Matheus '
+   'Augusto\\Documents\\mike-monitor\\minimal-monitor\\agent\\build\\agent\\PYZ-00.pyz',
+   'PYZ'),
+  ('struct',
+   'C:\\Users\\Matheus '
+   'Augusto\\Documents\\mike-monitor\\minimal-monitor\\agent\\build\\agent\\localpycs\\struct.pyc',
+   'PYMODULE'),
+  ('pyimod01_archive',
+   'C:\\Users\\Matheus '
+   'Augusto\\Documents\\mike-monitor\\minimal-monitor\\agent\\build\\agent\\localpycs\\pyimod01_archive.pyc',
+   'PYMODULE'),
+  ('pyimod02_importers',
+   'C:\\Users\\Matheus '
+   'Augusto\\Documents\\mike-monitor\\minimal-monitor\\agent\\build\\agent\\localpycs\\pyimod02_importers.pyc',
+   'PYMODULE'),
+  ('pyimod03_ctypes',
+   'C:\\Users\\Matheus '
+   'Augusto\\Documents\\mike-monitor\\minimal-monitor\\agent\\build\\agent\\localpycs\\pyimod03_ctypes.pyc',
+   'PYMODULE'),
+  ('pyimod04_pywin32',
+   'C:\\Users\\Matheus '
+   'Augusto\\Documents\\mike-monitor\\minimal-monitor\\agent\\build\\agent\\localpycs\\pyimod04_pywin32.pyc',
+   'PYMODULE'),
+  ('pyiboot01_bootstrap',
+   'C:\\Users\\Matheus '
+   'Augusto\\AppData\\Local\\Python\\pythoncore-3.14-64\\Lib\\site-packages\\PyInstaller\\loader\\pyiboot01_bootstrap.py',
+   'PYSOURCE'),
+  ('pyi_rth_inspect',
+   'C:\\Users\\Matheus '
+   'Augusto\\AppData\\Local\\Python\\pythoncore-3.14-64\\Lib\\site-packages\\PyInstaller\\hooks\\rthooks\\pyi_rth_inspect.py',
+   'PYSOURCE'),
+  ('pyi_rth_pywintypes',
+   'C:\\Users\\Matheus '
+   'Augusto\\AppData\\Local\\Python\\pythoncore-3.14-64\\Lib\\site-packages\\_pyinstaller_hooks_contrib\\rthooks\\pyi_rth_pywintypes.py',
+   'PYSOURCE'),
+  ('pyi_rth_pythoncom',
+   'C:\\Users\\Matheus '
+   'Augusto\\AppData\\Local\\Python\\pythoncore-3.14-64\\Lib\\site-packages\\_pyinstaller_hooks_contrib\\rthooks\\pyi_rth_pythoncom.py',
+   'PYSOURCE'),
+  ('agent',
+   'C:\\Users\\Matheus '
+   'Augusto\\Documents\\mike-monitor\\minimal-monitor\\agent\\agent.py',
+   'PYSOURCE'),
+  ('python314.dll',
+   'C:\\Users\\Matheus '
+   'Augusto\\AppData\\Local\\Python\\pythoncore-3.14-64\\python314.dll',
+   'BINARY'),
+  ('pywin32_system32\\pywintypes314.dll',
+   'C:\\Users\\Matheus '
+   'Augusto\\AppData\\Local\\Python\\pythoncore-3.14-64\\Lib\\site-packages\\pywin32_system32\\pywintypes314.dll',
+   'BINARY'),
+  ('pywin32_system32\\pythoncom314.dll',
+   'C:\\Users\\Matheus '
+   'Augusto\\AppData\\Local\\Python\\pythoncore-3.14-64\\Lib\\site-packages\\pywin32_system32\\pythoncom314.dll',
+   'BINARY'),
+  ('_decimal.pyd',
+   'C:\\Users\\Matheus '
+   'Augusto\\AppData\\Local\\Python\\pythoncore-3.14-64\\DLLs\\_decimal.pyd',
+   'EXTENSION'),
+  ('_hashlib.pyd',
+   'C:\\Users\\Matheus '
+   'Augusto\\AppData\\Local\\Python\\pythoncore-3.14-64\\DLLs\\_hashlib.pyd',
+   'EXTENSION'),
+  ('unicodedata.pyd',
+   'C:\\Users\\Matheus '
+   'Augusto\\AppData\\Local\\Python\\pythoncore-3.14-64\\DLLs\\unicodedata.pyd',
+   'EXTENSION'),
+  ('_zstd.pyd',
+   'C:\\Users\\Matheus '
+   'Augusto\\AppData\\Local\\Python\\pythoncore-3.14-64\\DLLs\\_zstd.pyd',
+   'EXTENSION'),
+  ('_lzma.pyd',
+   'C:\\Users\\Matheus '
+   'Augusto\\AppData\\Local\\Python\\pythoncore-3.14-64\\DLLs\\_lzma.pyd',
+   'EXTENSION'),
+  ('_bz2.pyd',
+   'C:\\Users\\Matheus '
+   'Augusto\\AppData\\Local\\Python\\pythoncore-3.14-64\\DLLs\\_bz2.pyd',
+   'EXTENSION'),
+  ('select.pyd',
+   'C:\\Users\\Matheus '
+   'Augusto\\AppData\\Local\\Python\\pythoncore-3.14-64\\DLLs\\select.pyd',
+   'EXTENSION'),
+  ('_ctypes.pyd',
+   'C:\\Users\\Matheus '
+   'Augusto\\AppData\\Local\\Python\\pythoncore-3.14-64\\DLLs\\_ctypes.pyd',
+   'EXTENSION'),
+  ('_ssl.pyd',
+   'C:\\Users\\Matheus '
+   'Augusto\\AppData\\Local\\Python\\pythoncore-3.14-64\\DLLs\\_ssl.pyd',
+   'EXTENSION'),
+  ('win32\\_win32sysloader.pyd',
+   'C:\\Users\\Matheus '
+   'Augusto\\AppData\\Local\\Python\\pythoncore-3.14-64\\Lib\\site-packages\\win32\\_win32sysloader.pyd',
+   'EXTENSION'),
+  ('win32\\win32api.pyd',
+   'C:\\Users\\Matheus '
+   'Augusto\\AppData\\Local\\Python\\pythoncore-3.14-64\\Lib\\site-packages\\win32\\win32api.pyd',
+   'EXTENSION'),
+  ('pythonwin\\win32ui.pyd',
+   'C:\\Users\\Matheus '
+   'Augusto\\AppData\\Local\\Python\\pythoncore-3.14-64\\Lib\\site-packages\\pythonwin\\win32ui.pyd',
+   'EXTENSION'),
+  ('win32\\win32event.pyd',
+   'C:\\Users\\Matheus '
+   'Augusto\\AppData\\Local\\Python\\pythoncore-3.14-64\\Lib\\site-packages\\win32\\win32event.pyd',
+   'EXTENSION'),
+  ('win32\\win32trace.pyd',
+   'C:\\Users\\Matheus '
+   'Augusto\\AppData\\Local\\Python\\pythoncore-3.14-64\\Lib\\site-packages\\win32\\win32trace.pyd',
+   'EXTENSION'),
+  ('_zoneinfo.pyd',
+   'C:\\Users\\Matheus '
+   'Augusto\\AppData\\Local\\Python\\pythoncore-3.14-64\\DLLs\\_zoneinfo.pyd',
+   'EXTENSION'),
+  ('psutil\\_psutil_windows.pyd',
+   'C:\\Users\\Matheus '
+   'Augusto\\AppData\\Local\\Python\\pythoncore-3.14-64\\Lib\\site-packages\\psutil\\_psutil_windows.pyd',
+   'EXTENSION'),
+  ('_socket.pyd',
+   'C:\\Users\\Matheus '
+   'Augusto\\AppData\\Local\\Python\\pythoncore-3.14-64\\DLLs\\_socket.pyd',
+   'EXTENSION'),
+  ('_wmi.pyd',
+   'C:\\Users\\Matheus '
+   'Augusto\\AppData\\Local\\Python\\pythoncore-3.14-64\\DLLs\\_wmi.pyd',
+   'EXTENSION'),
+  ('VCRUNTIME140.dll',
+   'C:\\Users\\Matheus '
+   'Augusto\\AppData\\Local\\Python\\pythoncore-3.14-64\\VCRUNTIME140.dll',
+   'BINARY'),
+  ('VCRUNTIME140_1.dll',
+   'C:\\Users\\Matheus '
+   'Augusto\\AppData\\Local\\Python\\pythoncore-3.14-64\\VCRUNTIME140_1.dll',
+   'BINARY'),
+  ('libcrypto-3.dll',
+   'C:\\Users\\Matheus '
+   'Augusto\\AppData\\Local\\Python\\pythoncore-3.14-64\\DLLs\\libcrypto-3.dll',
+   'BINARY'),
+  ('libffi-8.dll',
+   'C:\\Users\\Matheus '
+   'Augusto\\AppData\\Local\\Python\\pythoncore-3.14-64\\DLLs\\libffi-8.dll',
+   'BINARY'),
+  ('libssl-3.dll',
+   'C:\\Users\\Matheus '
+   'Augusto\\AppData\\Local\\Python\\pythoncore-3.14-64\\DLLs\\libssl-3.dll',
+   'BINARY'),
+  ('python3.dll',
+   'C:\\Users\\Matheus '
+   'Augusto\\AppData\\Local\\Python\\pythoncore-3.14-64\\python3.dll',
+   'BINARY'),
+  ('base_library.zip',
+   'C:\\Users\\Matheus '
+   'Augusto\\Documents\\mike-monitor\\minimal-monitor\\agent\\build\\agent\\base_library.zip',
+   'DATA')],
+ 'python314.dll',
+ False,
+ False,
+ False,
+ [],
+ None,
+ None,
+ None)

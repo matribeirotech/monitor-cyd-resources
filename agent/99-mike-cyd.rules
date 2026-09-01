@@ -1,0 +1,16 @@
+# Regra udev: da acesso a porta serial da CYD sem precisar de root
+# e cria o link fixo /dev/mike
+#
+# Instalar:
+#   sudo cp 99-mike-cyd.rules /etc/udev/rules.d/
+#   sudo udevadm control --reload-rules && sudo udevadm trigger
+#
+# Depois disso tambem vale adicionar seu usuario ao grupo dialout:
+#   sudo usermod -aG dialout $USER      (e fazer logout/login)
+
+# CH340
+SUBSYSTEM=="tty", ATTRS{idVendor}=="1a86", ATTRS{idProduct}=="7523", MODE="0666", GROUP="dialout", SYMLINK+="mike"
+# CH9102
+SUBSYSTEM=="tty", ATTRS{idVendor}=="1a86", ATTRS{idProduct}=="55d4", MODE="0666", GROUP="dialout", SYMLINK+="mike"
+# CP2102
+SUBSYSTEM=="tty", ATTRS{idVendor}=="10c4", ATTRS{idProduct}=="ea60", MODE="0666", GROUP="dialout", SYMLINK+="mike"

@@ -1,0 +1,786 @@
+#!/usr/bin/env python3
+"""
+mike_agent.py - Agente de telemetria do PC (Linux ou Windows) para o CYD
+"Mike Monitor".
+
+Le CPU / GPU / RAM / disco / rede / temperaturas e envia uma linha JSON por
+segundo pela porta serial USB do ESP32.
+
+Uso:
+    python3 mike_agent.py                  # auto-detecta a porta
+    python3 mike_agent.py -p /dev/ttyUSB0  # porta fixa (Linux)
+    python3 mike_agent.py -p COM5          # porta fixa (Windows)
+    python3 mike_agent.py --stdout         # so imprime o JSON (teste)
+    python3 mike_agent.py --once           # uma amostra e sai
+
+Requisitos: pip install -r requirements.txt (pyserial, psutil; no Windows
+tambem puxa wmi + pywin32, opcionais -- ver README, secao "Windows").
+"""
+
+import argparse
+import json
+import os
+import platform
+import re
+import shutil
+import socket
+import subprocess
+import sys
+import threading
+import time
+from collections import deque
+from datetime import datetime, timedelta, timezone
+
+IS_WINDOWS = platform.system() == "Windows"
+
+try:
+    import psutil
+except ImportError:
+    sys.exit("Faltando psutil. Rode: pip install psutil pyserial")
+
+BAUD = 115200
+INTERVAL = 1.0
+
+# Relogio sempre em horario de Brasilia, independente do fuso do PC que roda
+# o agente. Usa zoneinfo (stdlib) quando o SO tem a base IANA disponivel;
+# senao cai para o offset fixo -03:00 (Brasil aboliu o horario de verao em
+# 2019, entao America/Sao_Paulo e' sempre UTC-3).
+try:
+    from zoneinfo import ZoneInfo
+    TZ_BRASILIA = ZoneInfo("America/Sao_Paulo")
+except Exception:
+    TZ_BRASILIA = timezone(timedelta(hours=-3))
+
+
+def brasilia_now():
+    return datetime.now(TZ_BRASILIA)
+
+# VID:PID dos conversores USB-serial usados nas placas CYD
+KNOWN_USB_IDS = {
+    (0x1A86, 0x7523),  # CH340
+    (0x1A86, 0x55D4),  # CH9102
+    (0x10C4, 0xEA60),  # CP2102
+    (0x0403, 0x6001),  # FT232
+}
+
+# "modo game": nome de processo (substring, case-insensitive) que faz o Mike
+# trocar pra tela de jogo. So' emuladores/executaveis de jogo aqui de proposito
+# -- launchers genericos (Steam, Lutris, Heroic...) ficam de fora: eles passam
+# a maior parte do tempo abertos sem nenhum jogo em andamento (o processo de
+# UI da Steam, por exemplo, roda o tempo todo so' com o cliente aberto), entao
+# um nome de launcher aqui deixava o modo game ligado o tempo inteiro por
+# engano. Jogo rodando *pela* Steam e' detectado a parte, pelo caminho do
+# executavel -- ver _is_steam_game(). Complete a lista com --game-proc.
+DEFAULT_GAME_PROCESSES = (
+    "pcsx2", "rpcs3", "dolphin-emu", "yuzu", "ryujinx", "cemu", "citra",
+    "ppsspp", "duckstation", "mupen64plus", "retroarch", "xemu",
+)
+
+
+def _is_steam_game(exe_path):
+    """Um jogo de verdade instalado pela Steam mora em .../steamapps/common/...
+    -- ao contrario do cliente da Steam em si (Steam.exe/steamwebhelper), que
+    roda de outro diretorio e fica aberto o tempo todo, com ou sem jogo."""
+    if not exe_path:
+        return False
+    return "steamapps/common" in exe_path.replace("\\", "/").lower()
+
+
+# --------------------------------------------------------------- helpers ----
+def run(cmd, timeout=2):
+    try:
+        out = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout)
+        return out.stdout.strip() if out.returncode == 0 else None
+    except Exception:
+        return None
+
+
+def read_int(path):
+    try:
+        with open(path) as f:
+            return int(f.read().strip())
+    except Exception:
+        return None
+
+
+# raiz do disco a medir: "/" no Linux, a unidade do sistema (normalmente
+# "C:\") no Windows -- os.path.abspath(os.sep) resolve os dois sozinho
+SYSTEM_ROOT = os.path.abspath(os.sep)
+
+
+def load_average():
+    """Media de carga (1 min). So' existe em Unix -- Windows nao tem esse
+    conceito, entao a metrica fica ausente por la (igual outro sensor que
+    falte), em vez de derrubar o agente."""
+    try:
+        return round(os.getloadavg()[0], 2)
+    except (OSError, AttributeError):
+        return None
+
+
+# ------------------------------------- sensores no Windows (LibreHardwareMonitor) ---
+# O Windows nao tem hwmon/sysfs, entao psutil.sensors_temperatures()/sensors_fans()
+# simplesmente nao existem la (viram AttributeError, ja tratado abaixo). Se o
+# LibreHardwareMonitor -- ou o antigo OpenHardwareMonitor -- estiver rodando
+# como administrador com "Remote Web Server"/WMI habilitado (ligado por padrao),
+# o agente completa temperatura, fan e GPU lendo o WMI dele. Precisa do pacote
+# `wmi` (so' instala no Windows, ver requirements.txt); sem isso, ou sem o
+# programa rodando, essas metricas ficam ausentes -- igual quando falta
+# lm-sensors no Linux, o resto do agente funciona normal.
+_lhm = None
+_lhm_tried = False
+
+
+def _lhm_connect():
+    global _lhm, _lhm_tried
+    if _lhm_tried:
+        return _lhm
+    _lhm_tried = True
+    if not IS_WINDOWS:
+        return None
+    try:
+        import wmi
+    except ImportError:
+        return None
+    for ns in ("LibreHardwareMonitor", "OpenHardwareMonitor"):
+        try:
+            w = wmi.WMI(namespace=f"root/{ns}")
+            w.Sensor()  # confere se o namespace responde de verdade
+            _lhm = w
+            break
+        except Exception:
+            continue
+    return _lhm
+
+
+def _lhm_sensors(kind):
+    """Sensores WMI do LibreHardwareMonitor de um tipo: Temperature/Load/Fan/Power."""
+    w = _lhm_connect()
+    if not w:
+        return []
+    try:
+        return [s for s in w.Sensor() if s.SensorType == kind]
+    except Exception:
+        return []
+
+
+# ------------------------------------------------------------ temperatura ---
+CPU_TEMP_KEYS = ("k10temp", "zenpower", "coretemp", "cpu_thermal",
+                 "acpitz", "soc_thermal", "thinkpad")
+CPU_LABEL_HINTS = ("tctl", "tdie", "package", "cpu", "core 0", "composite")
+
+
+
+import urllib.request
+import json
+
+def _get_lhm_web_data():
+    try:
+        with urllib.request.urlopen('http://localhost:8085/data.json', timeout=1) as url:
+            return json.loads(url.read().decode())
+    except Exception:
+        return None
+
+def _find_web_sensors(node, kind, name_hints=None):
+    results = []
+    if not node: return results
+    def recurse(n, path):
+        t = (n.get("Text") or "").lower()
+        curr_path = path + [t]
+        val = n.get("Value")
+        if val:
+            path_str = " ".join(curr_path)
+            if kind.lower() in path_str:
+                if name_hints:
+                    if any(h.lower() in path_str for h in name_hints):
+                        results.append(val)
+                else:
+                    results.append(val)
+        for c in n.get("Children", []):
+            recurse(c, curr_path)
+    recurse(node, [])
+    parsed = []
+    for r in results:
+        try:
+            num = float(r.split()[0].replace(',', '.'))
+            parsed.append(num)
+        except:
+            pass
+    return parsed
+
+
+def cpu_temperature():
+    """Melhor palpite para a temperatura da CPU, em graus C."""
+    # psutil.sensors_temperatures so' existe em builds Linux/BSD -- no Windows
+    # o atributo nem existe, e isso ja cai no except (vira AttributeError).
+    temps = None
+    try:
+        temps = psutil.sensors_temperatures()
+    except Exception:
+        pass
+
+    if temps:
+        # 1) chip conhecido + label que parece do pacote/CPU
+        for chip in CPU_TEMP_KEYS:
+            for name, entries in temps.items():
+                if chip not in name.lower():
+                    continue
+                for e in entries:
+                    if e.label and any(h in e.label.lower() for h in CPU_LABEL_HINTS):
+                        return round(e.current, 1)
+                if entries:
+                    return round(entries[0].current, 1)
+
+        # 2) fallback: maior temperatura vista
+        best = None
+        for entries in temps.values():
+            for e in entries:
+                if e.current and 0 < e.current < 130:
+                    best = e.current if best is None else max(best, e.current)
+        if best:
+            return round(best, 1)
+
+    # 3) Windows sem hwmon: tenta o LibreHardwareMonitor (ver _lhm_sensors)
+    cpu_sensors = [s for s in _lhm_sensors("Temperature")
+                   if "cpu" in (s.Name or "").lower()
+                   or "cpu" in (s.Parent or "").lower()]
+    for s in cpu_sensors:
+        n = (s.Name or "").lower()
+        if any(h in n for h in ("package", "tctl", "tdie", "core max", "average")):
+            return round(s.Value, 1)
+    if cpu_sensors:
+        return round(cpu_sensors[0].Value, 1)
+
+    # 4) Tenta o Web Server do LibreHardwareMonitor
+    web_data = _get_lhm_web_data()
+    if web_data:
+        web_temps = _find_web_sensors(web_data, "temperature", ["cpu", "package", "tctl", "tdie", "core"])
+        if web_temps:
+            return round(max(web_temps), 1)
+
+    return None
+
+
+def fan_rpm():
+    try:
+        fans = psutil.sensors_fans()
+    except Exception:
+        fans = None
+    for entries in (fans or {}).values():
+        for e in entries:
+            if e.current and e.current > 0:
+                return int(e.current)
+    for s in _lhm_sensors("Fan"):
+        if s.Value:
+            return int(s.Value)
+    return None
+
+
+# -------------------------------------------------------------------- GPU ---
+_gpu_kind = None       # "nvidia" | "amd" | "intel" | "none"
+_amd_paths = {}
+_nvidia_smi = None      # caminho resolvido do executavel
+
+
+def _find_nvidia_smi():
+    """No Linux o nvidia-smi quase sempre esta no PATH; no Windows o instalador
+    do driver as vezes nao poe (ou poe so' pro instalador), entao completa com
+    os dois caminhos padrao."""
+    exe = shutil.which("nvidia-smi")
+    if exe:
+        return exe
+    if IS_WINDOWS:
+        for c in (
+            os.path.join(os.environ.get("SystemRoot", r"C:\Windows"), "System32", "nvidia-smi.exe"),
+            os.path.join(os.environ.get("ProgramFiles", r"C:\Program Files"),
+                         "NVIDIA Corporation", "NVSMI", "nvidia-smi.exe"),
+        ):
+            if os.path.isfile(c):
+                return c
+    return None
+
+
+def _detect_gpu():
+    global _gpu_kind, _amd_paths, _nvidia_smi
+    _nvidia_smi = _find_nvidia_smi()
+    if _nvidia_smi and run([_nvidia_smi, "-L"]):
+        _gpu_kind = "nvidia"
+        return
+    # AMD via sysfs (amdgpu) -- so' existe no Linux, no Windows o glob abaixo
+    # simplesmente nao acha nada e cai pro LibreHardwareMonitor em gpu_stats()
+    import glob
+    for card in sorted(glob.glob("/sys/class/drm/card[0-9]/device")):
+        if os.path.exists(os.path.join(card, "gpu_busy_percent")):
+            hw = glob.glob(os.path.join(card, "hwmon", "hwmon*"))
+            _amd_paths = {
+                "busy": os.path.join(card, "gpu_busy_percent"),
+                "vram_used": os.path.join(card, "mem_info_vram_used"),
+                "vram_total": os.path.join(card, "mem_info_vram_total"),
+                "temp": os.path.join(hw[0], "temp1_input") if hw else None,
+                "fan": os.path.join(hw[0], "fan1_input") if hw else None,
+                "power": os.path.join(hw[0], "power1_average") if hw else None,
+            }
+            _gpu_kind = "amd"
+            return
+    # Intel integrada: so temperatura via hwmon i915
+    for hw in glob.glob("/sys/class/hwmon/hwmon*"):
+        try:
+            with open(os.path.join(hw, "name")) as f:
+                if f.read().strip() in ("i915", "xe"):
+                    _amd_paths = {"temp": os.path.join(hw, "temp1_input")}
+                    _gpu_kind = "intel"
+                    return
+        except Exception:
+            pass
+    _gpu_kind = "none"
+
+
+def gpu_stats():
+    if _gpu_kind is None:
+        _detect_gpu()
+
+    if _gpu_kind == "nvidia":
+        q = run([_nvidia_smi,
+                 "--query-gpu=utilization.gpu,temperature.gpu,memory.used,"
+                 "memory.total,power.draw,fan.speed",
+                 "--format=csv,noheader,nounits"])
+        if q:
+            parts = [p.strip() for p in q.splitlines()[0].split(",")]
+
+            def num(i):
+                try:
+                    return float(parts[i])
+                except Exception:
+                    return None
+            used, total = num(2), num(3)
+            return {
+                "gpu": num(0),
+                "gput": num(1),
+                "vram": round(100.0 * used / total, 1) if used and total else None,
+                "vramu": round(used / 1024.0, 1) if used else None,
+                "vramt": round(total / 1024.0, 1) if total else None,
+                "gpuw": num(4),
+                "gpufan": num(5),
+                "gpuname": "NVIDIA",
+            }
+
+    if _gpu_kind == "amd":
+        busy = read_int(_amd_paths.get("busy") or "")
+        temp = read_int(_amd_paths.get("temp") or "")
+        vu = read_int(_amd_paths.get("vram_used") or "")
+        vt = read_int(_amd_paths.get("vram_total") or "")
+        pw = read_int(_amd_paths.get("power") or "")
+        return {
+            "gpu": busy,
+            "gput": round(temp / 1000.0, 1) if temp else None,
+            "vram": round(100.0 * vu / vt, 1) if vu and vt else None,
+            "vramu": round(vu / 1073741824.0, 1) if vu else None,
+            "vramt": round(vt / 1073741824.0, 1) if vt else None,
+            "gpuw": round(pw / 1000000.0, 1) if pw else None,
+            "gpufan": read_int(_amd_paths.get("fan") or ""),
+            "gpuname": "AMD",
+        }
+
+    if _gpu_kind == "intel":
+        temp = read_int(_amd_paths.get("temp") or "")
+        return {"gput": round(temp / 1000.0, 1) if temp else None, "gpuname": "INTEL"}
+
+    # Nada achado pelos metodos de cima (tipico do Windows sem NVIDIA): tenta
+    # o LibreHardwareMonitor, que expoe GPU AMD/Intel/NVIDIA de forma generica
+    lhm = _lhm_gpu_stats()
+    if lhm:
+        return lhm
+        
+    web = _lhm_gpu_stats_web()
+    if web:
+        return web
+
+    return {"gpuname": None}
+
+
+def _lhm_gpu_stats():
+    """GPU generica via LibreHardwareMonitor -- cobre AMD/Intel no Windows,
+    onde nao tem sysfs/hwmon pra ler direto."""
+    temps = _lhm_sensors("Temperature")
+    gpu_temp = next((s.Value for s in temps if "gpu" in (s.Name or "").lower()), None)
+    if gpu_temp is None:
+        return None
+    loads = _lhm_sensors("Load")
+    powers = _lhm_sensors("Power")
+    gpu_load = next((s.Value for s in loads
+                      if (s.Name or "").lower() in ("gpu core", "gpu")), None)
+    gpu_power = next((s.Value for s in powers if "gpu" in (s.Name or "").lower()), None)
+    parent = next((s.Parent or "" for s in temps if "gpu" in (s.Name or "").lower()), "")
+    name = "AMD" if "amdgpu" in parent.lower() else ("INTEL" if "intelgpu" in parent.lower() else "GPU")
+    return {
+        "gpu": round(gpu_load, 1) if gpu_load is not None else None,
+        "gput": round(gpu_temp, 1),
+        "gpuw": round(gpu_power, 1) if gpu_power is not None else None,
+        "gpuname": name,
+    }
+
+def _lhm_gpu_stats_web():
+    web_data = _get_lhm_web_data()
+    if not web_data:
+        return None
+    gpu_temps = _find_web_sensors(web_data, "temperature", ["gpu"])
+    if not gpu_temps:
+        return None
+    gpu_loads = _find_web_sensors(web_data, "load", ["gpu"])
+    gpu_powers = _find_web_sensors(web_data, "power", ["gpu"])
+    return {
+        "gpu": round(max(gpu_loads), 1) if gpu_loads else None,
+        "gput": round(max(gpu_temps), 1),
+        "gpuw": round(max(gpu_powers), 1) if gpu_powers else None,
+        "gpuname": "GPU",
+    }
+
+
+
+# ------------------------------------------------------------- journalctl ---
+# Prioridades do syslog: 0 emerg, 1 alert, 2 crit, 3 err, 4 warning,
+#                        5 notice, 6 info, 7 debug
+PRIO_ERR = 3
+PRIO_WARN = 4
+PRIO_CRIT = 2
+
+# Limites casados com a tela de logs: a fonte 1 do TFT_eSPI tem 6px por
+# caractere, e "[E] unit: msg" precisa caber nos 316px uteis.
+MSG_MAX = 36
+UNIT_MAX = 10
+SEND_MAX = 3          # linhas novas por pacote
+RATE_WINDOW = 60.0    # janela da taxa de erros, em segundos
+
+_ANSI = re.compile(r"\x1b\[[0-9;]*[A-Za-z]")
+_WS = re.compile(r"\s+")
+
+
+def clean_msg(s):
+    """Deixa a mensagem em ASCII curto: as fontes do display nao tem acento."""
+    s = _ANSI.sub("", s or "")
+    s = _WS.sub(" ", s).strip()
+    s = (s.replace("ç", "c").replace("ã", "a").replace("á", "a").replace("é", "e")
+          .replace("í", "i").replace("ó", "o").replace("ú", "u").replace("â", "a")
+          .replace("ê", "e").replace("ô", "o").replace("õ", "o").replace("à", "a"))
+    s = s.encode("ascii", "ignore").decode("ascii")
+    return s[:MSG_MAX]
+
+
+class JournalFollower(threading.Thread):
+    """Segue `journalctl -f` numa thread e acumula o que interessa.
+
+    Guarda contadores, taxa de erros e as linhas novas ainda nao enviadas.
+    O snapshot() devolve o delta e limpa o que ja foi entregue.
+    """
+
+    daemon = True
+
+    def __init__(self, units=None, since_boot=False):
+        super().__init__()
+        self.units = units or []
+        self.since_boot = since_boot
+        self.lock = threading.Lock()
+        self.pending = deque(maxlen=20)
+        self.err_total = 0
+        self.warn_total = 0
+        self.err_times = deque()
+        self.crit_seen = False
+        self.ok = False
+        self.error = None
+        self.proc = None
+
+    # -------------------------------------------------------------- setup --
+    @staticmethod
+    def available():
+        return shutil.which("journalctl") is not None
+
+    def _cmd(self):
+        cmd = ["journalctl", "-f", "-o", "json", "--no-pager"]
+        # -n 0 = nao despeja o historico, so o que chegar daqui pra frente
+        cmd += ["-n", "0"] if not self.since_boot else ["-b"]
+        # PRIORITY<=4 ja filtra no journald: menos dado atravessando o pipe
+        cmd += ["-p", "4"]
+        for u in self.units:
+            cmd += ["-u", u]
+        return cmd
+
+    # ---------------------------------------------------------------- run --
+    def run(self):
+        try:
+            self.proc = subprocess.Popen(
+                self._cmd(), stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
+                text=True, bufsize=1)
+        except Exception as e:
+            self.error = str(e)
+            return
+
+        self.ok = True
+        for line in self.proc.stdout:
+            line = line.strip()
+            if not line or not line.startswith("{"):
+                continue
+            try:
+                ent = json.loads(line)
+            except Exception:
+                continue
+            self._ingest(ent)
+
+    def _ingest(self, ent):
+        try:
+            prio = int(ent.get("PRIORITY", 6))
+        except (TypeError, ValueError):
+            prio = 6
+        if prio > PRIO_WARN:
+            return
+
+        unit = (ent.get("_SYSTEMD_UNIT") or ent.get("SYSLOG_IDENTIFIER")
+                or ent.get("_COMM") or "?")
+        unit = unit.replace(".service", "")[:UNIT_MAX]
+        msg = ent.get("MESSAGE")
+        if isinstance(msg, list):      # journald pode devolver bytes como lista
+            try:
+                msg = bytes(msg).decode("utf-8", "ignore")
+            except Exception:
+                msg = str(msg)
+        msg = clean_msg(msg)
+        if not msg:
+            return
+
+        now = time.time()
+        with self.lock:
+            if prio <= PRIO_ERR:
+                self.err_total += 1
+                self.err_times.append(now)
+                if prio <= PRIO_CRIT:
+                    self.crit_seen = True
+            else:
+                self.warn_total += 1
+            self.pending.append((prio, unit, msg))
+
+    # ----------------------------------------------------------- snapshot --
+    def snapshot(self):
+        now = time.time()
+        with self.lock:
+            while self.err_times and now - self.err_times[0] > RATE_WINDOW:
+                self.err_times.popleft()
+            rate = len(self.err_times) * (60.0 / RATE_WINDOW)
+
+            new = []
+            # prioriza as mais graves quando estoura o limite do pacote
+            items = sorted(self.pending, key=lambda t: t[0])[:SEND_MAX]
+            for prio, unit, msg in items:
+                new.append([prio, unit, msg])
+            n_new = len(self.pending)
+            self.pending.clear()
+
+            crit = self.crit_seen
+            self.crit_seen = False
+
+            out = {
+                "le": self.err_total,
+                "lw": self.warn_total,
+                "lr": round(rate, 1),
+                "ln": n_new,
+                "lc": 1 if crit else 0,
+            }
+            if new:
+                out["lg"] = new
+            return out
+
+    def stop(self):
+        if self.proc:
+            try:
+                self.proc.terminate()
+            except Exception:
+                pass
+
+
+# --------------------------------------------------------------- coletor ----
+class Collector:
+    def __init__(self, journal=None, game_processes=()):
+        self.journal = journal
+        psutil.cpu_percent(interval=None)
+        self.host = socket.gethostname()[:14]
+        self.prev_net = psutil.net_io_counters()
+        self.prev_disk = psutil.disk_io_counters()
+        self.prev_t = time.time()
+        self.cores = psutil.cpu_count(logical=True)
+        self.game_processes = tuple(g.lower() for g in DEFAULT_GAME_PROCESSES + tuple(game_processes))
+
+    def sample(self):
+        now = time.time()
+        dt = max(now - self.prev_t, 0.1)
+
+        cpu = psutil.cpu_percent(interval=None)
+        freq = psutil.cpu_freq()
+        vm = psutil.virtual_memory()
+        sw = psutil.swap_memory()
+        du = psutil.disk_usage(SYSTEM_ROOT)
+
+        net = psutil.net_io_counters()
+        rx = (net.bytes_recv - self.prev_net.bytes_recv) / dt / 1048576.0
+        tx = (net.bytes_sent - self.prev_net.bytes_sent) / dt / 1048576.0
+        self.prev_net = net
+
+        dio = psutil.disk_io_counters()
+        if dio and self.prev_disk:
+            dr = (dio.read_bytes - self.prev_disk.read_bytes) / dt / 1048576.0
+            dw = (dio.write_bytes - self.prev_disk.write_bytes) / dt / 1048576.0
+        else:
+            dr = dw = 0.0
+        self.prev_disk = dio
+        self.prev_t = now
+
+        # processo que mais consome CPU, e se tem algo de jogo rodando --
+        # os dois precisam varrer todo mundo, entao fazem isso numa passada so
+        top = ""
+        gaming = False
+        try:
+            procs = []
+            for p in psutil.process_iter(["name", "cpu_percent", "exe"]):
+                name = p.info["name"] or ""
+                if p.info["cpu_percent"]:
+                    procs.append((p.info["cpu_percent"], name))
+                if not gaming:
+                    low = name.lower()
+                    gaming = (any(g in low for g in self.game_processes)
+                              or _is_steam_game(p.info.get("exe")))
+            if procs:
+                top = max(procs)[1][:12]
+        except Exception:
+            pass
+
+        br = brasilia_now()
+
+        d = {
+            "cpu": round(cpu, 1),
+            "cput": cpu_temperature(),
+            "cpuf": int(freq.current) if freq and freq.current else None,
+            "cores": self.cores,
+            "load": load_average(),
+            "hh": br.hour,
+            "mm": br.minute,
+            "ram": round(vm.percent, 1),
+            "ramu": round(vm.used / 1073741824.0, 1),
+            "ramt": round(vm.total / 1073741824.0, 1),
+            "swap": round(sw.percent, 1),
+            "dsk": round(du.percent, 1),
+            "dskf": round(du.free / 1073741824.0, 1),
+            "dr": round(dr, 2),
+            "dw": round(dw, 2),
+            "rx": round(rx, 2),
+            "tx": round(tx, 2),
+            "up": int(now - psutil.boot_time()),
+            "fan": fan_rpm(),
+            "host": self.host,
+            "top": top,
+            "game": gaming,
+        }
+        d.update(gpu_stats())
+        # remove chaves nulas -> linha serial menor
+        d = {k: v for k, v in d.items() if v is not None}
+        if self.journal is not None:
+            d.update(self.journal.snapshot())
+        return d
+
+
+# ---------------------------------------------------------------- serial ----
+def find_port():
+    try:
+        from serial.tools import list_ports
+    except ImportError:
+        sys.exit("Faltando pyserial. Rode: pip install pyserial")
+    cands = list(list_ports.comports())
+    for p in cands:
+        if p.vid is not None and (p.vid, p.pid) in KNOWN_USB_IDS:
+            return p.device
+    # so' chega aqui se o VID:PID nao bateu com nenhum chip conhecido -- pega
+    # qualquer coisa com nome de porta serial (ttyUSB/ttyACM no Linux, COM* no
+    # Windows) como ultimo palpite
+    for p in cands:
+        if re.search(r"ttyUSB|ttyACM|^COM\d+$", p.device):
+            return p.device
+    return None
+
+
+def main():
+    ap = argparse.ArgumentParser(description="Agente Mike Monitor (CYD)")
+    ap.add_argument("-p", "--port", help="porta serial, ex: /dev/ttyUSB0")
+    ap.add_argument("-i", "--interval", type=float, default=INTERVAL)
+    ap.add_argument("--stdout", action="store_true", help="imprime o JSON em vez de enviar")
+    ap.add_argument("--once", action="store_true", help="coleta uma amostra e sai")
+    ap.add_argument("--no-logs", action="store_true", help="nao acompanha o journalctl")
+    ap.add_argument("-u", "--unit", action="append", default=[],
+                    help="limita os logs a uma unit (pode repetir)")
+    ap.add_argument("--log-boot", action="store_true",
+                    help="conta tambem os erros que ja estavam no journal deste boot")
+    ap.add_argument("--game-proc", action="append", default=[],
+                    help="nome de processo extra para o modo game (pode repetir)")
+    args = ap.parse_args()
+
+    journal = None
+    if not args.no_logs:
+        if JournalFollower.available():
+            journal = JournalFollower(units=args.unit, since_boot=args.log_boot)
+            journal.start()
+            time.sleep(0.4)
+            if journal.error:
+                print(f"[mike] journalctl falhou: {journal.error}", file=sys.stderr)
+                journal = None
+        else:
+            print("[mike] journalctl nao encontrado, seguindo sem logs", file=sys.stderr)
+
+    col = Collector(journal, game_processes=args.game_proc)
+    time.sleep(0.3)
+
+    if args.stdout or args.once:
+        while True:
+            print(json.dumps(col.sample(), ensure_ascii=False))
+            sys.stdout.flush()
+            if args.once:
+                return
+            time.sleep(args.interval)
+
+    import serial
+
+    ser = None
+    while True:
+        try:
+            if ser is None:
+                port = args.port or find_port()
+                if not port:
+                    print("[mike] nenhuma porta serial encontrada, tentando de novo...",
+                          file=sys.stderr)
+                    time.sleep(3)
+                    continue
+                ser = serial.Serial(port, BAUD, timeout=1)
+                # o ESP32 reseta ao abrir a porta
+                time.sleep(2.0)
+                ser.reset_input_buffer()
+                print(f"[mike] conectado em {port}", file=sys.stderr)
+
+            line = json.dumps(col.sample(), separators=(",", ":")) + "\n"
+            ser.write(line.encode())
+            ser.flush()
+
+        except KeyboardInterrupt:
+            break
+        except Exception as e:
+            print(f"[mike] erro: {e} -- reconectando", file=sys.stderr)
+            try:
+                if ser:
+                    ser.close()
+            except Exception:
+                pass
+            ser = None
+            time.sleep(3)
+            continue
+
+        time.sleep(args.interval)
+
+    if ser:
+        ser.close()
+
+
+if __name__ == "__main__":
+    main()

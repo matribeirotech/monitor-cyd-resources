@@ -1,0 +1,15 @@
+[Unit]
+Description=Mike Monitor - agente de telemetria para o CYD
+After=multi-user.target
+
+[Service]
+Type=simple
+# troque SEU_USUARIO e o caminho abaixo
+User=SEU_USUARIO
+ExecStart=/usr/bin/python3 /home/SEU_USUARIO/mike-monitor/agent/mike_agent.py
+Restart=always
+RestartSec=5
+Nice=10
+
+[Install]
+WantedBy=multi-user.target
