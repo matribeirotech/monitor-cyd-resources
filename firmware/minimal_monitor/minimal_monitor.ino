@@ -18,8 +18,8 @@
 #include <TFT_eSPI.h>
 #include <ArduinoJson.h>
 
-
-#include <XPT2046_Touchscreen.h>
+#include <SD.h>
+#include <AnimatedGIF.h>
 
 #include "ui_theme.h"
 
@@ -74,8 +74,56 @@
 #define TOUCH_FLIP_Y     0     // 1 inverte o eixo Y
 
 TFT_eSPI tft = TFT_eSPI();
-SPIClass touchSPI(VSPI);
-XPT2046_Touchscreen ts(XPT_CS, XPT_IRQ);
+
+struct TS_Point { int16_t x, y, z; };
+class TouchBB {
+public:
+  void begin() {
+    pinMode(XPT_CS, OUTPUT); digitalWrite(XPT_CS, HIGH);
+    pinMode(XPT_CLK, OUTPUT); digitalWrite(XPT_CLK, LOW);
+    pinMode(XPT_MOSI, OUTPUT); digitalWrite(XPT_MOSI, LOW);
+    pinMode(XPT_MISO, INPUT);
+    pinMode(XPT_IRQ, INPUT);
+  }
+  bool touched() { return digitalRead(XPT_IRQ) == LOW; }
+  uint16_t transfer(uint8_t cmd) {
+    uint16_t result = 0;
+    for(int i=7; i>=0; i--) {
+      digitalWrite(XPT_CLK, LOW);
+      digitalWrite(XPT_MOSI, (cmd >> i) & 1);
+      digitalWrite(XPT_CLK, HIGH);
+    }
+    digitalWrite(XPT_CLK, LOW); digitalWrite(XPT_CLK, HIGH);
+    for(int i=11; i>=0; i--) {
+      digitalWrite(XPT_CLK, LOW);
+      digitalWrite(XPT_CLK, HIGH);
+      if(digitalRead(XPT_MISO)) result |= (1 << i);
+    }
+    digitalWrite(XPT_CLK, LOW); digitalWrite(XPT_CLK, HIGH);
+    digitalWrite(XPT_CLK, LOW); digitalWrite(XPT_CLK, HIGH);
+    digitalWrite(XPT_CLK, LOW); digitalWrite(XPT_CLK, HIGH);
+    return result;
+  }
+  TS_Point getPoint() {
+    digitalWrite(XPT_CS, LOW);
+    transfer(0x90); // dummy read
+    int tx = transfer(0x90);
+    int ty = transfer(0xD0);
+    digitalWrite(XPT_CS, HIGH);
+    
+    // Equivale a setRotation(1) na biblioteca original
+    int16_t xRaw = tx;
+    int16_t yRaw = 4095 - ty;
+    
+    return {xRaw, yRaw, 1000};
+  }
+};
+TouchBB ts;
+
+AnimatedGIF gif;
+File gifFile;
+bool hasSD = false;
+char gifPath[64] = "/background.gif";
 
 // -------------------------------------------------------------- estado -----
 
@@ -114,6 +162,45 @@ void applyTheme(uint8_t t) {
     C_ACCENT = 0x07E0;  // Verde (Green)
     C_ACCENT_DK = 0x0000;
     C_OK = 0x07E0; C_WARN = 0xFFE0; C_HOT = 0xF800; C_COOL = 0x07E0; C_PINK = 0xF800;
+  } else if (t == 2) { // TEMA GIF SD
+    C_BG = 0x0000; C_CARD = 0x0000; C_CARD_HI = 0x03E0; C_TRACK = 0x0120;
+    C_TEXT = 0x07E0; C_DIM = 0x03E0; C_ACCENT = 0x07E0; C_ACCENT_DK = 0x0000;
+    C_OK = 0x07E0; C_WARN = 0xFFE0; C_HOT = 0xF800; C_COOL = 0x07E0; C_PINK = 0x07E0;
+  }
+}
+
+SPIClass sdSPI(VSPI);
+void * GIFOpenFile(const char *fname, int32_t *pSize) {
+  gifFile = SD.open(fname);
+  if (gifFile) { *pSize = gifFile.size(); return (void *)&gifFile; }
+  return NULL;
+}
+void GIFCloseFile(void *pHandle) { ((File *)pHandle)->close(); }
+int32_t GIFReadFile(GIFFILE *pFile, uint8_t *pBuf, int32_t iLen) {
+  File *f = static_cast<File *>(pFile->fHandle);
+  int32_t bytes = f->read(pBuf, iLen);
+  pFile->iPos = f->position();
+  return bytes;
+}
+int32_t GIFSeekFile(GIFFILE *pFile, int32_t iPosition) { 
+  File *f = static_cast<File *>(pFile->fHandle);
+  f->seek(iPosition);
+  pFile->iPos = f->position();
+  return pFile->iPos;
+}
+
+bool isBehindUI(int x, int y);
+
+void GIFDraw(GIFDRAW *pDraw) {
+  uint16_t *usPalette = pDraw->pPalette;
+  int y = pDraw->iY + pDraw->y;
+  if (isBehindUI(pDraw->iX, y)) return; // Simple row discard (not fully precise for partial row, but good enough)
+  
+  for (int x = 0; x < pDraw->iWidth; x++) {
+    if (pDraw->ucHasTransparency && pDraw->pPixels[x] == pDraw->ucTransparent) continue;
+    if (!isBehindUI(pDraw->iX + x, y)) {
+      tft.drawPixel(pDraw->iX + x, y, usPalette[pDraw->pPixels[x]]);
+    }
   }
 }
 
@@ -123,7 +210,7 @@ struct Stats {
   float ram = 0, ramu = 0, ramt = 0, swap = 0;
   float dsk = 0, dskf = 0, dr = 0, dw = 0;
   float rx = 0, tx = 0;
-  int   cores = 0, fan = -1, gpufan = -1;
+  int   cores = 0, fan = -1, gpufan = -1, fps = -1;
   int8_t hh = -1, mm = -1;    // hora de Brasilia, mandada pelo agente
   bool  game = false;         // processo de jogo/emulador rodando (modo game)
   uint32_t up = 0;
@@ -294,16 +381,16 @@ void drawHeader() {
   tft.setTextDatum(ML_DATUM);
   tft.setTextColor(C_ACCENT, C_ACCENT_DK);
   tft.drawString(currentTheme == 1 ? "z1p0.monitor_" : "sys.monitor_", 32, 10, 2);
-  // Gear icon (Settings)
-  tft.fillRect(SCR_W - 20, 4, 10, 10, C_DIM);
-  tft.fillRect(SCR_W - 17, 7, 4, 4, C_ACCENT_DK);
-
-
+  
   tft.setTextDatum(MR_DATUM);
   tft.setTextColor(linked ? C_TEXT : C_DIM, C_ACCENT_DK);
-  tft.setTextPadding(120);
-  tft.drawString(linked ? st.host : "sem sinal", SCR_W - 6, 10, 2);
+  tft.setTextPadding(100);
+  tft.drawString(linked ? st.host : "sem sinal", SCR_W - 32, 10, 2);
   tft.setTextPadding(0);
+
+  // Gear icon (Settings) - draw AFTER the host so it doesn't get erased
+  tft.fillRect(SCR_W - 22, 4, 12, 12, C_DIM);
+  tft.fillRect(SCR_W - 19, 7, 6, 6, C_ACCENT_DK);
 }
 
 // Relogio de Brasilia, mandado pelo agente Python (campos "hh"/"mm" do JSON,
@@ -446,7 +533,7 @@ bool isBehindUI(int x, int y) {
 }
 
 void drawRain() {
-  if (screen != SCR_MAIN) return;
+  if (screen != SCR_MAIN || currentTheme == 2) return;
   for (int i=0; i<NUM_DROPS; i++) {
     rainDrops[i].ticks++;
     if (rainDrops[i].ticks >= rainDrops[i].speed) {
@@ -525,7 +612,11 @@ void drawSetButton(const Rect &r, const char *lbl, uint16_t color) {
 void screenSetStatic() {
   drawHeader();
   
-  drawSetButton(BTN_THEME, currentTheme == 0 ? "TEMA: TERMINAL" : "TEMA: Z1P0", C_ACCENT);
+  const char* themeName = "TEMA: TERMINAL";
+  if (currentTheme == 1) themeName = "TEMA: Z1P0";
+  if (currentTheme == 2) themeName = "TEMA: GIF SD";
+  
+  drawSetButton(BTN_THEME, themeName, C_ACCENT);
   drawSetButton(BTN_BR_DOWN, "-", C_DIM);
   drawSetButton(BTN_BR_UP, "+", C_DIM);
   
@@ -545,7 +636,12 @@ void screenSetDynamic() {
 
 void screenMainStatic() {
   tft.fillScreen(C_BG);
-  initRain();
+  if (currentTheme == 2 && hasSD) {
+    gif.close();
+    gif.open(gifPath, GIFOpenFile, GIFCloseFile, GIFReadFile, GIFSeekFile, GIFDraw);
+  } else {
+    initRain();
+  }
   drawHeader();
   drawCard(2, HDR_H + 2, 156, 120, nullptr);      // CPU
   drawCard(162, HDR_H + 2, 156, 120, nullptr);    // RAM
@@ -567,13 +663,25 @@ void screenMainDynamic() {
   tft.setTextDatum(MC_DATUM);
   tft.setTextPadding(140);
   if (st.cput > 0) {
-    snprintf(buf, sizeof(buf), "TEMP: %.0f C", st.cput);
+    snprintf(buf, sizeof(buf), "CPU: %.0f C", st.cput);
     tft.setTextColor(levelColor(st.cput, T_TEMP_HOT, T_TEMP_MAX), C_CARD);
   } else { 
     snprintf(buf, sizeof(buf), "TEMP: -- C"); 
     tft.setTextColor(C_DIM, C_CARD); 
   }
   tft.drawString(buf, 80, HDR_H + 150, 4);
+
+  if (st.game) {
+    if (st.fps >= 0) snprintf(buf, sizeof(buf), "FPS: %d", st.fps);
+    else snprintf(buf, sizeof(buf), "GAME ON");
+    tft.setTextColor(C_PINK, C_CARD);
+  } else if (st.gput > 0) {
+    snprintf(buf, sizeof(buf), "GPU: %.0f C", st.gput);
+    tft.setTextColor(levelColor(st.gput, T_TEMP_HOT, T_TEMP_MAX), C_CARD);
+  } else {
+    snprintf(buf, sizeof(buf), " ");
+  }
+  tft.drawString(buf, 80, HDR_H + 180, 4);
   tft.setTextPadding(0);
 
   // ---- Disco/Rede ----
@@ -749,6 +857,34 @@ void applyJson(const char *json) {
   JsonDocument doc;
   if (deserializeJson(doc, json)) return;
 
+  // Comandos de Controle
+  JsonVariant vTheme = doc["cmd_theme"];
+  if (!vTheme.isNull()) {
+    currentTheme = vTheme.as<uint8_t>() % 3;
+    applyTheme(currentTheme);
+    prefs.putUInt("theme", currentTheme);
+    needFullDraw = true;
+  }
+  
+  JsonVariant vBright = doc["cmd_bright"];
+  if (!vBright.isNull()) {
+    currentBrightness = vBright.as<int>();
+    if (currentBrightness < 10) currentBrightness = 10;
+    if (currentBrightness > 255) currentBrightness = 255;
+    ledcWrite(0, currentBrightness);
+    prefs.putInt("bright", currentBrightness);
+    if (screen == SCR_SET) needFullDraw = true;
+  }
+  
+  JsonVariant vGif = doc["cmd_gif"];
+  if (!vGif.isNull() && hasSD) {
+    strlcpy(gifPath, vGif.as<const char*>(), sizeof(gifPath));
+    if (currentTheme == 2 && screen == SCR_MAIN) {
+       gif.close();
+       gif.open(gifPath, GIFOpenFile, GIFCloseFile, GIFReadFile, GIFSeekFile, GIFDraw);
+    }
+  }
+
   st.cpu   = doc["cpu"]   | st.cpu;
   st.cput  = doc["cput"]  | -1.0f;
   st.cpuf  = doc["cpuf"]  | 0.0f;
@@ -772,6 +908,7 @@ void applyJson(const char *json) {
   st.hh    = doc["hh"]    | -1;
   st.mm    = doc["mm"]    | -1;
   st.game  = doc["game"]  | false;
+  st.fps   = doc["fps"]   | -1;
   st.up    = doc["up"]    | 0;
   strlcpy(st.host,    doc["host"]    | st.host, sizeof(st.host));
   strlcpy(st.top,     doc["top"]     | "",      sizeof(st.top));
@@ -899,7 +1036,7 @@ void handleTap(int16_t x, int16_t y) {
   
   if (screen == SCR_SET) {
     if (inside(BTN_THEME, x, y)) {
-      currentTheme = (currentTheme + 1) % 2;
+      currentTheme = (currentTheme + 1) % 3;
       applyTheme(currentTheme);
       prefs.putUInt("theme", currentTheme);
       needFullDraw = true;
@@ -1027,11 +1164,14 @@ void setup() {
   tft.fillScreen(C_BG);
   initRain();
 
-  touchSPI.begin(XPT_CLK, XPT_MISO, XPT_MOSI, XPT_CS);
-  ts.begin(touchSPI);
-  ts.setRotation(SCREEN_ROTATION);
+  ts.begin(); // Usando nosso bitbang touch!
 
-  
+  sdSPI.begin(18, 19, 23, 5);
+  if (SD.begin(5, sdSPI, 4000000)) {
+    hasSD = true;
+    gif.begin(LITTLE_ENDIAN_PIXELS);
+  }
+
   memset(hCpu, 0, sizeof(hCpu)); memset(hGpu, 0, sizeof(hGpu));
   memset(hRam, 0, sizeof(hRam)); memset(hTmp, 0, sizeof(hTmp));
 
@@ -1084,6 +1224,12 @@ void loop() {
   if (millis() - lastRain >= 50) {
     lastRain = millis();
     drawRain();
+  }
+
+  if (screen == SCR_MAIN && currentTheme == 2 && hasSD) {
+    if (!gif.playFrame(true, NULL)) {
+      gif.reset();
+    }
   }
 
   if (millis() - lastRefresh >= 200) {

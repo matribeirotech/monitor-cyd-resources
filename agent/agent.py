@@ -28,6 +28,9 @@ import subprocess
 import sys
 import threading
 import time
+import mmap
+import struct
+import ctypes
 from collections import deque
 from datetime import datetime, timedelta, timezone
 
@@ -116,6 +119,44 @@ def load_average():
         return round(os.getloadavg()[0], 2)
     except (OSError, AttributeError):
         return None
+
+def get_rtss_fps():
+    """Lê o FPS do RTSS (RivaTuner Statistics Server) compartilhado na memória."""
+    if not IS_WINDOWS:
+        return None
+    try:
+        shmem = mmap.mmap(-1, 32768, "RTSSSharedMemoryV2", access=mmap.ACCESS_READ)
+        sig = struct.unpack('<I', shmem[0:4])[0]
+        if sig != 0x52545353:
+            shmem.close()
+            return None
+            
+        app_arr_offset = struct.unpack('<I', shmem[12:16])[0]
+        app_arr_size = struct.unpack('<I', shmem[16:20])[0]
+        app_entry_size = struct.unpack('<I', shmem[8:12])[0]
+        total_size = app_arr_offset + app_arr_size * app_entry_size
+        shmem.close()
+        
+        shmem = mmap.mmap(-1, total_size, "RTSSSharedMemoryV2", access=mmap.ACCESS_READ)
+        
+        # Iterar pelas AppEntries para encontrar o jogo rodando
+        for i in range(app_arr_size):
+            offset = app_arr_offset + i * app_entry_size
+            proc_id = struct.unpack('<I', shmem[offset:offset+4])[0]
+            if proc_id == 0:
+                continue
+            
+            frame_time = struct.unpack('<I', shmem[offset+280:offset+284])[0]
+            if frame_time > 0:
+                fps = 1000000.0 / frame_time
+                if fps > 0 and fps < 2000:
+                    shmem.close()
+                    return int(fps + 0.5)
+        shmem.close()
+        return None
+    except Exception:
+        return None
+
 
 
 # ------------------------------------- sensores no Windows (LibreHardwareMonitor) ---
@@ -675,6 +716,7 @@ class Collector:
             "host": self.host,
             "top": top,
             "game": gaming,
+            "fps": get_rtss_fps() if gaming else None,
         }
         d.update(gpu_stats())
         # remove chaves nulas -> linha serial menor
@@ -740,47 +782,189 @@ def main():
             if args.once:
                 return
             time.sleep(args.interval)
-
-    import serial
-
-    ser = None
-    while True:
-        try:
-            if ser is None:
-                port = args.port or find_port()
-                if not port:
-                    print("[mike] nenhuma porta serial encontrada, tentando de novo...",
-                          file=sys.stderr)
-                    time.sleep(3)
-                    continue
-                ser = serial.Serial(port, BAUD, timeout=1)
-                # o ESP32 reseta ao abrir a porta
-                time.sleep(2.0)
-                ser.reset_input_buffer()
-                print(f"[mike] conectado em {port}", file=sys.stderr)
-
-            line = json.dumps(col.sample(), separators=(",", ":")) + "\n"
-            ser.write(line.encode())
-            ser.flush()
-
-        except KeyboardInterrupt:
-            break
-        except Exception as e:
-            print(f"[mike] erro: {e} -- reconectando", file=sys.stderr)
-            try:
+            
+    try:
+        import tkinter as tk
+        from tkinter import ttk
+        import queue
+        
+        class AgentGUI:
+            def __init__(self, root, col, args):
+                self.root = root
+                self.col = col
+                self.args = args
+                self.cmd_queue = queue.Queue()
+                
+                self.root.title("Mike Monitor - Controle")
+                self.root.geometry("450x550")
+                self.root.configure(bg="#050505")
+                
+                style = ttk.Style()
+                if "clam" in style.theme_names():
+                    style.theme_use("clam")
+                style.configure(".", background="#050505", foreground="#00FF00", font=("Consolas", 10))
+                style.configure("TFrame", background="#050505")
+                style.configure("TLabel", background="#050505", foreground="#00FF00")
+                style.configure("TButton", background="#1a1a1a", foreground="#00FF00", borderwidth=1, bordercolor="#00FF00")
+                style.map("TButton", background=[("active", "#333333")])
+                style.configure("TRadiobutton", background="#050505", foreground="#00FF00")
+                style.configure("Horizontal.TScale", background="#050505")
+        
+                self.setup_ui()
+                
+                self.running = True
+                self.thread = threading.Thread(target=self.serial_loop, daemon=True)
+                self.thread.start()
+                
+                self.root.protocol("WM_DELETE_WINDOW", self.on_close)
+        
+            def setup_ui(self):
+                frame = ttk.Frame(self.root, padding=15)
+                frame.pack(fill=tk.BOTH, expand=True)
+        
+                ttk.Label(frame, text="MIKE MONITOR", font=("Consolas", 16, "bold")).pack(pady=10)
+                
+                self.lbl_status = ttk.Label(frame, text="Status: Aguardando conexão...")
+                self.lbl_status.pack(pady=5)
+                
+                # Tema
+                lf_theme = tk.LabelFrame(frame, text=" Tema do Monitor ", bg="#050505", fg="#00FF00", font=("Consolas", 10))
+                lf_theme.pack(fill=tk.X, pady=10, padx=5)
+                
+                self.theme_var = tk.IntVar(value=0)
+                ttk.Radiobutton(lf_theme, text="Terminal Minimalista", variable=self.theme_var, value=0, command=self.send_commands).pack(anchor=tk.W, padx=10, pady=2)
+                ttk.Radiobutton(lf_theme, text="z1p0 (Hacker Verde/Preto)", variable=self.theme_var, value=1, command=self.send_commands).pack(anchor=tk.W, padx=10, pady=2)
+                ttk.Radiobutton(lf_theme, text="GIF do Cartão SD", variable=self.theme_var, value=2, command=self.send_commands).pack(anchor=tk.W, padx=10, pady=2)
+                
+                # Brilho
+                lf_bright = tk.LabelFrame(frame, text=" Brilho ", bg="#050505", fg="#00FF00", font=("Consolas", 10))
+                lf_bright.pack(fill=tk.X, pady=10, padx=5)
+                
+                self.bright_var = tk.DoubleVar(value=128)
+                scale = ttk.Scale(lf_bright, from_=10, to=255, variable=self.bright_var, orient=tk.HORIZONTAL)
+                scale.pack(fill=tk.X, padx=10, pady=10)
+                scale.bind("<ButtonRelease-1>", lambda e: self.send_commands())
+                
+                # GIF do SD
+                lf_gif = tk.LabelFrame(frame, text=" Arquivo GIF no Cartão SD ", bg="#050505", fg="#00FF00", font=("Consolas", 10))
+                lf_gif.pack(fill=tk.X, pady=10, padx=5)
+                
+                self.txt_gif = tk.Entry(lf_gif, bg="#1a1a1a", fg="#00FF00", insertbackground="#00FF00", font=("Consolas", 10))
+                self.txt_gif.insert(0, "/background.gif")
+                self.txt_gif.pack(fill=tk.X, padx=10, pady=5)
+                ttk.Button(lf_gif, text="Aplicar GIF", command=self.send_commands).pack(pady=5)
+                
+                # Log
+                self.txt_log = tk.Text(frame, height=8, bg="#0a0a0a", fg="#00cc00", font=("Consolas", 8))
+                self.txt_log.pack(fill=tk.BOTH, expand=True, pady=10)
+        
+            def log(self, msg):
+                self.txt_log.insert(tk.END, msg + "\n")
+                self.txt_log.see(tk.END)
+                # Keep log short
+                if int(self.txt_log.index('end-1c').split('.')[0]) > 50:
+                    self.txt_log.delete('1.0', '2.0')
+                
+            def send_commands(self):
+                cmd = {
+                    "cmd_theme": self.theme_var.get(),
+                    "cmd_bright": int(self.bright_var.get()),
+                    "cmd_gif": self.txt_gif.get()
+                }
+                self.cmd_queue.put(cmd)
+        
+            def on_close(self):
+                self.running = False
+                self.root.destroy()
+                
+            def serial_loop(self):
+                import serial
+                ser = None
+                while self.running:
+                    try:
+                        if ser is None:
+                            port = self.args.port or find_port()
+                            if not port:
+                                self.root.after(0, lambda: self.lbl_status.config(text="Status: Nenhuma porta serial encontrada..."))
+                                time.sleep(3)
+                                continue
+                            ser = serial.Serial(port, BAUD, timeout=1)
+                            time.sleep(2.0)
+                            ser.reset_input_buffer()
+                            msg = f"Conectado em {port}"
+                            self.root.after(0, lambda m=msg: self.lbl_status.config(text=f"Status: {m}"))
+                            self.root.after(0, lambda m=msg: self.log(f"[{m}]"))
+        
+                        pkt = self.col.sample()
+                        
+                        # Check for queued commands
+                        while not self.cmd_queue.empty():
+                            cmd = self.cmd_queue.get_nowait()
+                            pkt.update(cmd)
+                        
+                        line = json.dumps(pkt, separators=(",", ":")) + "\n"
+                        ser.write(line.encode())
+                        ser.flush()
+                        
+                        if "fps" in pkt:
+                            fps_txt = f"FPS: {pkt['fps']:>3} | "
+                        else:
+                            fps_txt = ""
+                        log_msg = f"{fps_txt}CPU: {pkt.get('cpu',0):>4}% | RAM: {pkt.get('ram',0):>4}% | T: {pkt.get('cput',0):>3}°C"
+                        self.root.after(0, lambda m=log_msg: self.log(m))
+        
+                    except Exception as e:
+                        self.root.after(0, lambda err=e: self.lbl_status.config(text=f"Status: Erro de conexão"))
+                        if ser:
+                            try:
+                                ser.close()
+                            except:
+                                pass
+                        ser = None
+                        time.sleep(3)
+                        continue
+        
+                    time.sleep(self.args.interval)
+        
                 if ser:
                     ser.close()
+
+        root = tk.Tk()
+        app = AgentGUI(root, col, args)
+        root.mainloop()
+        
+    except ImportError:
+        # Fallback to CLI if tkinter is missing
+        print("[mike] Tkinter não encontrado. Rodando em modo texto.")
+        import serial
+        ser = None
+        while True:
+            try:
+                if ser is None:
+                    port = args.port or find_port()
+                    if not port:
+                        time.sleep(3)
+                        continue
+                    ser = serial.Serial(port, BAUD, timeout=1)
+                    time.sleep(2.0)
+                    ser.reset_input_buffer()
+                line = json.dumps(col.sample(), separators=(",", ":")) + "\n"
+                ser.write(line.encode())
+                ser.flush()
+            except KeyboardInterrupt:
+                break
             except Exception:
-                pass
-            ser = None
-            time.sleep(3)
-            continue
-
-        time.sleep(args.interval)
-
-    if ser:
-        ser.close()
-
+                if ser:
+                    try:
+                        ser.close()
+                    except:
+                        pass
+                ser = None
+                time.sleep(3)
+                continue
+            time.sleep(args.interval)
+        if ser:
+            ser.close()
 
 if __name__ == "__main__":
     main()
