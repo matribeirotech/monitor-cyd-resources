@@ -145,28 +145,53 @@ uint16_t C_COOL      = 0x07E0;
 uint16_t C_PINK      = 0x07E0;
 
 uint8_t currentTheme = 0;
+uint8_t currentColor = 0;
 int currentBrightness = 128; // 0-255
+
+// escurece uma cor RGB565 pela metade, preservando os campos
+static uint16_t dim565(uint16_t c) {
+  uint16_t r = (c >> 11) & 0x1F, g = (c >> 5) & 0x3F, b = c & 0x1F;
+  return ((r / 3) << 11) | ((g / 3) << 5) | (b / 3);
+}
+
+void applyColor(uint8_t cid) {
+  currentColor = cid;
+  uint16_t c = 0x07E0; // default Green
+  if (cid == 0) c = 0x07E0; // Green
+  else if (cid == 1) c = 0x07FF; // Cyan
+  else if (cid == 2) c = 0xFD20; // Orange
+  else if (cid == 3) c = 0xF81F; // Magenta
+  else if (cid == 4) c = 0xF800; // Red
+
+  uint16_t dim = dim565(c);
+  uint16_t dark = dim565(dim);
+
+  C_TEXT = c;
+  C_ACCENT = c;
+  C_OK = c;
+  C_COOL = c;
+  C_PINK = c;
+  
+  C_DIM = dim;
+  C_CARD_HI = dim;
+  C_TRACK = dark;
+  C_ACCENT_DK = 0x0000;
+  
+  // Z1P0 (Theme 1) overrides - make text white so it's readable
+  if (currentTheme == 1) {
+    C_TEXT = 0xFFFF;
+  }
+}
 
 void applyTheme(uint8_t t) {
   currentTheme = t;
-  if (t == 0) { // Terminal Minimalista
-    C_BG = 0x0000; C_CARD = 0x0000; C_CARD_HI = 0x03E0; C_TRACK = 0x0120;
-    C_TEXT = 0x07E0; C_DIM = 0x03E0; C_ACCENT = 0x07E0; C_ACCENT_DK = 0x0000;
-    C_OK = 0x07E0; C_WARN = 0xFFE0; C_HOT = 0xF800; C_COOL = 0x07E0; C_PINK = 0x07E0;
-  } else if (t == 1) { // z1p0 (Jamaicano / Canabico)
-    C_BG = 0x0000; C_CARD = 0x0000; 
-    C_CARD_HI = 0xFFE0; // Amarelo (Yellow)
-    C_TRACK = 0x0000;   // Fundo preto puro para a animacao brilhar mais
-    C_TEXT = 0xFFFF;    // Branco para legibilidade
-    C_DIM = 0xF800;     // Vermelho (Red)
-    C_ACCENT = 0x07E0;  // Verde (Green)
-    C_ACCENT_DK = 0x0000;
-    C_OK = 0x07E0; C_WARN = 0xFFE0; C_HOT = 0xF800; C_COOL = 0x07E0; C_PINK = 0xF800;
-  } else if (t == 2) { // TEMA GIF SD
-    C_BG = 0x0000; C_CARD = 0x0000; C_CARD_HI = 0x03E0; C_TRACK = 0x0120;
-    C_TEXT = 0x07E0; C_DIM = 0x03E0; C_ACCENT = 0x07E0; C_ACCENT_DK = 0x0000;
-    C_OK = 0x07E0; C_WARN = 0xFFE0; C_HOT = 0xF800; C_COOL = 0x07E0; C_PINK = 0x07E0;
-  }
+  // Initialize base colors, but then immediately overwrite them with the user's chosen palette
+  C_BG = 0x0000; 
+  C_CARD = 0x0000; 
+  C_WARN = 0xFFE0; 
+  C_HOT = 0xF800;
+  
+  applyColor(currentColor);
 }
 
 SPIClass sdSPI(VSPI);
@@ -410,8 +435,28 @@ void drawClock() {
   tft.setTextPadding(0);
 }
 
+bool isBehindUI(int x, int y) {
+  if (screen != SCR_MAIN) return true;
+  if (y < HDR_H + 2) return true;
+  if (y > 240 - 15) return true;
+  int dx = x - 80, dy = y - (HDR_H + 60), d2 = dx*dx + dy*dy;
+  if (d2 >= 38*38 && d2 <= 49*49) return true;
+  if (x >= 40 && x <= 120 && y >= 64 && y <= 98) return true;
+  dx = x - 240; dy = y - (HDR_H + 60); d2 = dx*dx + dy*dy;
+  if (d2 >= 38*38 && d2 <= 49*49) return true;
+  if (x >= 200 && x <= 280 && y >= 64 && y <= 98) return true;
+  if (x >= 10 && x <= 150 && y >= 155 && y <= 216) return true;
+  if (x >= 165 && x <= 310 && y >= 145 && y <= 216) return true;
+  return false;
+}
+
 void drawCard(int x, int y, int w, int h, const char *title) {
-  tft.fillRoundRect(x, y, w, h, 4, C_CARD);
+  if (currentTheme == 2) { // Somente tema 2 (GIF) tem fundo preenchido nos cards? Na verdade o GIF é o fundo.
+    tft.fillRoundRect(x, y, w, h, 4, C_CARD);
+  } else if (currentTheme != 0 && currentTheme != 1 && currentTheme != 3) {
+    tft.fillRoundRect(x, y, w, h, 4, C_CARD);
+  }
+  
   tft.drawRoundRect(x, y, w, h, 4, C_CARD_HI);
   if (title) {
     tft.setTextDatum(TL_DATUM);
@@ -429,8 +474,8 @@ void drawGauge(int cx, int cy, int r, float value, const char *label,
   int aEnd = A0 + (int)((A1 - A0) * v / 100.0f);
   uint16_t col = valid ? levelColor(v, warn, hot) : C_TRACK;
 
-  // so redesenha o anel se mudou (drawSmoothArc e caro)
-  bool changed = (slot < 0) || (gGaugeEnd[slot] != aEnd) || (gGaugeCol[slot] != col);
+  // so redesenha o anel se mudou (drawSmoothArc e caro), exceto no tema 1 (chuva apaga o anel)
+  bool changed = (slot < 0) || (gGaugeEnd[slot] != aEnd) || (gGaugeCol[slot] != col) || (currentTheme == 1);
   if (changed) {
     if (aEnd > A0 + 1) tft.drawSmoothArc(cx, cy, r, ir, A0, aEnd, col, C_CARD, true);
     if (aEnd < A1 - 1) tft.drawSmoothArc(cx, cy, r, ir, aEnd, A1, C_TRACK, C_CARD, true);
@@ -461,7 +506,8 @@ void drawBar(int x, int y, int w, int h, const char *label, float pct,
   int fill = (int)((bw - 2) * constrain(pct, 0.0f, 100.0f) / 100.0f);
   uint16_t col = levelColor(pct, warn, hot);
   if (fill > 0) tft.fillRect(bx + 1, y + 1, fill, h - 2, col);
-  if (fill < bw - 2) tft.fillRect(bx + 1 + fill, y + 1, bw - 2 - fill, h - 2, C_CARD);
+  // apagar a barra
+  if (fill < bw - 2) tft.fillRect(bx + 1 + fill, y + 1, bw - 2 - fill, h - 2, (currentTheme==1)?C_BG:C_CARD);
 
   tft.setTextDatum(MR_DATUM);
   tft.setTextColor(C_TEXT, C_CARD);
@@ -475,7 +521,7 @@ void drawBar(int x, int y, int w, int h, const char *label, float pct,
 // pomodoro) porque valem em TODAS as telas, nao so' na tela 4.
 #define NAV_BAR_H 18
 static const Rect BTN_PREV = {0,          SCR_H - NAV_BAR_H, 54, NAV_BAR_H};
-static const Rect BTN_GEAR = {SCR_W - 30, 0, 30, HDR_H};
+static const Rect BTN_GEAR = {SCR_W - 80, 0, 80, 80}; // Massive invisible hitbox for corner
 static const Rect BTN_NEXT = {SCR_W - 54, SCR_H - NAV_BAR_H, 54, NAV_BAR_H};
 
 void drawDots() {
@@ -490,112 +536,49 @@ void drawDots() {
   tft.drawString(">", BTN_NEXT.x + BTN_NEXT.w / 2, BTN_NEXT.y + BTN_NEXT.h / 2, 2);
 }
 
-// ============================================================== tela 0 =====
-#define NUM_DROPS 30
-struct Drop {
-  int col;
-  int row;
-  int len;
-  int speed;
-  int ticks;
-} rainDrops[NUM_DROPS];
+void initTerminalBg() {
+  tft.setTextDatum(TL_DATUM);
+  tft.setTextColor(dim565(C_ACCENT), C_BG);
+  tft.drawString("root@sys:~# htop", 10, HDR_H + 5, 2);
+  tft.drawString("Mem: 1.2G/16G  Swp: 0K/2G", 10, HDR_H + 25, 1);
+  tft.drawString("Tasks: 128, 1 thr, 85 kthr", 10, HDR_H + 40, 1);
+  tft.drawString("Load average: 1.05 0.98", 10, HDR_H + 55, 1);
+  
+  tft.drawString("root@sys:~# tail -f /var/log/syslog", 10, HDR_H + 80, 2);
+  tft.drawString("kernel: [0.00] Linux version 5.15", 10, HDR_H + 100, 1);
+  tft.drawString("systemd: Started Monitor Daemon.", 10, HDR_H + 115, 1);
+  tft.drawString("root@sys:~# ", 10, 215, 2);
+}
 
-void initRain() {
-  for (int i=0; i<NUM_DROPS; i++) {
-    rainDrops[i].col = random(0, 53);
-    rainDrops[i].row = random(-25, 0);
-    rainDrops[i].len = random(6, 18);
-    rainDrops[i].speed = random(1, 3);
-    rainDrops[i].ticks = 0;
-  }
+void drawTerminalCursor() {
+  if (currentTheme != 0 || screen != SCR_MAIN) return;
+  static bool blinkState = false;
+  blinkState = !blinkState;
+  tft.setTextColor(blinkState ? C_ACCENT : C_BG, C_BG);
+  tft.drawString("_", 104, 215, 2);
 }
 
 const uint8_t leaf_sprite[] PROGMEM = {
-  0b00100000, //   #
-  0b10101000, // # # #
-  0b11111000, // #####
-  0b11111000, // #####
-  0b01110000, //  ###
-  0b00100000, //   #
-  0b00100000, //   #
-  0b00000000
+  0b00010000,
+  0b01010100,
+  0b01010100,
+  0b11111110,
+  0b01111100,
+  0b00111000,
+  0b00010000,
+  0b00010000
 };
 
-bool isBehindUI(int x, int y) {
-  if (screen != SCR_MAIN) return true;
-  if (x >= 25 && x <= 135 && y >= 30 && y <= 135) return true;
-  if (x >= 185 && x <= 295 && y >= 30 && y <= 135) return true;
-  if (x >= 10 && x <= 150 && y >= 140 && y <= 210) return true;
-  if (x >= 160 && x <= 310 && y >= 135 && y <= 210) return true;
-  if (y < HDR_H + 2) return true;
-  if (y > SCR_H - 15) return true;
-  return false;
-}
-
-void drawRain() {
-  if (screen != SCR_MAIN || currentTheme == 2) return;
-  for (int i=0; i<NUM_DROPS; i++) {
-    rainDrops[i].ticks++;
-    if (rainDrops[i].ticks >= rainDrops[i].speed) {
-      rainDrops[i].ticks = 0;
-      
-      int tailRow = rainDrops[i].row - rainDrops[i].len;
-      // Erase tail
-      if (tailRow >= 3 && tailRow < 30) {
-         int x = rainDrops[i].col * 6;
-         int y = tailRow * 8;
-         if (!isBehindUI(x, y)) tft.fillRect(x, y, 6, 8, C_BG);
-      }
-      
-      // Old head becomes trail (darker green, maybe flip character)
-      if (rainDrops[i].row >= 3 && rainDrops[i].row < 30) {
-         int x = rainDrops[i].col * 6;
-         int y = rainDrops[i].row * 8;
-         if (!isBehindUI(x, y)) {
-           if (currentTheme == 1) {
-             tft.fillRect(x, y, 6, 8, C_BG);
-             tft.drawBitmap(x, y, leaf_sprite, 6, 8, 0x0120); // Dark green trail for leaves
-           } else {
-             char c = random(33, 126);
-             tft.fillRect(x, y, 6, 8, C_BG);
-             tft.setTextColor(0x03E0, C_BG); // Dark green
-             tft.drawChar(c, x, y, 1);
-           }
-         }
-      }
-      
-      rainDrops[i].row++;
-      
-      // New head (bright green/white)
-      if (rainDrops[i].row >= 3 && rainDrops[i].row < 30) {
-         int x = rainDrops[i].col * 6;
-         int y = rainDrops[i].row * 8;
-         if (!isBehindUI(x, y)) {
-           if (currentTheme == 1) { // z1p0
-             int colorPick = random(0, 3);
-             uint16_t cColor = 0x07E0;
-             if (colorPick == 1) cColor = 0xFFE0; // Yellow
-             else if (colorPick == 2) cColor = 0xF800; // Red
-             tft.fillRect(x, y, 6, 8, C_BG);
-             tft.drawBitmap(x, y, leaf_sprite, 6, 8, cColor);
-           } else {
-             char c = random(33, 126);
-             tft.fillRect(x, y, 6, 8, C_BG);
-             tft.setTextColor(0xAFE5, C_BG); // Bright whitish-green
-             tft.drawChar(c, x, y, 1);
-           }
-         }
-      }
-      
-      if (tailRow >= 30) {
-        rainDrops[i].col = random(0, 53);
-        rainDrops[i].row = random(-15, 0);
-        rainDrops[i].len = random(6, 18);
-        rainDrops[i].speed = random(1, 3);
-      }
-    }
+void initCannabisBg() {
+  for (int i=0; i<30; i++) {
+    int x = random(10, 310);
+    int y = random(HDR_H + 5, 230);
+    // Don't draw exactly behind the text to avoid readability issues
+    if ((x > 60 && x < 120 && y > 60 && y < 100) || (x > 220 && x < 280 && y > 60 && y < 100)) continue;
+    tft.drawBitmap(x, y, leaf_sprite, 8, 8, dim565(C_ACCENT));
   }
 }
+
 
 
 static const Rect BTN_THEME = {20, 60, 280, 40};
@@ -615,6 +598,7 @@ void screenSetStatic() {
   const char* themeName = "TEMA: TERMINAL";
   if (currentTheme == 1) themeName = "TEMA: Z1P0";
   if (currentTheme == 2) themeName = "TEMA: GIF SD";
+  if (currentTheme == 3) themeName = "TEMA: HEAVY METAL";
   
   drawSetButton(BTN_THEME, themeName, C_ACCENT);
   drawSetButton(BTN_BR_DOWN, "-", C_DIM);
@@ -639,9 +623,15 @@ void screenMainStatic() {
   if (currentTheme == 2 && hasSD) {
     gif.close();
     gif.open(gifPath, GIFOpenFile, GIFCloseFile, GIFReadFile, GIFSeekFile, GIFDraw);
+  } else if (currentTheme == 3 && hasSD) {
+    gif.close();
+    gif.open("/heavymetal.gif", GIFOpenFile, GIFCloseFile, GIFReadFile, GIFSeekFile, GIFDraw);
+  } else if (currentTheme == 1) {
+    initCannabisBg();
   } else {
-    initRain();
+    initTerminalBg();
   }
+  
   drawHeader();
   drawCard(2, HDR_H + 2, 156, 120, nullptr);      // CPU
   drawCard(162, HDR_H + 2, 156, 120, nullptr);    // RAM
@@ -702,19 +692,12 @@ void screenMainDynamic() {
 // ============================================================== tela 1 =====
 void screenGraphStatic() {
   tft.fillScreen(C_BG);
-  initRain();
   drawHeader();
   drawCard(2,   HDR_H + 2,  156, 96, "CPU %");
   drawCard(162, HDR_H + 2,  156, 96, "GPU %");
   drawCard(2,   HDR_H + 102, 156, 96, "RAM %");
   drawCard(162, HDR_H + 102, 156, 96, "TEMP C");
   drawDots();
-}
-
-// escurece uma cor RGB565 pela metade, preservando os campos
-static uint16_t dim565(uint16_t c) {
-  uint16_t r = (c >> 11) & 0x1F, g = (c >> 5) & 0x3F, b = c & 0x1F;
-  return ((r / 3) << 11) | ((g / 3) << 5) | (b / 3);
 }
 
 void plot(int x, int y, int w, int h, uint8_t *data, uint16_t col, const char *unit) {
@@ -759,7 +742,6 @@ void screenGraphDynamic() {
 // ============================================================== tela 2 =====
 void screenTempStatic() {
   tft.fillScreen(C_BG);
-  initRain();
   drawHeader();
   drawCard(2,   HDR_H + 2,  156, 108, "CPU");
   drawCard(162, HDR_H + 2,  156, 108, "GPU");
@@ -853,6 +835,8 @@ void drawButton(const Rect &r, const char *label, uint16_t bg, uint16_t fg,
 
 
 // ========================================================= serial / JSON ===
+#include "mbedtls/base64.h"
+
 void applyJson(const char *json) {
   JsonDocument doc;
   if (deserializeJson(doc, json)) return;
@@ -860,9 +844,22 @@ void applyJson(const char *json) {
   // Comandos de Controle
   JsonVariant vTheme = doc["cmd_theme"];
   if (!vTheme.isNull()) {
-    currentTheme = vTheme.as<uint8_t>() % 3;
+    currentTheme = vTheme.as<uint8_t>() % 4;
     applyTheme(currentTheme);
     prefs.putUInt("theme", currentTheme);
+    needFullDraw = true;
+  }
+  
+  JsonVariant vSet = doc["cmd_settings"];
+  if (!vSet.isNull()) {
+    if (screen != SCR_SET) screen = SCR_SET;
+    else screen = SCR_MAIN;
+    needFullDraw = true;
+  }
+  
+  JsonVariant vCol = doc["cmd_color"];
+  if (!vCol.isNull()) {
+    applyColor(vCol.as<uint8_t>());
     needFullDraw = true;
   }
   
@@ -882,6 +879,39 @@ void applyJson(const char *json) {
     if (currentTheme == 2 && screen == SCR_MAIN) {
        gif.close();
        gif.open(gifPath, GIFOpenFile, GIFCloseFile, GIFReadFile, GIFSeekFile, GIFDraw);
+    }
+  }
+
+  // File Transfer
+  JsonVariant vFile = doc["file_name"];
+  JsonVariant vMode = doc["file_mode"];
+  if (!vFile.isNull() && !vMode.isNull() && hasSD) {
+    const char* fName = vFile.as<const char*>();
+    const char* fMode = vMode.as<const char*>();
+    
+    if (strcmp(fMode, "w") == 0) {
+      File f = SD.open(fName, FILE_WRITE);
+      if (f) f.close();
+    }
+    
+    JsonVariant vData = doc["file_data"];
+    if (!vData.isNull()) {
+      const char* b64 = vData.as<const char*>();
+      int b64Len = strlen(b64);
+      if (b64Len > 0) {
+        uint8_t* bin = (uint8_t*)malloc(b64Len);
+        if (bin) {
+          size_t olen = 0;
+          if (mbedtls_base64_decode(bin, b64Len, &olen, (const unsigned char*)b64, b64Len) == 0) {
+            File f = SD.open(fName, FILE_APPEND);
+            if (f) {
+              f.write(bin, olen);
+              f.close();
+            }
+          }
+          free(bin);
+        }
+      }
     }
   }
 
@@ -1036,7 +1066,7 @@ void handleTap(int16_t x, int16_t y) {
   
   if (screen == SCR_SET) {
     if (inside(BTN_THEME, x, y)) {
-      currentTheme = (currentTheme + 1) % 3;
+      currentTheme = (currentTheme + 1) % 4;
       applyTheme(currentTheme);
       prefs.putUInt("theme", currentTheme);
       needFullDraw = true;
@@ -1162,7 +1192,6 @@ void setup() {
   tft.init();
   tft.setRotation(SCREEN_ROTATION);
   tft.fillScreen(C_BG);
-  initRain();
 
   ts.begin(); // Usando nosso bitbang touch!
 
@@ -1220,15 +1249,18 @@ void loop() {
   }
 
   static uint32_t lastRefresh = 0;
-  static uint32_t lastRain = 0;
-  if (millis() - lastRain >= 50) {
-    lastRain = millis();
-    drawRain();
+  static uint32_t lastCursor = 0;
+  
+  if (millis() - lastCursor >= 500) {
+    lastCursor = millis();
+    drawTerminalCursor();
   }
 
-  if (screen == SCR_MAIN && currentTheme == 2 && hasSD) {
-    if (!gif.playFrame(true, NULL)) {
-      gif.reset();
+  if (screen == SCR_MAIN && hasSD) {
+    if (currentTheme == 2 || currentTheme == 3) {
+      if (!gif.playFrame(true, NULL)) {
+        gif.reset();
+      }
     }
   }
 

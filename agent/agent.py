@@ -785,8 +785,10 @@ def main():
             
     try:
         import tkinter as tk
-        from tkinter import ttk
+        from tkinter import ttk, filedialog, messagebox
         import queue
+        import base64
+        import os
         
         class AgentGUI:
             def __init__(self, root, col, args):
@@ -794,21 +796,18 @@ def main():
                 self.col = col
                 self.args = args
                 self.cmd_queue = queue.Queue()
+                self.transfer_queue = queue.Queue()
+                self.current_color = "#00FF00"
                 
                 self.root.title("Mike Monitor - Controle")
-                self.root.geometry("450x550")
+                self.root.geometry("480x620")
                 self.root.configure(bg="#050505")
                 
-                style = ttk.Style()
-                if "clam" in style.theme_names():
-                    style.theme_use("clam")
-                style.configure(".", background="#050505", foreground="#00FF00", font=("Consolas", 10))
-                style.configure("TFrame", background="#050505")
-                style.configure("TLabel", background="#050505", foreground="#00FF00")
-                style.configure("TButton", background="#1a1a1a", foreground="#00FF00", borderwidth=1, bordercolor="#00FF00")
-                style.map("TButton", background=[("active", "#333333")])
-                style.configure("TRadiobutton", background="#050505", foreground="#00FF00")
-                style.configure("Horizontal.TScale", background="#050505")
+                self.style = ttk.Style()
+                if "clam" in self.style.theme_names():
+                    self.style.theme_use("clam")
+                
+                self.update_styles()
         
                 self.setup_ui()
                 
@@ -817,51 +816,133 @@ def main():
                 self.thread.start()
                 
                 self.root.protocol("WM_DELETE_WINDOW", self.on_close)
+                
+            def update_styles(self):
+                self.style.configure(".", background="#050505", foreground=self.current_color, font=("Consolas", 10))
+                self.style.configure("TFrame", background="#050505")
+                self.style.configure("TLabel", background="#050505", foreground=self.current_color)
+                self.style.configure("TButton", background="#1a1a1a", foreground=self.current_color, borderwidth=1, bordercolor=self.current_color)
+                self.style.map("TButton", background=[("active", "#333333")])
+                self.style.configure("TRadiobutton", background="#050505", foreground=self.current_color)
+                self.style.configure("Horizontal.TScale", background="#050505")
         
             def setup_ui(self):
-                frame = ttk.Frame(self.root, padding=15)
-                frame.pack(fill=tk.BOTH, expand=True)
+                self.frame = ttk.Frame(self.root, padding=15)
+                self.frame.pack(fill=tk.BOTH, expand=True)
         
-                ttk.Label(frame, text="MIKE MONITOR", font=("Consolas", 16, "bold")).pack(pady=10)
+                ttk.Label(self.frame, text="MIKE MONITOR", font=("Consolas", 16, "bold")).pack(pady=5)
                 
-                self.lbl_status = ttk.Label(frame, text="Status: Aguardando conexão...")
+                self.lbl_status = ttk.Label(self.frame, text="Status: Aguardando conexão...")
                 self.lbl_status.pack(pady=5)
                 
+                # Cores
+                self.lf_color = tk.LabelFrame(self.frame, text=" Cor da Chuva Matrix ", bg="#050505", fg=self.current_color, font=("Consolas", 10))
+                self.lf_color.pack(fill=tk.X, pady=5, padx=5)
+                
+                self.color_var = tk.IntVar(value=0)
+                colors = [("Verde", 0, "#00FF00"), ("Ciano", 1, "#00FFFF"), ("Laranja", 2, "#FFA500"), ("Magenta", 3, "#FF00FF"), ("Vermelho", 4, "#FF0000")]
+                
+                col_frame = tk.Frame(self.lf_color, bg="#050505")
+                col_frame.pack(fill=tk.X, padx=10, pady=5)
+                for text, val, hex_col in colors:
+                    rb = tk.Radiobutton(col_frame, text=text, variable=self.color_var, value=val, 
+                                        bg="#050505", fg=hex_col, selectcolor="#1a1a1a", activebackground="#333333", activeforeground=hex_col,
+                                        command=lambda h=hex_col: self.change_color(h))
+                    rb.pack(side=tk.LEFT, padx=3)
+
                 # Tema
-                lf_theme = tk.LabelFrame(frame, text=" Tema do Monitor ", bg="#050505", fg="#00FF00", font=("Consolas", 10))
-                lf_theme.pack(fill=tk.X, pady=10, padx=5)
+                self.lf_theme = tk.LabelFrame(self.frame, text=" Tema do Monitor ", bg="#050505", fg=self.current_color, font=("Consolas", 10))
+                self.lf_theme.pack(fill=tk.X, pady=5, padx=5)
                 
                 self.theme_var = tk.IntVar(value=0)
-                ttk.Radiobutton(lf_theme, text="Terminal Minimalista", variable=self.theme_var, value=0, command=self.send_commands).pack(anchor=tk.W, padx=10, pady=2)
-                ttk.Radiobutton(lf_theme, text="z1p0 (Hacker Verde/Preto)", variable=self.theme_var, value=1, command=self.send_commands).pack(anchor=tk.W, padx=10, pady=2)
-                ttk.Radiobutton(lf_theme, text="GIF do Cartão SD", variable=self.theme_var, value=2, command=self.send_commands).pack(anchor=tk.W, padx=10, pady=2)
+                ttk.Radiobutton(self.lf_theme, text="Terminal Minimalista", variable=self.theme_var, value=0, command=self.send_commands).pack(anchor=tk.W, padx=10, pady=2)
+                ttk.Radiobutton(self.lf_theme, text="z1p0 (Cannabis Bg)", variable=self.theme_var, value=1, command=self.send_commands).pack(anchor=tk.W, padx=10, pady=2)
+                ttk.Radiobutton(self.lf_theme, text="GIF do Cartão SD", variable=self.theme_var, value=2, command=self.send_commands).pack(anchor=tk.W, padx=10, pady=2)
+                ttk.Radiobutton(self.lf_theme, text="Heavy Metal (heavymetal.gif)", variable=self.theme_var, value=3, command=self.send_commands).pack(anchor=tk.W, padx=10, pady=2)
+                
+                # CYD Remote Control
+                btn_frame_remote = tk.Frame(self.lf_theme, bg="#050505")
+                btn_frame_remote.pack(fill=tk.X, padx=10, pady=5)
+                ttk.Button(btn_frame_remote, text="Abrir Configurações na Placa", command=lambda: self.cmd_queue.put({"cmd_settings": 1})).pack(side=tk.LEFT, padx=5)
                 
                 # Brilho
-                lf_bright = tk.LabelFrame(frame, text=" Brilho ", bg="#050505", fg="#00FF00", font=("Consolas", 10))
-                lf_bright.pack(fill=tk.X, pady=10, padx=5)
+                self.lf_bright = tk.LabelFrame(self.frame, text=" Brilho ", bg="#050505", fg=self.current_color, font=("Consolas", 10))
+                self.lf_bright.pack(fill=tk.X, pady=5, padx=5)
                 
                 self.bright_var = tk.DoubleVar(value=128)
-                scale = ttk.Scale(lf_bright, from_=10, to=255, variable=self.bright_var, orient=tk.HORIZONTAL)
-                scale.pack(fill=tk.X, padx=10, pady=10)
+                scale = ttk.Scale(self.lf_bright, from_=10, to=255, variable=self.bright_var, orient=tk.HORIZONTAL)
+                scale.pack(fill=tk.X, padx=10, pady=5)
                 scale.bind("<ButtonRelease-1>", lambda e: self.send_commands())
                 
                 # GIF do SD
-                lf_gif = tk.LabelFrame(frame, text=" Arquivo GIF no Cartão SD ", bg="#050505", fg="#00FF00", font=("Consolas", 10))
-                lf_gif.pack(fill=tk.X, pady=10, padx=5)
+                self.lf_gif = tk.LabelFrame(self.frame, text=" Cartão SD (GIFs) ", bg="#050505", fg=self.current_color, font=("Consolas", 10))
+                self.lf_gif.pack(fill=tk.X, pady=5, padx=5)
                 
-                self.txt_gif = tk.Entry(lf_gif, bg="#1a1a1a", fg="#00FF00", insertbackground="#00FF00", font=("Consolas", 10))
+                self.txt_gif = tk.Entry(self.lf_gif, bg="#1a1a1a", fg=self.current_color, insertbackground=self.current_color, font=("Consolas", 10))
                 self.txt_gif.insert(0, "/background.gif")
                 self.txt_gif.pack(fill=tk.X, padx=10, pady=5)
-                ttk.Button(lf_gif, text="Aplicar GIF", command=self.send_commands).pack(pady=5)
+                
+                btn_frame = tk.Frame(self.lf_gif, bg="#050505")
+                btn_frame.pack(fill=tk.X, padx=10, pady=5)
+                ttk.Button(btn_frame, text="Tocar este GIF", command=self.send_commands).pack(side=tk.LEFT, padx=5)
+                ttk.Button(btn_frame, text="Transferir GIF...", command=self.upload_gif).pack(side=tk.RIGHT, padx=5)
+                
+                self.prog_var = tk.DoubleVar()
+                self.prog_bar = ttk.Progressbar(self.lf_gif, variable=self.prog_var, maximum=100)
                 
                 # Log
-                self.txt_log = tk.Text(frame, height=8, bg="#0a0a0a", fg="#00cc00", font=("Consolas", 8))
-                self.txt_log.pack(fill=tk.BOTH, expand=True, pady=10)
+                self.txt_log = tk.Text(self.frame, height=8, bg="#0a0a0a", fg=self.current_color, font=("Consolas", 8))
+                self.txt_log.pack(fill=tk.BOTH, expand=True, pady=5)
+
+            def change_color(self, hex_col):
+                self.current_color = hex_col
+                self.update_styles()
+                self.lf_color.config(fg=hex_col)
+                self.lf_theme.config(fg=hex_col)
+                self.lf_bright.config(fg=hex_col)
+                self.lf_gif.config(fg=hex_col)
+                self.txt_gif.config(fg=hex_col, insertbackground=hex_col)
+                self.txt_log.config(fg=hex_col)
+                self.send_commands()
+
+            def upload_gif(self):
+                filepath = filedialog.askopenfilename(title="Selecione um arquivo GIF", filetypes=[("Arquivos GIF", "*.gif")])
+                if not filepath: return
+                filename = "/" + os.path.basename(filepath)
+                if len(filename) > 30:
+                    messagebox.showerror("Erro", "Nome do arquivo muito longo.")
+                    return
+                try:
+                    with open(filepath, "rb") as f:
+                        data = f.read()
+                except Exception as e:
+                    messagebox.showerror("Erro", str(e))
+                    return
+                    
+                self.txt_gif.delete(0, tk.END)
+                self.txt_gif.insert(0, filename)
+                
+                def transfer_task():
+                    self.prog_var.set(0)
+                    self.prog_bar.pack(fill=tk.X, padx=10, pady=5)
+                    chunk_size = 512
+                    total = len(data)
+                    self.transfer_queue.put({"file_name": filename, "file_mode": "w", "file_data": ""})
+                    for i in range(0, total, chunk_size):
+                        chunk = data[i:i+chunk_size]
+                        b64 = base64.b64encode(chunk).decode('ascii')
+                        self.transfer_queue.put({"file_name": filename, "file_mode": "a", "file_data": b64})
+                        pct = (i + len(chunk)) / total * 100
+                        self.root.after(0, lambda p=pct: self.prog_var.set(p))
+                    self.root.after(0, lambda: self.prog_bar.pack_forget())
+                    self.root.after(0, lambda: messagebox.showinfo("Sucesso", "GIF transferido com sucesso!"))
+                    self.root.after(0, self.send_commands) # Força o tema a tocar o novo GIF
         
+                threading.Thread(target=transfer_task, daemon=True).start()
+
             def log(self, msg):
                 self.txt_log.insert(tk.END, msg + "\n")
                 self.txt_log.see(tk.END)
-                # Keep log short
                 if int(self.txt_log.index('end-1c').split('.')[0]) > 50:
                     self.txt_log.delete('1.0', '2.0')
                 
@@ -869,13 +950,46 @@ def main():
                 cmd = {
                     "cmd_theme": self.theme_var.get(),
                     "cmd_bright": int(self.bright_var.get()),
-                    "cmd_gif": self.txt_gif.get()
+                    "cmd_gif": self.txt_gif.get(),
+                    "cmd_color": self.color_var.get()
                 }
                 self.cmd_queue.put(cmd)
         
             def on_close(self):
-                self.running = False
-                self.root.destroy()
+                self.root.withdraw()
+                threading.Thread(target=self.setup_tray, daemon=True).start()
+                
+            def setup_tray(self):
+                try:
+                    import pystray
+                    from PIL import Image, ImageDraw
+                    
+                    def create_image():
+                        image = Image.new('RGB', (64, 64), color=(0, 0, 0))
+                        dc = ImageDraw.Draw(image)
+                        dc.rectangle((16, 16, 48, 48), fill=(0, 255, 0))
+                        return image
+
+                    def show_window(icon, item):
+                        icon.stop()
+                        self.root.after(0, self.root.deiconify)
+                        
+                    def quit_app(icon, item):
+                        icon.stop()
+                        self.running = False
+                        self.root.after(0, self.root.destroy)
+                        
+                    menu = pystray.Menu(
+                        pystray.MenuItem('Abrir Mike Monitor', show_window, default=True),
+                        pystray.MenuItem('Sair', quit_app)
+                    )
+                    
+                    self.tray_icon = pystray.Icon("MikeMonitor", create_image(), "Mike Monitor", menu)
+                    self.tray_icon.run()
+                except ImportError:
+                    # Fallback se pystray não estiver instalado
+                    self.running = False
+                    self.root.after(0, self.root.destroy)
                 
             def serial_loop(self):
                 import serial
@@ -895,9 +1009,15 @@ def main():
                             self.root.after(0, lambda m=msg: self.lbl_status.config(text=f"Status: {m}"))
                             self.root.after(0, lambda m=msg: self.log(f"[{m}]"))
         
+                        if not self.transfer_queue.empty():
+                            pkt = self.transfer_queue.get_nowait()
+                            line = json.dumps(pkt, separators=(",", ":")) + "\n"
+                            ser.write(line.encode())
+                            ser.flush()
+                            time.sleep(0.05)
+                            continue
+                            
                         pkt = self.col.sample()
-                        
-                        # Check for queued commands
                         while not self.cmd_queue.empty():
                             cmd = self.cmd_queue.get_nowait()
                             pkt.update(cmd)
