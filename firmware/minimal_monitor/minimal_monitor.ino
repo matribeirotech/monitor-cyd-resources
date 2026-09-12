@@ -620,12 +620,26 @@ void screenSetDynamic() {
 
 void screenMainStatic() {
   tft.fillScreen(C_BG);
-  if (currentTheme == 2 && hasSD) {
+  if ((currentTheme == 2 || currentTheme == 3) && !hasSD) {
+    tft.setTextDatum(MC_DATUM);
+    tft.setTextColor(C_HOT, C_BG);
+    tft.drawString("ERRO: CARTAO SD NAO DETECTADO", SCR_W/2, SCR_H/2, 2);
+  } else if (currentTheme == 2 && hasSD) {
     gif.close();
-    gif.open(gifPath, GIFOpenFile, GIFCloseFile, GIFReadFile, GIFSeekFile, GIFDraw);
+    if (!gif.open(gifPath, GIFOpenFile, GIFCloseFile, GIFReadFile, GIFSeekFile, GIFDraw)) {
+      tft.setTextDatum(MC_DATUM);
+      tft.setTextColor(C_HOT, C_BG);
+      tft.drawString("ERRO: GIF NAO ENCONTRADO", SCR_W/2, SCR_H/2, 2);
+      tft.drawString(gifPath, SCR_W/2, SCR_H/2 + 20, 2);
+    }
   } else if (currentTheme == 3 && hasSD) {
     gif.close();
-    gif.open("/heavymetal.gif", GIFOpenFile, GIFCloseFile, GIFReadFile, GIFSeekFile, GIFDraw);
+    if (!gif.open("/heavymetal.gif", GIFOpenFile, GIFCloseFile, GIFReadFile, GIFSeekFile, GIFDraw)) {
+      tft.setTextDatum(MC_DATUM);
+      tft.setTextColor(C_HOT, C_BG);
+      tft.drawString("ERRO: /heavymetal.gif NAO ENCONTRADO", SCR_W/2, SCR_H/2, 2);
+      tft.drawString("Transfira o GIF usando o painel!", SCR_W/2, SCR_H/2 + 20, 2);
+    }
   } else if (currentTheme == 1) {
     initCannabisBg();
   } else {
@@ -1207,7 +1221,8 @@ void setup() {
   // splash
       tft.setTextDatum(MC_DATUM);
   tft.setTextColor(C_ACCENT, C_BG);
-  tft.drawString("CYBER MONITOR", SCR_W / 2, 24, 4);
+  tft.drawString("CYD HARDWARE", SCR_W / 2, 24, 4);
+  tft.drawString("MONITOR", SCR_W / 2, 54, 4);
   tft.setTextColor(C_DIM, C_BG);
   tft.drawString("esperando o PC...", SCR_W / 2, 170, 2);
   tft.drawString("rode o agent.py no Linux", SCR_W / 2, 192, 2);

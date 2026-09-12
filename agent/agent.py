@@ -799,7 +799,7 @@ def main():
                 self.transfer_queue = queue.Queue()
                 self.current_color = "#00FF00"
                 
-                self.root.title("Mike Monitor - Controle")
+                self.root.title("CYD Hardware Monitor - Controle")
                 self.root.geometry("480x620")
                 self.root.configure(bg="#050505")
                 
@@ -830,7 +830,7 @@ def main():
                 self.frame = ttk.Frame(self.root, padding=15)
                 self.frame.pack(fill=tk.BOTH, expand=True)
         
-                ttk.Label(self.frame, text="MIKE MONITOR", font=("Consolas", 16, "bold")).pack(pady=5)
+                ttk.Label(self.frame, text="CYD HARDWARE MONITOR", font=("Consolas", 16, "bold")).pack(pady=5)
                 
                 self.lbl_status = ttk.Label(self.frame, text="Status: Aguardando conexão...")
                 self.lbl_status.pack(pady=5)
@@ -980,11 +980,11 @@ def main():
                         self.root.after(0, self.root.destroy)
                         
                     menu = pystray.Menu(
-                        pystray.MenuItem('Abrir Mike Monitor', show_window, default=True),
+                        pystray.MenuItem('Abrir CYD Monitor', show_window, default=True),
                         pystray.MenuItem('Sair', quit_app)
                     )
                     
-                    self.tray_icon = pystray.Icon("MikeMonitor", create_image(), "Mike Monitor", menu)
+                    self.tray_icon = pystray.Icon("CYDMonitor", create_image(), "CYD Hardware Monitor", menu)
                     self.tray_icon.run()
                 except ImportError:
                     # Fallback se pystray não estiver instalado
