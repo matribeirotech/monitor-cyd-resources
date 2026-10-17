@@ -3,13 +3,34 @@
 ![Versão](https://img.shields.io/badge/vers%C3%A3o-3.0.0-00FF00?style=for-the-badge)
 ![Plataforma](https://img.shields.io/badge/ESP32-2432S028R%20(CYD)-blue?style=for-the-badge&logo=espressif)
 ![Interface PC](https://img.shields.io/badge/GUI%20PC-Flet%20%2F%20Flutter-02569B?style=for-the-badge&logo=flutter)
+![Autor](https://img.shields.io/badge/Autor-Matheus%20Ribeiro%20(z1po)-FF5500?style=for-the-badge)
 ![Licença](https://img.shields.io/badge/Licen%C3%A7a-MIT-green?style=for-the-badge)
 
 Um **monitor de hardware e terminal de mercado financeiro em tempo real** de código aberto para a placa **ESP32-2432S028R (*Cheap Yellow Display* / CYD 2.8" 320×240)**, controlado **100% pelo PC via USB Serial** através de um painel desktop moderno construído em **Flet (Flutter para Python)**.
 
+---
+
+## 📸 Galeria do Projeto (v3.0 em Funcionamento Real)
+
+### 💻 Painel de Controle Total no PC (Flet / Flutter)
 <p align="center">
-  <img src="main_screen.jpg" alt="Tela Principal CPU + RAM" width="48%" />
-  <img src="z1p0_screen.jpg" alt="Tema Customizado na CYD" width="48%" />
+  <img src="preview/preview-tela-pc-1.jpg" alt="Painel de Controle Total no PC em Flet / Flutter" width="90%" />
+</p>
+
+### 📈 Terminal Bolsa de Valores & Criptomoedas (`LIVE MARKET`) na Placa CYD
+<p align="center">
+  <img src="preview/preview-tela-4.jpg" alt="Tela Bolsa e Cripto - Dólar, Euro, IBOVESPA, S&P500 e Bitcoin 24h" width="49%" />
+  <img src="preview/preview-tela-5.jpg" alt="Tela Bolsa e Cripto com Ticker Tape mostrando S&P500 e CPU" width="49%" />
+</p>
+
+### 🖥️ Customização de Cores em Tempo Real + Letreiro da Bolsa (*Ticker Tape*) no Rodapé
+<p align="center">
+  <img src="preview/preview-tela-1.jpg" alt="Tela Resumo - Tema Verde Matrix com Ticker Tape" width="49%" />
+  <img src="preview/preview-tela-2.jpg" alt="Tela Resumo - Tema Azul Neon com Cotação Dólar e Euro no Rodapé" width="49%" />
+</p>
+<p align="center">
+  <img src="preview/preview-tela-3.jpg" alt="Tela Resumo - Tema Vermelho Crimson com Solana e BNB no Rodapé" width="49%" />
+  <img src="preview/preview-tela-6.jpg" alt="Tela 4x Gráficos em Tempo Real (CPU, RAM, GPU, Temp) + Ticker Tape" width="49%" />
 </p>
 
 ---
@@ -20,7 +41,7 @@ Muitas placas **ESP32-2432S028R (CYD)** sofrem com falhas no controlador resisti
 
 Na **versão 3.0**, toda a dependência de hardware do touch foi **100% removida do firmware** (economizando RAM, CPU e barramentos SPI no ESP32) e **100% do controle foi transferido para o Agente no PC**:
 - Troca instantânea de telas (`< 50ms` via fila *event-driven*).
-- Seletor de cores **RGB565 / HEX** em tempo real que repinta toda a interface da placa na hora.
+- Seletor de cores **RGB565 / HEX** em tempo real que repinta toda a interface da placa na hora (como visto nas fotos acima em Verde, Azul e Vermelho).
 - Controle de brilho do display via **PWM (Pino 21)**.
 - Upload e conversão automática de papéis de parede (`JPG`, `PNG`, `BMP`, `GIF`) do PC direto para o **Cartão MicroSD** da placa pelo próprio cabo USB.
 - **Letreiro Infinito da Bolsa de Valores (*Ticker Tape*)** correndo suavemente no rodapé das telas de hardware enquanto você joga ou trabalha, além de uma **Tela Dedicada ao Mercado Financeiro & Criptomoedas**.
@@ -85,7 +106,7 @@ minimal-monitor/
 │   ├── agent.py                     # Coletor Hardware + Coletor Mercado Financeiro + GUI Flet + Uploader SD
 │   ├── requirements.txt             # Dependências Python do projeto
 │   ├── ui_config.example.json       # Modelo do arquivo de configuração persistida pelo Agente
-│   ├── agent.spec                   # Especificação PyInstaller / Flet Pack
+│   ├── CYD-Hardware-Monitor.spec    # Especificação PyInstaller / Flet Pack
 │   ├── dist/
 │   │   └── CYD-Hardware-Monitor.exe # Executável standalone pronto para Windows (sem precisar instalar Python)
 │   ├── 99-mike-cyd.rules            # Regra udev para porta USB Serial no Linux
@@ -94,8 +115,16 @@ minimal-monitor/
 ├── docs/                            # Documentação Técnica e Arquitetura
 │   └── ARCHITECTURE.md              # Especificação completa do Protocolo Serial JSON v3.0 e pinagem da CYD
 │
+├── preview/                         # Fotos reais da placa CYD e screenshot do Painel Flet (v3.0)
+│   ├── preview-tela-pc-1.jpg        # Screenshot do Painel de Controle Total no PC (Flet / Flutter)
+│   ├── preview-tela-1.jpg           # Tela Resumo (Tema Verde) + Letreiro da Bolsa
+│   ├── preview-tela-2.jpg           # Tela Resumo (Tema Azul) + Letreiro Dólar/Euro
+│   ├── preview-tela-3.jpg           # Tela Resumo (Tema Vermelho) + Letreiro Cripto
+│   ├── preview-tela-4.jpg           # Tela Bolsa & Cripto (Dólar, Euro, IBOV, Criptos e Gráfico BTC)
+│   ├── preview-tela-5.jpg           # Tela Bolsa & Cripto + Ticker S&P500 / CPU
+│   └── preview-tela-6.jpg           # Tela 4x Gráficos em Tempo Real + Letreiro da Bolsa
+│
 ├── imagens-referencia/              # Wallpapers de exemplo (JPG/GIF) prontos para enviar ao Cartão SD
-├── preview/                         # Previews gerados dos componentes e telas
 ├── tools/                           # Utilitários de verificação e simulação offline das telas
 ├── .github/ISSUE_TEMPLATE/          # Templates padronizados para relato de Bugs e sugestões de Features
 ├── CONTRIBUTING.md                  # Guia rápido para desenvolvedores contribuírem com novas telas/sensores
@@ -164,22 +193,22 @@ O Agente Python comunica-se com o ESP32 a `115200 bps` enviando linhas JSON term
     "ram": 62.1, "ramu": 9.9, "ramt": 16.0, "swap": 2.0,
     "gpu": 45.0, "gput": 61.0, "gpuw": 115.0, "vram": 50.0, "gpuname": "RADEON",
     "dsk": 55.6, "dskf": 412.3, "rx": 1.25, "tx": 0.18,
-    "hh": 16, "mm": 30, "up": 86400, "host": "MEU-PC"
+    "hh": 16, "mm": 30, "up": 86400, "host": "z1popc"
   },
   "mkt": {
     "usd": 5.06, "usdc": -0.69,
     "eur": 5.70, "eurc": -0.20,
     "ibov": 205430, "ibovc": -0.52,
     "sp500": 7659, "sp500c": -0.77,
-    "btc": 81530, "btcc": 0.50, "btc_brl": 412786,
-    "eth": 2417.0, "ethc": 0.54,
-    "sol": 103.97, "solc": 1.07,
-    "bnb": 715.87, "bnbc": -0.56,
-    "xrp": 1.30, "xrpc": 0.54,
+    "btc": 81611, "btcc": -0.01, "btc_brl": 413200,
+    "eth": 2420.0, "ethc": 0.29,
+    "sol": 104.09, "solc": 0.42,
+    "bnb": 718.00, "bnbc": -0.48,
+    "xrp": 1.30, "xrpc": -0.12,
     "btch": [42, 48, 51, 60, 75, 82, 95, 100]
   },
   "ui": {
-    "screen": 1,
+    "screen": 6,
     "color": "0x07E0",
     "bg": "megadeth-rust-in-p.jpg",
     "brt": 220,
@@ -206,62 +235,4 @@ Este é um projeto **Open Source** e contribuições da comunidade são muito be
 Distribuído sob a licença **MIT**. Veja o arquivo [`LICENSE`](LICENSE) para mais informações.
 
 ---
-*Projeto arquitetado e escalado por **Matheus Augusto** & comunidade Open Source.*
-
----
-
-## 📡 Resumo do Protocolo Serial JSON (v3.0)
-
-O Agente Python comunica-se com o ESP32 a `115200 bps` enviando linhas JSON terminadas por `\n` (`newline-delimited JSON`):
-
-```json
-{
-  "sys": {
-    "cpu": 24.5, "cput": 54.0, "cpuf": 4200, "cores": 12,
-    "ram": 62.1, "ramu": 9.9, "ramt": 16.0, "swap": 2.0,
-    "gpu": 45.0, "gput": 61.0, "gpuw": 115.0, "vram": 50.0, "gpuname": "RADEON",
-    "dsk": 55.6, "dskf": 412.3, "rx": 1.25, "tx": 0.18,
-    "hh": 16, "mm": 30, "up": 86400, "host": "MEU-PC"
-  },
-  "mkt": {
-    "usd": 5.06, "usdc": -0.69,
-    "eur": 5.70, "eurc": -0.20,
-    "ibov": 205430, "ibovc": -0.52,
-    "sp500": 7659, "sp500c": -0.77,
-    "btc": 81530, "btcc": 0.50, "btc_brl": 412786,
-    "eth": 2417.0, "ethc": 0.54,
-    "sol": 103.97, "solc": 1.07,
-    "bnb": 715.87, "bnbc": -0.56,
-    "xrp": 1.30, "xrpc": 0.54,
-    "btch": [42, 48, 51, 60, 75, 82, 95, 100]
-  },
-  "ui": {
-    "screen": 1,
-    "color": "0x07E0",
-    "bg": "megadeth-rust-in-p.jpg",
-    "brt": 220,
-    "ticker": true
-  }
-}
-```
-> 📖 Para detalhes completos sobre o protocolo de upload de imagens via Serial (Chunked Base64) e pinagem de hardware, consulte [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md).
-
----
-
-## 🤝 Como Contribuir
-
-Este é um projeto **Open Source** e contribuições da comunidade são muito bem-vindas! Seja criando novas telas em `TFT_eSPI`, adicionando novos indicadores financeiros, integrando novos sensores ou melhorando o painel em Flet:
-
-1. Leia o nosso **[Guia de Contribuição (`CONTRIBUTING.md`)](CONTRIBUTING.md)**.
-2. Consulte a **[Arquitetura Técnica (`docs/ARCHITECTURE.md`)](docs/ARCHITECTURE.md)**.
-3. Faça um *Fork* do repositório, crie sua *branch* (`git checkout -b feat/minha-nova-tela`) e abra um **Pull Request**!
-
----
-
-## 📄 Licença
-
-Distribuído sob a licença **MIT**. Veja o arquivo [`LICENSE`](LICENSE) para mais informações.
-
----
-*Projeto arquitetado e escalado por **Matheus Augusto** & comunidade Open Source.*
-
+*Projeto idealizado, arquitetado e desenvolvido por **Matheus Ribeiro -- z1po** & comunidade Open Source.*
