@@ -1,0 +1,9 @@
+{
+  "com_port": "COM6",
+  "screen": 0,
+  "color": "0x07FF",
+  "bg": "",
+  "brt": 220,
+  "ticker": true
+}
+
