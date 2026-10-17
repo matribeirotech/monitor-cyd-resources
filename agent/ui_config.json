@@ -1,0 +1,13 @@
+{
+  "screen": 0,
+  "hex_color": "#00FFFF",
+  "color": "0x07FF",
+  "bg": "megadeth-rust-in-p.jpg",
+  "brt": 255,
+  "ticker": true,
+  "sd_files": [
+    "none",
+    "terminal",
+    "z1p0"
+  ]
+}

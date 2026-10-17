@@ -1,53 +1,55 @@
 #!/usr/bin/env python3
 """
-mike_agent.py - Agente de telemetria do PC (Linux ou Windows) para o CYD
-"Mike Monitor".
+agent.py - Agente PC & Painel de Controle Total em FLET (Flutter) para o
+CYD Hardware Monitor (No-Touch Edition - 100% controlado pelo PC via USB Serial).
 
-Le CPU / GPU / RAM / disco / rede / temperaturas e envia uma linha JSON por
-segundo pela porta serial USB do ESP32.
+Coleta telemetria (LibreHardwareMonitor na porta 8085 / WMI / psutil / nvidia-smi / RTSS)
+e gerencia 100% da interface da placa CYD (Telas, Estúdio de Cores RGB565 em tempo real,
+Imagens de Fundo do Cartão SD com redimensionamento automático 320x240 e upload Serial,
+e Controle de Brilho PWM).
 
-Uso:
-    python3 mike_agent.py                  # auto-detecta a porta
-    python3 mike_agent.py -p /dev/ttyUSB0  # porta fixa (Linux)
-    python3 mike_agent.py -p COM5          # porta fixa (Windows)
-    python3 mike_agent.py --stdout         # so imprime o JSON (teste)
-    python3 mike_agent.py --once           # uma amostra e sai
-
-Requisitos: pip install -r requirements.txt (pyserial, psutil; no Windows
-tambem puxa wmi + pywin32, opcionais -- ver README, secao "Windows").
+Formato do Payload Serial:
+{"sys":{"cpu": 45, "gpu": 60, "ram": 80, "temp": 55, ...},
+ "ui":{"screen": 1, "color": "0x07E0", "bg": "cyberpunk.jpg", "brt": 200}}
 """
 
 import argparse
+import base64
+import inspect
+import io
 import json
+import mmap
 import os
 import platform
+import queue
 import re
 import shutil
 import socket
+import struct
 import subprocess
 import sys
 import threading
 import time
-import mmap
-import struct
-import ctypes
-from collections import deque
+import urllib.request
 from datetime import datetime, timedelta, timezone
 
 IS_WINDOWS = platform.system() == "Windows"
+if sys.stdout is None:
+    sys.stdout = open(os.devnull, "w", encoding="utf-8")
+if sys.stderr is None:
+    sys.stderr = open(os.devnull, "w", encoding="utf-8")
 
 try:
     import psutil
 except ImportError:
-    sys.exit("Faltando psutil. Rode: pip install psutil pyserial")
+    sys.exit("Faltando psutil. Instale as dependencias com: pip install -r agent/requirements.txt")
 
 BAUD = 115200
 INTERVAL = 1.0
+APP_DIR = os.path.dirname(sys.executable) if getattr(sys, "frozen", False) else os.path.dirname(os.path.abspath(__file__))
+CONFIG_FILE = os.path.join(APP_DIR, "ui_config.json")
 
-# Relogio sempre em horario de Brasilia, independente do fuso do PC que roda
-# o agente. Usa zoneinfo (stdlib) quando o SO tem a base IANA disponivel;
-# senao cai para o offset fixo -03:00 (Brasil aboliu o horario de verao em
-# 2019, entao America/Sao_Paulo e' sempre UTC-3).
+# Fuso horario de Brasilia (UTC-3)
 try:
     from zoneinfo import ZoneInfo
     TZ_BRASILIA = ZoneInfo("America/Sao_Paulo")
@@ -58,6 +60,34 @@ except Exception:
 def brasilia_now():
     return datetime.now(TZ_BRASILIA)
 
+
+def rgb_hex_to_rgb565_str(hex_color: str) -> str:
+    """Converte '#RRGGBB' para string hexadecimal RGB565 ex: '0x07E0'."""
+    h = hex_color.strip().lstrip("#")
+    if len(h) != 6:
+        return "0x07E0"
+    try:
+        r = int(h[0:2], 16)
+        g = int(h[2:4], 16)
+        b = int(h[4:6], 16)
+    except ValueError:
+        return "0x07E0"
+    rgb565 = ((r & 0xF8) << 8) | ((g & 0xFC) << 3) | (b >> 3)
+    if rgb565 == 0:
+        rgb565 = 0x0841  # evita preto total invisivel
+    return f"0x{rgb565:04X}"
+
+
+def hex_to_rgb_tuple(hex_color: str) -> tuple[int, int, int]:
+    h = hex_color.strip().lstrip("#")
+    if len(h) != 6:
+        return (0, 255, 0)
+    try:
+        return (int(h[0:2], 16), int(h[2:4], 16), int(h[4:6], 16))
+    except ValueError:
+        return (0, 255, 0)
+
+
 # VID:PID dos conversores USB-serial usados nas placas CYD
 KNOWN_USB_IDS = {
     (0x1A86, 0x7523),  # CH340
@@ -66,14 +96,6 @@ KNOWN_USB_IDS = {
     (0x0403, 0x6001),  # FT232
 }
 
-# "modo game": nome de processo (substring, case-insensitive) que faz o Mike
-# trocar pra tela de jogo. So' emuladores/executaveis de jogo aqui de proposito
-# -- launchers genericos (Steam, Lutris, Heroic...) ficam de fora: eles passam
-# a maior parte do tempo abertos sem nenhum jogo em andamento (o processo de
-# UI da Steam, por exemplo, roda o tempo todo so' com o cliente aberto), entao
-# um nome de launcher aqui deixava o modo game ligado o tempo inteiro por
-# engano. Jogo rodando *pela* Steam e' detectado a parte, pelo caminho do
-# executavel -- ver _is_steam_game(). Complete a lista com --game-proc.
 DEFAULT_GAME_PROCESSES = (
     "pcsx2", "rpcs3", "dolphin-emu", "yuzu", "ryujinx", "cemu", "citra",
     "ppsspp", "duckstation", "mupen64plus", "retroarch", "xemu",
@@ -81,9 +103,6 @@ DEFAULT_GAME_PROCESSES = (
 
 
 def _is_steam_game(exe_path):
-    """Um jogo de verdade instalado pela Steam mora em .../steamapps/common/...
-    -- ao contrario do cliente da Steam em si (Steam.exe/steamwebhelper), que
-    roda de outro diretorio e fica aberto o tempo todo, com ou sem jogo."""
     if not exe_path:
         return False
     return "steamapps/common" in exe_path.replace("\\", "/").lower()
@@ -106,50 +125,43 @@ def read_int(path):
         return None
 
 
-# raiz do disco a medir: "/" no Linux, a unidade do sistema (normalmente
-# "C:\") no Windows -- os.path.abspath(os.sep) resolve os dois sozinho
 SYSTEM_ROOT = os.path.abspath(os.sep)
 
 
 def load_average():
-    """Media de carga (1 min). So' existe em Unix -- Windows nao tem esse
-    conceito, entao a metrica fica ausente por la (igual outro sensor que
-    falte), em vez de derrubar o agente."""
     try:
         return round(os.getloadavg()[0], 2)
     except (OSError, AttributeError):
         return None
 
+
 def get_rtss_fps():
-    """Lê o FPS do RTSS (RivaTuner Statistics Server) compartilhado na memória."""
+    """Le o FPS do RTSS (RivaTuner Statistics Server) compartilhado na memoria."""
     if not IS_WINDOWS:
         return None
     try:
         shmem = mmap.mmap(-1, 32768, "RTSSSharedMemoryV2", access=mmap.ACCESS_READ)
-        sig = struct.unpack('<I', shmem[0:4])[0]
+        sig = struct.unpack("<I", shmem[0:4])[0]
         if sig != 0x52545353:
             shmem.close()
             return None
-            
-        app_arr_offset = struct.unpack('<I', shmem[12:16])[0]
-        app_arr_size = struct.unpack('<I', shmem[16:20])[0]
-        app_entry_size = struct.unpack('<I', shmem[8:12])[0]
+
+        app_arr_offset = struct.unpack("<I", shmem[12:16])[0]
+        app_arr_size = struct.unpack("<I", shmem[16:20])[0]
+        app_entry_size = struct.unpack("<I", shmem[8:12])[0]
         total_size = app_arr_offset + app_arr_size * app_entry_size
         shmem.close()
-        
+
         shmem = mmap.mmap(-1, total_size, "RTSSSharedMemoryV2", access=mmap.ACCESS_READ)
-        
-        # Iterar pelas AppEntries para encontrar o jogo rodando
         for i in range(app_arr_size):
             offset = app_arr_offset + i * app_entry_size
-            proc_id = struct.unpack('<I', shmem[offset:offset+4])[0]
+            proc_id = struct.unpack("<I", shmem[offset:offset + 4])[0]
             if proc_id == 0:
                 continue
-            
-            frame_time = struct.unpack('<I', shmem[offset+280:offset+284])[0]
+            frame_time = struct.unpack("<I", shmem[offset + 280:offset + 284])[0]
             if frame_time > 0:
                 fps = 1000000.0 / frame_time
-                if fps > 0 and fps < 2000:
+                if 0 < fps < 2000:
                     shmem.close()
                     return int(fps + 0.5)
         shmem.close()
@@ -158,16 +170,7 @@ def get_rtss_fps():
         return None
 
 
-
-# ------------------------------------- sensores no Windows (LibreHardwareMonitor) ---
-# O Windows nao tem hwmon/sysfs, entao psutil.sensors_temperatures()/sensors_fans()
-# simplesmente nao existem la (viram AttributeError, ja tratado abaixo). Se o
-# LibreHardwareMonitor -- ou o antigo OpenHardwareMonitor -- estiver rodando
-# como administrador com "Remote Web Server"/WMI habilitado (ligado por padrao),
-# o agente completa temperatura, fan e GPU lendo o WMI dele. Precisa do pacote
-# `wmi` (so' instala no Windows, ver requirements.txt); sem isso, ou sem o
-# programa rodando, essas metricas ficam ausentes -- igual quando falta
-# lm-sensors no Linux, o resto do agente funciona normal.
+# ----------------------------- Sensores no Windows (LibreHardwareMonitor) ---
 _lhm = None
 _lhm_tried = False
 
@@ -186,7 +189,7 @@ def _lhm_connect():
     for ns in ("LibreHardwareMonitor", "OpenHardwareMonitor"):
         try:
             w = wmi.WMI(namespace=f"root/{ns}")
-            w.Sensor()  # confere se o namespace responde de verdade
+            w.Sensor()
             _lhm = w
             break
         except Exception:
@@ -195,7 +198,6 @@ def _lhm_connect():
 
 
 def _lhm_sensors(kind):
-    """Sensores WMI do LibreHardwareMonitor de um tipo: Temperature/Load/Fan/Power."""
     w = _lhm_connect()
     if not w:
         return []
@@ -205,26 +207,25 @@ def _lhm_sensors(kind):
         return []
 
 
-# ------------------------------------------------------------ temperatura ---
 CPU_TEMP_KEYS = ("k10temp", "zenpower", "coretemp", "cpu_thermal",
                  "acpitz", "soc_thermal", "thinkpad")
 CPU_LABEL_HINTS = ("tctl", "tdie", "package", "cpu", "core 0", "composite")
 
 
-
-import urllib.request
-import json
-
 def _get_lhm_web_data():
+    """Consulta o servidor web do LibreHardwareMonitor na porta 8085."""
     try:
-        with urllib.request.urlopen('http://localhost:8085/data.json', timeout=1) as url:
-            return json.loads(url.read().decode())
+        with urllib.request.urlopen("http://localhost:8085/data.json", timeout=0.8) as url:
+            return json.loads(url.read().decode("utf-8", errors="ignore"))
     except Exception:
         return None
 
+
 def _find_web_sensors(node, kind, name_hints=None):
     results = []
-    if not node: return results
+    if not node:
+        return results
+
     def recurse(n, path):
         t = (n.get("Text") or "").lower()
         curr_path = path + [t]
@@ -239,21 +240,20 @@ def _find_web_sensors(node, kind, name_hints=None):
                     results.append(val)
         for c in n.get("Children", []):
             recurse(c, curr_path)
+
     recurse(node, [])
     parsed = []
     for r in results:
         try:
-            num = float(r.split()[0].replace(',', '.'))
+            num = float(r.split()[0].replace(",", "."))
             parsed.append(num)
-        except:
+        except Exception:
             pass
     return parsed
 
 
-def cpu_temperature():
-    """Melhor palpite para a temperatura da CPU, em graus C."""
-    # psutil.sensors_temperatures so' existe em builds Linux/BSD -- no Windows
-    # o atributo nem existe, e isso ja cai no except (vira AttributeError).
+def cpu_temperature(web_data=None):
+    """Retorna a temperatura da CPU em graus Celsius."""
     temps = None
     try:
         temps = psutil.sensors_temperatures()
@@ -261,7 +261,6 @@ def cpu_temperature():
         pass
 
     if temps:
-        # 1) chip conhecido + label que parece do pacote/CPU
         for chip in CPU_TEMP_KEYS:
             for name, entries in temps.items():
                 if chip not in name.lower():
@@ -272,7 +271,6 @@ def cpu_temperature():
                 if entries:
                     return round(entries[0].current, 1)
 
-        # 2) fallback: maior temperatura vista
         best = None
         for entries in temps.values():
             for e in entries:
@@ -281,7 +279,13 @@ def cpu_temperature():
         if best:
             return round(best, 1)
 
-    # 3) Windows sem hwmon: tenta o LibreHardwareMonitor (ver _lhm_sensors)
+    if web_data is None:
+        web_data = _get_lhm_web_data()
+    if web_data:
+        web_temps = _find_web_sensors(web_data, "temperature", ["cpu", "package", "tctl", "tdie", "core"])
+        if web_temps:
+            return round(max(web_temps), 1)
+
     cpu_sensors = [s for s in _lhm_sensors("Temperature")
                    if "cpu" in (s.Name or "").lower()
                    or "cpu" in (s.Parent or "").lower()]
@@ -291,13 +295,6 @@ def cpu_temperature():
             return round(s.Value, 1)
     if cpu_sensors:
         return round(cpu_sensors[0].Value, 1)
-
-    # 4) Tenta o Web Server do LibreHardwareMonitor
-    web_data = _get_lhm_web_data()
-    if web_data:
-        web_temps = _find_web_sensors(web_data, "temperature", ["cpu", "package", "tctl", "tdie", "core"])
-        if web_temps:
-            return round(max(web_temps), 1)
 
     return None
 
@@ -318,15 +315,12 @@ def fan_rpm():
 
 
 # -------------------------------------------------------------------- GPU ---
-_gpu_kind = None       # "nvidia" | "amd" | "intel" | "none"
+_gpu_kind = None
 _amd_paths = {}
-_nvidia_smi = None      # caminho resolvido do executavel
+_nvidia_smi = None
 
 
 def _find_nvidia_smi():
-    """No Linux o nvidia-smi quase sempre esta no PATH; no Windows o instalador
-    do driver as vezes nao poe (ou poe so' pro instalador), entao completa com
-    os dois caminhos padrao."""
     exe = shutil.which("nvidia-smi")
     if exe:
         return exe
@@ -347,8 +341,6 @@ def _detect_gpu():
     if _nvidia_smi and run([_nvidia_smi, "-L"]):
         _gpu_kind = "nvidia"
         return
-    # AMD via sysfs (amdgpu) -- so' existe no Linux, no Windows o glob abaixo
-    # simplesmente nao acha nada e cai pro LibreHardwareMonitor em gpu_stats()
     import glob
     for card in sorted(glob.glob("/sys/class/drm/card[0-9]/device")):
         if os.path.exists(os.path.join(card, "gpu_busy_percent")):
@@ -363,7 +355,6 @@ def _detect_gpu():
             }
             _gpu_kind = "amd"
             return
-    # Intel integrada: so temperatura via hwmon i915
     for hw in glob.glob("/sys/class/hwmon/hwmon*"):
         try:
             with open(os.path.join(hw, "name")) as f:
@@ -376,9 +367,62 @@ def _detect_gpu():
     _gpu_kind = "none"
 
 
-def gpu_stats():
+def _lhm_gpu_stats():
+    temps = _lhm_sensors("Temperature")
+    gpu_temp = next((s.Value for s in temps if "gpu" in (s.Name or "").lower()), None)
+    if gpu_temp is None:
+        return None
+    loads = _lhm_sensors("Load")
+    powers = _lhm_sensors("Power")
+    gpu_load = next((s.Value for s in loads
+                     if (s.Name or "").lower() in ("gpu core", "gpu")), None)
+    gpu_power = next((s.Value for s in powers if "gpu" in (s.Name or "").lower()), None)
+    parent = next((s.Parent or "" for s in temps if "gpu" in (s.Name or "").lower()), "")
+    name = "AMD" if "amdgpu" in parent.lower() else ("INTEL" if "intelgpu" in parent.lower() else "GPU")
+    return {
+        "gpu": round(gpu_load, 1) if gpu_load is not None else 0.0,
+        "gput": round(gpu_temp, 1),
+        "gpuw": round(gpu_power, 1) if gpu_power is not None else None,
+        "gpuname": name,
+    }
+
+
+def _lhm_gpu_stats_web(web_data=None):
+    if web_data is None:
+        web_data = _get_lhm_web_data()
+    if not web_data:
+        return None
+    gpu_temps = _find_web_sensors(web_data, "temperature", ["gpu", "hot spot"])
+    if not gpu_temps:
+        gpu_temps = _find_web_sensors(web_data, "temperature", ["tctl", "tdie", "package"])
+    gpu_loads = _find_web_sensors(web_data, "load", ["gpu core", "d3d 3d"])
+    gpu_powers = _find_web_sensors(web_data, "power", ["gpu", "package"])
+    vram_used = _find_web_sensors(web_data, "data", ["gpu memory used", "d3d dedicated memory used"])
+    vram_total = _find_web_sensors(web_data, "data", ["gpu memory total", "d3d dedicated memory total"])
+
+    if not gpu_temps and not gpu_loads:
+        return None
+
+    vu_mb = vram_used[0] if vram_used else None
+    vt_mb = vram_total[0] if vram_total else None
+    vram_pct = round(100.0 * vu_mb / vt_mb, 1) if (vu_mb is not None and vt_mb) else None
+
+    return {
+        "gpu": round(max(gpu_loads), 1) if gpu_loads else 0.0,
+        "gput": round(max(gpu_temps), 1) if gpu_temps else None,
+        "gpuw": round(gpu_powers[0], 1) if gpu_powers else None,
+        "vram": vram_pct,
+        "vramu": round(vu_mb / 1024.0, 1) if vu_mb is not None else None,
+        "vramt": round(vt_mb / 1024.0, 1) if vt_mb is not None else None,
+        "gpuname": "RADEON",
+    }
+
+
+def gpu_stats(web_data=None):
     if _gpu_kind is None:
         _detect_gpu()
+
+    web = _lhm_gpu_stats_web(web_data)
 
     if _gpu_kind == "nvidia":
         q = run([_nvidia_smi,
@@ -395,7 +439,7 @@ def gpu_stats():
                     return None
             used, total = num(2), num(3)
             return {
-                "gpu": num(0),
+                "gpu": num(0) if num(0) is not None else 0.0,
                 "gput": num(1),
                 "vram": round(100.0 * used / total, 1) if used and total else None,
                 "vramu": round(used / 1024.0, 1) if used else None,
@@ -412,7 +456,7 @@ def gpu_stats():
         vt = read_int(_amd_paths.get("vram_total") or "")
         pw = read_int(_amd_paths.get("power") or "")
         return {
-            "gpu": busy,
+            "gpu": busy if busy is not None else 0.0,
             "gput": round(temp / 1000.0, 1) if temp else None,
             "vram": round(100.0 * vu / vt, 1) if vu and vt else None,
             "vramu": round(vu / 1073741824.0, 1) if vu else None,
@@ -422,224 +466,23 @@ def gpu_stats():
             "gpuname": "AMD",
         }
 
-    if _gpu_kind == "intel":
-        temp = read_int(_amd_paths.get("temp") or "")
-        return {"gput": round(temp / 1000.0, 1) if temp else None, "gpuname": "INTEL"}
-
-    # Nada achado pelos metodos de cima (tipico do Windows sem NVIDIA): tenta
-    # o LibreHardwareMonitor, que expoe GPU AMD/Intel/NVIDIA de forma generica
-    lhm = _lhm_gpu_stats()
-    if lhm:
-        return lhm
-        
-    web = _lhm_gpu_stats_web()
     if web:
         return web
 
-    return {"gpuname": None}
+    lhm = _lhm_gpu_stats()
+    if lhm:
+        return lhm
 
+    if _gpu_kind == "intel":
+        temp = read_int(_amd_paths.get("temp") or "")
+        return {"gpu": 0.0, "gput": round(temp / 1000.0, 1) if temp else None, "gpuname": "INTEL"}
 
-def _lhm_gpu_stats():
-    """GPU generica via LibreHardwareMonitor -- cobre AMD/Intel no Windows,
-    onde nao tem sysfs/hwmon pra ler direto."""
-    temps = _lhm_sensors("Temperature")
-    gpu_temp = next((s.Value for s in temps if "gpu" in (s.Name or "").lower()), None)
-    if gpu_temp is None:
-        return None
-    loads = _lhm_sensors("Load")
-    powers = _lhm_sensors("Power")
-    gpu_load = next((s.Value for s in loads
-                      if (s.Name or "").lower() in ("gpu core", "gpu")), None)
-    gpu_power = next((s.Value for s in powers if "gpu" in (s.Name or "").lower()), None)
-    parent = next((s.Parent or "" for s in temps if "gpu" in (s.Name or "").lower()), "")
-    name = "AMD" if "amdgpu" in parent.lower() else ("INTEL" if "intelgpu" in parent.lower() else "GPU")
-    return {
-        "gpu": round(gpu_load, 1) if gpu_load is not None else None,
-        "gput": round(gpu_temp, 1),
-        "gpuw": round(gpu_power, 1) if gpu_power is not None else None,
-        "gpuname": name,
-    }
-
-def _lhm_gpu_stats_web():
-    web_data = _get_lhm_web_data()
-    if not web_data:
-        return None
-    gpu_temps = _find_web_sensors(web_data, "temperature", ["gpu"])
-    if not gpu_temps:
-        return None
-    gpu_loads = _find_web_sensors(web_data, "load", ["gpu"])
-    gpu_powers = _find_web_sensors(web_data, "power", ["gpu"])
-    return {
-        "gpu": round(max(gpu_loads), 1) if gpu_loads else None,
-        "gput": round(max(gpu_temps), 1),
-        "gpuw": round(max(gpu_powers), 1) if gpu_powers else None,
-        "gpuname": "GPU",
-    }
-
-
-
-# ------------------------------------------------------------- journalctl ---
-# Prioridades do syslog: 0 emerg, 1 alert, 2 crit, 3 err, 4 warning,
-#                        5 notice, 6 info, 7 debug
-PRIO_ERR = 3
-PRIO_WARN = 4
-PRIO_CRIT = 2
-
-# Limites casados com a tela de logs: a fonte 1 do TFT_eSPI tem 6px por
-# caractere, e "[E] unit: msg" precisa caber nos 316px uteis.
-MSG_MAX = 36
-UNIT_MAX = 10
-SEND_MAX = 3          # linhas novas por pacote
-RATE_WINDOW = 60.0    # janela da taxa de erros, em segundos
-
-_ANSI = re.compile(r"\x1b\[[0-9;]*[A-Za-z]")
-_WS = re.compile(r"\s+")
-
-
-def clean_msg(s):
-    """Deixa a mensagem em ASCII curto: as fontes do display nao tem acento."""
-    s = _ANSI.sub("", s or "")
-    s = _WS.sub(" ", s).strip()
-    s = (s.replace("ç", "c").replace("ã", "a").replace("á", "a").replace("é", "e")
-          .replace("í", "i").replace("ó", "o").replace("ú", "u").replace("â", "a")
-          .replace("ê", "e").replace("ô", "o").replace("õ", "o").replace("à", "a"))
-    s = s.encode("ascii", "ignore").decode("ascii")
-    return s[:MSG_MAX]
-
-
-class JournalFollower(threading.Thread):
-    """Segue `journalctl -f` numa thread e acumula o que interessa.
-
-    Guarda contadores, taxa de erros e as linhas novas ainda nao enviadas.
-    O snapshot() devolve o delta e limpa o que ja foi entregue.
-    """
-
-    daemon = True
-
-    def __init__(self, units=None, since_boot=False):
-        super().__init__()
-        self.units = units or []
-        self.since_boot = since_boot
-        self.lock = threading.Lock()
-        self.pending = deque(maxlen=20)
-        self.err_total = 0
-        self.warn_total = 0
-        self.err_times = deque()
-        self.crit_seen = False
-        self.ok = False
-        self.error = None
-        self.proc = None
-
-    # -------------------------------------------------------------- setup --
-    @staticmethod
-    def available():
-        return shutil.which("journalctl") is not None
-
-    def _cmd(self):
-        cmd = ["journalctl", "-f", "-o", "json", "--no-pager"]
-        # -n 0 = nao despeja o historico, so o que chegar daqui pra frente
-        cmd += ["-n", "0"] if not self.since_boot else ["-b"]
-        # PRIORITY<=4 ja filtra no journald: menos dado atravessando o pipe
-        cmd += ["-p", "4"]
-        for u in self.units:
-            cmd += ["-u", u]
-        return cmd
-
-    # ---------------------------------------------------------------- run --
-    def run(self):
-        try:
-            self.proc = subprocess.Popen(
-                self._cmd(), stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
-                text=True, bufsize=1)
-        except Exception as e:
-            self.error = str(e)
-            return
-
-        self.ok = True
-        for line in self.proc.stdout:
-            line = line.strip()
-            if not line or not line.startswith("{"):
-                continue
-            try:
-                ent = json.loads(line)
-            except Exception:
-                continue
-            self._ingest(ent)
-
-    def _ingest(self, ent):
-        try:
-            prio = int(ent.get("PRIORITY", 6))
-        except (TypeError, ValueError):
-            prio = 6
-        if prio > PRIO_WARN:
-            return
-
-        unit = (ent.get("_SYSTEMD_UNIT") or ent.get("SYSLOG_IDENTIFIER")
-                or ent.get("_COMM") or "?")
-        unit = unit.replace(".service", "")[:UNIT_MAX]
-        msg = ent.get("MESSAGE")
-        if isinstance(msg, list):      # journald pode devolver bytes como lista
-            try:
-                msg = bytes(msg).decode("utf-8", "ignore")
-            except Exception:
-                msg = str(msg)
-        msg = clean_msg(msg)
-        if not msg:
-            return
-
-        now = time.time()
-        with self.lock:
-            if prio <= PRIO_ERR:
-                self.err_total += 1
-                self.err_times.append(now)
-                if prio <= PRIO_CRIT:
-                    self.crit_seen = True
-            else:
-                self.warn_total += 1
-            self.pending.append((prio, unit, msg))
-
-    # ----------------------------------------------------------- snapshot --
-    def snapshot(self):
-        now = time.time()
-        with self.lock:
-            while self.err_times and now - self.err_times[0] > RATE_WINDOW:
-                self.err_times.popleft()
-            rate = len(self.err_times) * (60.0 / RATE_WINDOW)
-
-            new = []
-            # prioriza as mais graves quando estoura o limite do pacote
-            items = sorted(self.pending, key=lambda t: t[0])[:SEND_MAX]
-            for prio, unit, msg in items:
-                new.append([prio, unit, msg])
-            n_new = len(self.pending)
-            self.pending.clear()
-
-            crit = self.crit_seen
-            self.crit_seen = False
-
-            out = {
-                "le": self.err_total,
-                "lw": self.warn_total,
-                "lr": round(rate, 1),
-                "ln": n_new,
-                "lc": 1 if crit else 0,
-            }
-            if new:
-                out["lg"] = new
-            return out
-
-    def stop(self):
-        if self.proc:
-            try:
-                self.proc.terminate()
-            except Exception:
-                pass
+    return {"gpu": 0.0, "gpuname": None}
 
 
 # --------------------------------------------------------------- coletor ----
 class Collector:
-    def __init__(self, journal=None, game_processes=()):
-        self.journal = journal
+    def __init__(self, game_processes=()):
         psutil.cpu_percent(interval=None)
         self.host = socket.gethostname()[:14]
         self.prev_net = psutil.net_io_counters()
@@ -647,12 +490,18 @@ class Collector:
         self.prev_t = time.time()
         self.cores = psutil.cpu_count(logical=True)
         self.game_processes = tuple(g.lower() for g in DEFAULT_GAME_PROCESSES + tuple(game_processes))
+        self._last_proc_scan = 0.0
+        self._cached_top = ""
+        self._cached_gaming = False
 
-    def sample(self):
+    def sample_sys(self):
+        """Coleta todas as metricas do sistema para o objeto 'sys' do JSON."""
         now = time.time()
         dt = max(now - self.prev_t, 0.1)
 
+        web_data = _get_lhm_web_data()
         cpu = psutil.cpu_percent(interval=None)
+        cput = cpu_temperature(web_data)
         freq = psutil.cpu_freq()
         vm = psutil.virtual_memory()
         sw = psutil.swap_memory()
@@ -672,30 +521,33 @@ class Collector:
         self.prev_disk = dio
         self.prev_t = now
 
-        # processo que mais consome CPU, e se tem algo de jogo rodando --
-        # os dois precisam varrer todo mundo, entao fazem isso numa passada so
-        top = ""
-        gaming = False
-        try:
-            procs = []
-            for p in psutil.process_iter(["name", "cpu_percent", "exe"]):
-                name = p.info["name"] or ""
-                if p.info["cpu_percent"]:
-                    procs.append((p.info["cpu_percent"], name))
-                if not gaming:
-                    low = name.lower()
-                    gaming = (any(g in low for g in self.game_processes)
-                              or _is_steam_game(p.info.get("exe")))
-            if procs:
-                top = max(procs)[1][:12]
-        except Exception:
-            pass
+        # Varredura de processos com cache de 5s para manter uso de CPU quase zero
+        if now - self._last_proc_scan >= 5.0:
+            self._last_proc_scan = now
+            top = ""
+            gaming = False
+            try:
+                procs = []
+                for p in psutil.process_iter(["name", "cpu_percent", "exe"]):
+                    name = p.info["name"] or ""
+                    if p.info["cpu_percent"]:
+                        procs.append((p.info["cpu_percent"], name))
+                    if not gaming:
+                        low = name.lower()
+                        gaming = (any(g in low for g in self.game_processes)
+                                  or _is_steam_game(p.info.get("exe")))
+                if procs:
+                    top = max(procs)[1][:12]
+            except Exception:
+                pass
+            self._cached_top = top
+            self._cached_gaming = gaming
 
         br = brasilia_now()
-
-        d = {
+        sys_data = {
             "cpu": round(cpu, 1),
-            "cput": cpu_temperature(),
+            "temp": cput,
+            "cput": cput,
             "cpuf": int(freq.current) if freq and freq.current else None,
             "cores": self.cores,
             "load": load_average(),
@@ -712,18 +564,14 @@ class Collector:
             "rx": round(rx, 2),
             "tx": round(tx, 2),
             "up": int(now - psutil.boot_time()),
-            "fan": fan_rpm(),
+            "fan": fan_rpm() if not web_data else None,
             "host": self.host,
-            "top": top,
-            "game": gaming,
-            "fps": get_rtss_fps() if gaming else None,
+            "top": self._cached_top,
+            "game": self._cached_gaming,
+            "fps": get_rtss_fps() if self._cached_gaming else None,
         }
-        d.update(gpu_stats())
-        # remove chaves nulas -> linha serial menor
-        d = {k: v for k, v in d.items() if v is not None}
-        if self.journal is not None:
-            d.update(self.journal.snapshot())
-        return d
+        sys_data.update(gpu_stats(web_data))
+        return {k: v for k, v in sys_data.items() if v is not None}
 
 
 # ---------------------------------------------------------------- serial ----
@@ -736,355 +584,1188 @@ def find_port():
     for p in cands:
         if p.vid is not None and (p.vid, p.pid) in KNOWN_USB_IDS:
             return p.device
-    # so' chega aqui se o VID:PID nao bateu com nenhum chip conhecido -- pega
-    # qualquer coisa com nome de porta serial (ttyUSB/ttyACM no Linux, COM* no
-    # Windows) como ultimo palpite
     for p in cands:
         if re.search(r"ttyUSB|ttyACM|^COM\d+$", p.device):
             return p.device
     return None
 
 
+def prepare_image_for_cyd(filepath: str) -> tuple[str, bytes]:
+    """
+    Prepara uma imagem do PC para o Cartao SD da CYD (320x240):
+    - Se for .gif: envia os bytes originais.
+    - Se for .jpg, .jpeg, .png, .bmp: redimensiona/recorta em 320x240 usando Pillow
+      e converte para JPEG Baseline otimizado (~15 KB) para transferencia rapida
+      via Serial e compatibilidade 100% com o TJpg_Decoder do ESP32.
+    """
+    ext = os.path.splitext(filepath)[1].lower()
+    raw_base = re.sub(r"[^a-zA-Z0-9_\-]", "_", os.path.splitext(os.path.basename(filepath))[0])[:18]
+
+    if ext == ".gif":
+        with open(filepath, "rb") as f:
+            return f"{raw_base}.gif", f.read()
+
+    try:
+        from PIL import Image, ImageOps
+        img = Image.open(filepath).convert("RGB")
+        img = ImageOps.fit(img, (320, 240), method=Image.Resampling.LANCZOS)
+        buf = io.BytesIO()
+        img.save(buf, format="JPEG", quality=82, optimize=True, progressive=False)
+        return f"{raw_base}.jpg", buf.getvalue()
+    except ImportError:
+        with open(filepath, "rb") as f:
+            return f"{raw_base}{ext}", f.read()
+
+
+def load_ui_config():
+    defaults = {
+        "screen": 1,
+        "hex_color": "#00FF00",
+        "color": "0x07E0",
+        "bg": "none",
+        "brt": 200,
+        "ticker": True,
+        "sd_files": [
+            "none",
+            "terminal",
+            "z1p0",
+            "cyberpunk.jpg",
+            "megadeth.jpg",
+            "megadeth2.jpg",
+            "megadeth-rust-in-peace.jpg",
+            "pantera-vulgar-display-of-power.jpg",
+            "heavymetal.gif",
+            "background.gif",
+        ],
+    }
+    if os.path.isfile(CONFIG_FILE):
+        try:
+            with open(CONFIG_FILE, "r", encoding="utf-8") as f:
+                saved = json.load(f)
+                defaults.update(saved)
+        except Exception:
+            pass
+    return defaults
+
+
+def save_ui_config(cfg):
+    try:
+        with open(CONFIG_FILE, "w", encoding="utf-8") as f:
+            json.dump(cfg, f, indent=2, ensure_ascii=False)
+    except Exception:
+        pass
+
+
+# ========================================== COLETOR DE MERCADO FINANCEIRO ====
+class MarketCollector:
+    """
+    Coleta cotacoes do mercado financeiro em tempo real em uma thread separada
+    (nao bloqueia o loop de 1s de telemetria de hardware):
+      - Cambio Fiat: Dolar (USD/BRL) e Euro (EUR/BRL) via AwesomeAPI (fallback Yahoo Finance)
+      - Criptomoedas Principais: BTC, ETH, SOL, BNB, XRP + Curva 24h do BTC via Binance Public API
+      - Bolsa de Valores: IBOVESPA (^BVSP) e S&P 500 (^GSPC) via Yahoo Finance
+    """
+
+    def __init__(self, refresh_interval: float = 20.0):
+        self.refresh_interval = refresh_interval
+        self._lock = threading.Lock()
+        self._data = {
+            "usd": 0.0, "usdc": 0.0,
+            "eur": 0.0, "eurc": 0.0,
+            "ibov": 0.0, "ibovc": 0.0,
+            "sp500": 0.0, "sp500c": 0.0,
+            "btc": 0.0, "btcc": 0.0, "btc_brl": 0.0,
+            "eth": 0.0, "ethc": 0.0,
+            "sol": 0.0, "solc": 0.0,
+            "bnb": 0.0, "bnbc": 0.0,
+            "xrp": 0.0, "xrpc": 0.0,
+            "btch": [],
+        }
+        self._updated_at = 0.0
+        self._running = True
+        self._trigger_ev = threading.Event()
+        threading.Thread(target=self._worker, daemon=True).start()
+
+    def _http_json(self, url: str, timeout: float = 5.0):
+        req = urllib.request.Request(
+            url,
+            headers={
+                "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) CYDMonitor/3.0",
+                "Accept": "application/json",
+            },
+        )
+        with urllib.request.urlopen(req, timeout=timeout) as resp:
+            return json.loads(resp.read().decode("utf-8", errors="ignore"))
+
+    def _fetch_yahoo_quote(self, ticker_encoded: str) -> tuple[float, float] | None:
+        try:
+            url = f"https://query1.finance.yahoo.com/v8/finance/chart/{ticker_encoded}?interval=1d&range=2d"
+            raw = self._http_json(url, timeout=4.5)
+            meta = raw["chart"]["result"][0]["meta"]
+            price = float(meta["regularMarketPrice"])
+            prev = float(meta.get("chartPreviousClose") or meta.get("previousClose") or price)
+            chg = ((price - prev) / prev * 100.0) if prev > 0 else 0.0
+            return round(price, 4), round(chg, 2)
+        except Exception:
+            return None
+
+    def fetch_once(self) -> bool:
+        updated = False
+        new_d = {}
+
+        # 1) Cambio USD/BRL e EUR/BRL via AwesomeAPI (com fallback para Yahoo Finance)
+        try:
+            fx = self._http_json("https://economia.awesomeapi.com.br/last/USD-BRL,EUR-BRL", timeout=4.5)
+            if "USDBRL" in fx:
+                new_d["usd"] = round(float(fx["USDBRL"]["bid"]), 3)
+                new_d["usdc"] = round(float(fx["USDBRL"].get("pctChange", 0.0)), 2)
+                updated = True
+            if "EURBRL" in fx:
+                new_d["eur"] = round(float(fx["EURBRL"]["bid"]), 3)
+                new_d["eurc"] = round(float(fx["EURBRL"].get("pctChange", 0.0)), 2)
+                updated = True
+        except Exception:
+            y_usd = self._fetch_yahoo_quote("BRL=X")
+            if y_usd:
+                new_d["usd"], new_d["usdc"] = round(y_usd[0], 3), y_usd[1]
+                updated = True
+            y_eur = self._fetch_yahoo_quote("EURBRL=X")
+            if y_eur:
+                new_d["eur"], new_d["eurc"] = round(y_eur[0], 3), y_eur[1]
+                updated = True
+
+        # 2) Criptomoedas Principais via Binance Public 24hr Ticker API
+        try:
+            syms = "%5B%22BTCUSDT%22,%22ETHUSDT%22,%22SOLUSDT%22,%22BNBUSDT%22,%22XRPUSDT%22%5D"
+            tickers = self._http_json(f"https://api.binance.com/api/v3/ticker/24hr?symbols={syms}", timeout=4.5)
+            mapping = {
+                "BTCUSDT": ("btc", "btcc", 0),
+                "ETHUSDT": ("eth", "ethc", 1),
+                "SOLUSDT": ("sol", "solc", 2),
+                "BNBUSDT": ("bnb", "bnbc", 2),
+                "XRPUSDT": ("xrp", "xrpc", 3),
+            }
+            for item in tickers:
+                sym = item.get("symbol")
+                if sym in mapping:
+                    k_p, k_c, dec = mapping[sym]
+                    p_val = float(item.get("lastPrice", 0.0))
+                    c_val = float(item.get("priceChangePercent", 0.0))
+                    new_d[k_p] = round(p_val, dec) if dec > 0 else round(p_val, 0)
+                    new_d[k_c] = round(c_val, 2)
+                    updated = True
+        except Exception:
+            pass
+
+        # 3) Curva de 24h do Bitcoin (48 candles de 30m normalizados 0..100 para o grafico da CYD)
+        try:
+            klines = self._http_json(
+                "https://api.binance.com/api/v3/klines?symbol=BTCUSDT&interval=30m&limit=48",
+                timeout=4.5,
+            )
+            closes = [float(k[4]) for k in klines if len(k) > 4]
+            if len(closes) >= 4:
+                lo, hi = min(closes), max(closes)
+                span = (hi - lo) if (hi > lo) else 1.0
+                new_d["btch"] = [int(round((c - lo) / span * 100.0)) for c in closes]
+        except Exception:
+            pass
+
+        # 4) Indices da Bolsa de Valores: IBOVESPA (^BVSP) e S&P 500 (^GSPC)
+        ibov = self._fetch_yahoo_quote("%5EBVSP")
+        if ibov:
+            new_d["ibov"] = round(ibov[0], 0)
+            new_d["ibovc"] = ibov[1]
+            updated = True
+
+        sp500 = self._fetch_yahoo_quote("%5EGSPC")
+        if sp500:
+            new_d["sp500"] = round(sp500[0], 0)
+            new_d["sp500c"] = sp500[1]
+            updated = True
+
+        with self._lock:
+            self._data.update(new_d)
+            usd_now = self._data.get("usd", 0.0)
+            btc_now = self._data.get("btc", 0.0)
+            if usd_now > 0 and btc_now > 0:
+                self._data["btc_brl"] = round(btc_now * usd_now, 0)
+            if updated:
+                self._updated_at = time.time()
+        return updated
+
+    def _worker(self):
+        while self._running:
+            try:
+                self.fetch_once()
+            except Exception:
+                pass
+            self._trigger_ev.wait(timeout=self.refresh_interval)
+            self._trigger_ev.clear()
+
+    def force_refresh(self):
+        self._trigger_ev.set()
+
+    def get_market_dict(self) -> dict:
+        with self._lock:
+            return dict(self._data)
+
+    @property
+    def updated_at(self) -> float:
+        with self._lock:
+            return self._updated_at
+
+
+# ========================================== INTERFACE MODERNA EM FLET (FLUTTER) ==
+def launch_flet_gui(col: Collector, mkt_col: MarketCollector, cli_args):
+    import flet as ft
+
+    # Helpers compativeis entre Flet 0.2x e Flet 1.0+
+    _ICONS = getattr(ft, "Icons", getattr(ft, "icons", None))
+    _Border = getattr(ft, "Border", getattr(ft, "border", None))
+    _Padding = getattr(ft, "Padding", getattr(ft, "padding", None))
+    _Button = getattr(ft, "Button", getattr(ft, "ElevatedButton", None))
+
+    def icon_val(name: str):
+        return getattr(_ICONS, name, None) if _ICONS else None
+
+    def border_all(width: float, color: str):
+        return _Border.all(width, color)
+
+    def pad_sym(horizontal: float = 0, vertical: float = 0):
+        return _Padding.symmetric(horizontal=horizontal, vertical=vertical)
+
+    def build_app(page: ft.Page):
+        page.title = "CYD Hardware & Financial Market Monitor — Painel de Controle Total (Flet / Flutter)"
+        page.bgcolor = "#07090E"
+        page.padding = 16
+        page.scroll = ft.ScrollMode.AUTO
+        page.theme_mode = ft.ThemeMode.DARK
+
+        try:
+            if hasattr(page, "window") and page.window is not None:
+                page.window.width = 900
+                page.window.height = 940
+                page.window.min_width = 740
+                page.window.min_height = 740
+            else:
+                page.window_width = 900
+                page.window_height = 940
+        except Exception:
+            pass
+
+        cfg = load_ui_config()
+        state = {
+            "screen": int(cfg.get("screen", 1)),
+            "hex_color": cfg.get("hex_color", "#00FF00").upper(),
+            "color": cfg.get("color", "0x07E0"),
+            "bg": cfg.get("bg", "none"),
+            "brt": int(cfg.get("brt", 200)),
+            "ticker": bool(cfg.get("ticker", True)),
+            "sd_files": list(cfg.get("sd_files", [])),
+            "running": True,
+            "ui_dirty": True,
+            "last_ui_sync": 0.0,
+            "last_mkt_sync": 0.0,
+            "last_brt_ev": 0.0,
+        }
+
+        ui_event_queue = queue.Queue()
+        transfer_queue = queue.Queue()
+        log_lines = []
+
+        def get_ui_dict():
+            bg = (state["bg"] or "none").strip()
+            if bg.startswith("/"):
+                bg = bg[1:]
+            return {
+                "screen": int(state["screen"]),
+                "color": state["color"],
+                "bg": bg,
+                "brt": int(state["brt"]),
+                "ticker": bool(state["ticker"]),
+            }
+
+        def persist_and_queue_ui():
+            cfg.update({
+                "screen": state["screen"],
+                "hex_color": state["hex_color"],
+                "color": state["color"],
+                "bg": state["bg"],
+                "brt": state["brt"],
+                "ticker": state["ticker"],
+                "sd_files": state["sd_files"],
+            })
+            save_ui_config(cfg)
+            state["ui_dirty"] = True
+            while not ui_event_queue.empty():
+                try:
+                    ui_event_queue.get_nowait()
+                except Exception:
+                    break
+            ui_event_queue.put({"ui": get_ui_dict(), "mkt": mkt_col.get_market_dict()})
+
+        def append_log(msg: str):
+            ts = datetime.now().strftime("%H:%M:%S")
+            log_lines.append(f"[{ts}] {msg}")
+            if len(log_lines) > 35:
+                del log_lines[0]
+            txt_console.value = "\n".join(log_lines)
+            try:
+                page.update()
+            except Exception:
+                pass
+
+        # ------------------------ CABECALHO & STATUS USB ---------------------
+        lbl_title = ft.Text(
+            "⚡ CYD HARDWARE & MARKET MONITOR",
+            size=22,
+            weight=ft.FontWeight.BOLD,
+            color=state["hex_color"],
+            font_family="Consolas",
+        )
+        lbl_subtitle = ft.Text(
+            "Painel de Controle Total • Hardware + Bolsa de Valores & Cripto em Tempo Real (USB Serial)",
+            size=12,
+            color="#8B95A8",
+        )
+        status_dot = ft.Container(
+            width=10,
+            height=10,
+            border_radius=5,
+            bgcolor="#F59E0B",
+        )
+        lbl_usb_status = ft.Text(
+            "Procurando porta USB...",
+            size=12,
+            weight=ft.FontWeight.W_600,
+            color="#E2E8F0",
+            font_family="Consolas",
+        )
+        status_badge = ft.Container(
+            content=ft.Row([status_dot, lbl_usb_status], spacing=8, tight=True),
+            bgcolor="#111622",
+            border=border_all(1, "#222B3D"),
+            border_radius=20,
+            padding=pad_sym(horizontal=14, vertical=6),
+        )
+
+        header_row = ft.Row(
+            [
+                ft.Column([lbl_title, lbl_subtitle], spacing=2),
+                status_badge,
+            ],
+            alignment=ft.MainAxisAlignment.SPACE_BETWEEN,
+        )
+
+        # ---------------- FAIXA DE TELEMETRIA AO VIVO NO PC ------------------
+        def make_metric_card(title: str, init_val: str, init_sub: str):
+            val_txt = ft.Text(init_val, size=20, weight=ft.FontWeight.BOLD, color="#FFFFFF", font_family="Consolas")
+            sub_txt = ft.Text(init_sub, size=11, color="#8B95A8", font_family="Consolas")
+            bar = ft.ProgressBar(value=0.0, color=state["hex_color"], bgcolor="#1A2130", height=6, border_radius=3)
+            card = ft.Container(
+                content=ft.Column(
+                    [
+                        ft.Row(
+                            [
+                                ft.Text(title, size=11, weight=ft.FontWeight.BOLD, color="#94A3B8"),
+                                sub_txt,
+                            ],
+                            alignment=ft.MainAxisAlignment.SPACE_BETWEEN,
+                        ),
+                        val_txt,
+                        bar,
+                    ],
+                    spacing=6,
+                ),
+                bgcolor="#0E131D",
+                border=border_all(1, "#1E2738"),
+                border_radius=12,
+                padding=12,
+                expand=True,
+            )
+            return card, val_txt, sub_txt, bar
+
+        card_cpu, lbl_cpu_val, lbl_cpu_sub, bar_cpu = make_metric_card("PROCESSADOR (CPU)", "0.0%", "-- °C")
+        card_ram, lbl_ram_val, lbl_ram_sub, bar_ram = make_metric_card("MEMÓRIA (RAM)", "0.0%", "0.0/0G")
+        card_gpu, lbl_gpu_val, lbl_gpu_sub, bar_gpu = make_metric_card("GRÁFICOS (GPU)", "0.0%", "-- °C")
+        card_dsk, lbl_dsk_val, lbl_dsk_sub, bar_dsk = make_metric_card("DISCO & REDE", "0.0%", "0.0 MB/s")
+
+        telemetry_row = ft.Row([card_cpu, card_ram, card_gpu, card_dsk], spacing=10)
+
+        # ---------------- FAIXA DE MERCADO FINANCEIRO & CRIPTO AO VIVO -------
+        def make_fin_pill(symbol: str, init_price: str):
+            p_txt = ft.Text(init_price, size=14, weight=ft.FontWeight.BOLD, color="#FFFFFF", font_family="Consolas")
+            c_txt = ft.Text("0.00%", size=11, weight=ft.FontWeight.BOLD, color="#22C55E", font_family="Consolas")
+            pill = ft.Container(
+                content=ft.Column(
+                    [
+                        ft.Row(
+                            [
+                                ft.Text(symbol, size=11, weight=ft.FontWeight.BOLD, color=state["hex_color"]),
+                                c_txt,
+                            ],
+                            alignment=ft.MainAxisAlignment.SPACE_BETWEEN,
+                        ),
+                        p_txt,
+                    ],
+                    spacing=2,
+                ),
+                bgcolor="#0E1420",
+                border=border_all(1, "#1E293B"),
+                border_radius=10,
+                padding=pad_sym(horizontal=10, vertical=8),
+                expand=True,
+            )
+            return pill, p_txt, c_txt
+
+        pill_usd, lbl_usd_p, lbl_usd_c = make_fin_pill("💵 USD/BRL", "R$ --")
+        pill_eur, lbl_eur_p, lbl_eur_c = make_fin_pill("💶 EUR/BRL", "R$ --")
+        pill_btc, lbl_btc_p, lbl_btc_c = make_fin_pill("₿ BITCOIN", "$ --")
+        pill_eth, lbl_eth_p, lbl_eth_c = make_fin_pill("Ξ ETHEREUM", "$ --")
+        pill_sol, lbl_sol_p, lbl_sol_c = make_fin_pill("◎ SOLANA", "$ --")
+        pill_ibov, lbl_ibov_p, lbl_ibov_c = make_fin_pill("📈 IBOV (B3)", "---k pts")
+
+        def on_toggle_ticker(_e):
+            state["ticker"] = not state["ticker"]
+            new_lbl = (
+                "📟 Letreiro da Bolsa no Rodapé: ATIVO"
+                if state["ticker"]
+                else "📟 Letreiro da Bolsa no Rodapé: OCULTO"
+            )
+            if hasattr(btn_ticker_toggle, "content"):
+                btn_ticker_toggle.content = new_lbl
+            if hasattr(btn_ticker_toggle, "text"):
+                btn_ticker_toggle.text = new_lbl
+            persist_and_queue_ui()
+            append_log(f"Letreiro infinito (Ticker Tape) {'ativado' if state['ticker'] else 'ocultado'} nas telas.")
+
+        btn_ticker_toggle = ft.OutlinedButton(
+            "📟 Letreiro da Bolsa no Rodapé: ATIVO" if state["ticker"] else "📟 Letreiro da Bolsa no Rodapé: OCULTO",
+            on_click=on_toggle_ticker,
+        )
+
+        def on_manual_mkt_refresh(_e):
+            mkt_col.force_refresh()
+            append_log("Atualizando cotações de Câmbio, Cripto e Bolsa...")
+
+        sec_market_live = ft.Container(
+            content=ft.Column(
+                [
+                    ft.Row(
+                        [
+                            ft.Text(
+                                "📊 MERCADO FINANCEIRO & CRIPTO AO VIVO (EXIBIDO NA TELA 6 E NO LETREIRO INFINITO DA TELA PRINCIPAL)",
+                                size=12,
+                                weight=ft.FontWeight.BOLD,
+                                color="#94A3B8",
+                            ),
+                            ft.Row(
+                                [
+                                    btn_ticker_toggle,
+                                    ft.OutlinedButton("🔄 Atualizar Cotações", on_click=on_manual_mkt_refresh),
+                                ],
+                                spacing=8,
+                            ),
+                        ],
+                        alignment=ft.MainAxisAlignment.SPACE_BETWEEN,
+                    ),
+                    ft.Row([pill_usd, pill_eur, pill_btc, pill_eth, pill_sol, pill_ibov], spacing=8),
+                ],
+                spacing=8,
+            ),
+            bgcolor="#0B0F17",
+            border=border_all(1, "#1A2232"),
+            border_radius=14,
+            padding=12,
+        )
+
+        # ---------------- 1. GERENCIADOR DE TELAS (GRID INTERATIVO) ----------
+        screen_defs = [
+            (0, "Tela 0: Resumo Gauges", "Gauges circulares de CPU & RAM + Disco/Rede + Letreiro Bolsa", "SPEED"),
+            (1, "Tela 1: Painel CPU + RAM (Principal)", "Barras + Gráficos de CPU % e RAM % lado a lado + Letreiro Bolsa", "TERMINAL"),
+            (2, "Tela 2: Gráfico Duplo CPU vs RAM", "Curvas de Uso de CPU % + Uso de RAM % juntas + Letreiro Bolsa", "SHOW_CHART"),
+            (3, "Tela 3: GPU Focus", "Gauge Grande de GPU + VRAM + Watts/FPS + Letreiro Bolsa", "VIDEOGAME_ASSET"),
+            (4, "Tela 4: 4x Gráficos", "Grid em tempo real: CPU %, RAM %, GPU % e TEMP °C + Letreiro Bolsa", "GRID_VIEW"),
+            (5, "Tela 5: Wallpaper HUD", "Destaque para a imagem do Cartão SD + Dock CPU/RAM + Letreiro", "WALLPAPER"),
+            (6, "📈 Tela 6: Mercado Financeiro & Bolsa (Cripto + Dólar + Euro + B3)", "Terminal completo: Dólar (USD/BRL), Euro (EUR/BRL), IBOVESPA, Top 5 Cripto (BTC/ETH/SOL/BNB/XRP) + Gráfico Bitcoin 24h", "CURRENCY_BITCOIN"),
+        ]
+        screen_cards = []
+
+        def on_select_screen(scr_idx: int):
+            state["screen"] = scr_idx
+            refresh_screen_cards()
+            persist_and_queue_ui()
+            append_log(f"Tela alterada para {scr_idx}")
+
+        def refresh_screen_cards():
+            for idx, cont, title_t, badge_t in screen_cards:
+                active = (idx == state["screen"])
+                cont.bgcolor = "#162032" if active else "#0F141F"
+                cont.border = border_all(2 if active else 1, state["hex_color"] if active else "#1E2738")
+                title_t.color = state["hex_color"] if active else "#E2E8F0"
+                badge_t.bgcolor = state["hex_color"] if active else "#1A2234"
+                badge_t.content.color = "#05070A" if active else "#94A3B8"
+            try:
+                page.update()
+            except Exception:
+                pass
+
+        for idx, title, desc, _ic in screen_defs:
+            active = (idx == state["screen"])
+            title_t = ft.Text(title, size=13, weight=ft.FontWeight.BOLD, color=state["hex_color"] if active else "#E2E8F0")
+            desc_t = ft.Text(desc, size=11, color="#8B95A8")
+            badge_t = ft.Container(
+                content=ft.Text(f"TELA {idx}", size=10, weight=ft.FontWeight.BOLD, color="#05070A" if active else "#94A3B8"),
+                bgcolor=state["hex_color"] if active else "#1A2234",
+                border_radius=6,
+                padding=pad_sym(horizontal=8, vertical=2),
+            )
+            card_cont = ft.Container(
+                content=ft.Column(
+                    [
+                        ft.Row([title_t, badge_t], alignment=ft.MainAxisAlignment.SPACE_BETWEEN),
+                        desc_t,
+                    ],
+                    spacing=4,
+                ),
+                bgcolor="#162032" if active else "#0F141F",
+                border=border_all(2 if active else 1, state["hex_color"] if active else "#1E2738"),
+                border_radius=10,
+                padding=10,
+                ink=True,
+                on_click=lambda e, i=idx: on_select_screen(i),
+                expand=True,
+            )
+            screen_cards.append((idx, card_cont, title_t, badge_t))
+
+        screens_grid = ft.Column(
+            [
+                ft.Row([screen_cards[0][1], screen_cards[1][1]], spacing=10),
+                ft.Row([screen_cards[2][1], screen_cards[3][1]], spacing=10),
+                ft.Row([screen_cards[4][1], screen_cards[5][1]], spacing=10),
+                ft.Row([screen_cards[6][1]], spacing=10),
+            ],
+            spacing=8,
+        )
+
+        sec_screens = ft.Container(
+            content=ft.Column(
+                [
+                    ft.Text("🖥️ 1. GERENCIADOR DE TELAS DA CYD (TROCA INSTANTÂNEA)", size=13, weight=ft.FontWeight.BOLD, color="#94A3B8"),
+                    screens_grid,
+                ],
+                spacing=10,
+            ),
+            bgcolor="#0B0F17",
+            border=border_all(1, "#1A2232"),
+            border_radius=14,
+            padding=14,
+        )
+
+        # ---------------- 2. ESTÚDIO DE CORES RGB565 (COLOR PICKER) ----------
+        r_init, g_init, b_init = hex_to_rgb_tuple(state["hex_color"])
+
+        color_preview_box = ft.Container(
+            width=44,
+            height=44,
+            bgcolor=state["hex_color"],
+            border_radius=10,
+            border=border_all(2, "#FFFFFF"),
+        )
+        txt_hex_input = ft.TextField(
+            label="Código HEX",
+            value=state["hex_color"],
+            width=135,
+            height=44,
+            text_size=13,
+            content_padding=pad_sym(horizontal=10, vertical=6),
+        )
+        lbl_rgb565_badge = ft.Text(
+            f"RGB565: {state['color']}",
+            size=13,
+            weight=ft.FontWeight.BOLD,
+            color=state["hex_color"],
+            font_family="Consolas",
+        )
+
+        slider_r = ft.Slider(min=0, max=255, divisions=255, value=r_init, active_color="#EF4444", expand=True)
+        slider_g = ft.Slider(min=0, max=255, divisions=255, value=g_init, active_color="#22C55E", expand=True)
+        slider_b = ft.Slider(min=0, max=255, divisions=255, value=b_init, active_color="#3B82F6", expand=True)
+
+        def apply_new_hex(hex_str: str, update_sliders=True):
+            h = hex_str.strip().upper()
+            if not h.startswith("#"):
+                h = "#" + h
+            if len(h) != 7:
+                return
+            state["hex_color"] = h
+            state["color"] = rgb_hex_to_rgb565_str(h)
+
+            if update_sliders:
+                rv, gv, bv = hex_to_rgb_tuple(h)
+                slider_r.value = rv
+                slider_g.value = gv
+                slider_b.value = bv
+
+            txt_hex_input.value = h
+            color_preview_box.bgcolor = h
+            lbl_rgb565_badge.value = f"RGB565: {state['color']}"
+            lbl_rgb565_badge.color = h
+            lbl_title.color = h
+            bar_cpu.color = h
+            bar_ram.color = h
+            bar_gpu.color = h
+            bar_dsk.color = h
+            slider_brt.active_color = h
+            refresh_screen_cards()
+            persist_and_queue_ui()
+
+        def on_rgb_slider_change(_e):
+            rv = int(slider_r.value or 0)
+            gv = int(slider_g.value or 0)
+            bv = int(slider_b.value or 0)
+            new_hex = f"#{rv:02X}{gv:02X}{bv:02X}"
+            apply_new_hex(new_hex, update_sliders=False)
+
+        slider_r.on_change = on_rgb_slider_change
+        slider_g.on_change = on_rgb_slider_change
+        slider_b.on_change = on_rgb_slider_change
+        txt_hex_input.on_submit = lambda e: apply_new_hex(txt_hex_input.value, update_sliders=True)
+
+        presets = [
+            ("Matrix", "#00FF00"),
+            ("Cyber Cyan", "#00FFFF"),
+            ("Amber", "#FFA500"),
+            ("Magenta", "#FF00FF"),
+            ("Crimson", "#FF2020"),
+            ("Neon Blue", "#1E90FF"),
+            ("Ouro", "#FFD700"),
+            ("Roxo", "#A855F7"),
+            ("Lime", "#84CC16"),
+            ("Branco", "#FFFFFF"),
+        ]
+        swatch_controls = []
+        for pname, phex in presets:
+            swatch_controls.append(
+                ft.Container(
+                    content=ft.Row(
+                        [
+                            ft.Container(width=12, height=12, border_radius=6, bgcolor=phex),
+                            ft.Text(pname, size=11, weight=ft.FontWeight.W_600, color="#E2E8F0"),
+                        ],
+                        spacing=6,
+                        tight=True,
+                    ),
+                    bgcolor="#141B29",
+                    border=border_all(1, phex),
+                    border_radius=16,
+                    padding=pad_sym(horizontal=10, vertical=5),
+                    ink=True,
+                    on_click=lambda e, h=phex: apply_new_hex(h, update_sliders=True),
+                )
+            )
+
+        sec_colors = ft.Container(
+            content=ft.Column(
+                [
+                    ft.Row(
+                        [
+                            ft.Text("🎨 2. SELETOR DE CORES EM TEMPO REAL (COLOR PICKER RGB565)", size=13, weight=ft.FontWeight.BOLD, color="#94A3B8"),
+                            lbl_rgb565_badge,
+                        ],
+                        alignment=ft.MainAxisAlignment.SPACE_BETWEEN,
+                    ),
+                    ft.Row(swatch_controls, wrap=True, spacing=8, run_spacing=8),
+                    ft.Row(
+                        [
+                            color_preview_box,
+                            txt_hex_input,
+                            ft.Column(
+                                [
+                                    ft.Row([ft.Text("R", size=11, color="#EF4444", width=14), slider_r], spacing=4),
+                                    ft.Row([ft.Text("G", size=11, color="#22C55E", width=14), slider_g], spacing=4),
+                                    ft.Row([ft.Text("B", size=11, color="#3B82F6", width=14), slider_b], spacing=4),
+                                ],
+                                spacing=0,
+                                expand=True,
+                            ),
+                        ],
+                        spacing=14,
+                    ),
+                ],
+                spacing=10,
+            ),
+            bgcolor="#0B0F17",
+            border=border_all(1, "#1A2232"),
+            border_radius=14,
+            padding=14,
+        )
+
+        # ---------------- 3. FUNDO DO CARTAO SD & BRILHO PWM -----------------
+        def make_dropdown_options(items):
+            return [ft.dropdown.Option(x) for x in items]
+
+        dd_kwargs = {
+            "label": "Imagem de Fundo / Tema no Cartão SD",
+            "value": state["bg"],
+            "options": make_dropdown_options(state["sd_files"]),
+            "expand": True,
+        }
+        dd_sig = inspect.signature(ft.Dropdown.__init__).parameters
+
+        def on_bg_selected(_e):
+            if dd_bg.value:
+                state["bg"] = dd_bg.value
+                persist_and_queue_ui()
+                append_log(f"Fundo alterado para '{state['bg']}'")
+
+        if "on_change" in dd_sig:
+            dd_kwargs["on_change"] = on_bg_selected
+        elif "on_select" in dd_sig:
+            dd_kwargs["on_select"] = on_bg_selected
+
+        dd_bg = ft.Dropdown(**dd_kwargs)
+
+        prog_upload = ft.ProgressBar(value=0.0, visible=False, color=state["hex_color"], bgcolor="#1A2130", height=8)
+        lbl_upload_status = ft.Text("", size=11, color="#94A3B8", visible=False)
+
+        def request_sd_files(_e=None):
+            ui_event_queue.put({"cmd": "list_sd"})
+            append_log("Solicitando lista de imagens do Cartão SD da CYD...")
+
+        def start_file_transfer(filepath: str):
+            if not filepath:
+                return
+            try:
+                target_name, data = prepare_image_for_cyd(filepath)
+            except Exception as ex:
+                append_log(f"Erro ao preparar imagem: {ex}")
+                return
+
+            append_log(f"Enviando '{target_name}' ({len(data)/1024:.1f} KB) via Serial para o SD...")
+
+            def worker():
+                prog_upload.visible = True
+                lbl_upload_status.visible = True
+                prog_upload.value = 0.0
+                lbl_upload_status.value = f"Transferindo {target_name} (0%)..."
+                try:
+                    page.update()
+                except Exception:
+                    pass
+
+                chunk_size = 512
+                total = len(data)
+                transfer_queue.put({"file_name": f"/{target_name}", "file_mode": "w"})
+                for i in range(0, total, chunk_size):
+                    chunk = data[i:i + chunk_size]
+                    b64 = base64.b64encode(chunk).decode("ascii")
+                    transfer_queue.put({
+                        "file_name": f"/{target_name}",
+                        "file_mode": "a",
+                        "file_data": b64,
+                    })
+                    pct = (i + len(chunk)) / total
+                    prog_upload.value = pct
+                    lbl_upload_status.value = f"Transferindo {target_name} ({int(pct * 100)}%)..."
+                    try:
+                        page.update()
+                    except Exception:
+                        pass
+
+                transfer_queue.put({"file_name": f"/{target_name}", "file_mode": "eof"})
+                if target_name not in state["sd_files"]:
+                    state["sd_files"].append(target_name)
+                    dd_bg.options = make_dropdown_options(state["sd_files"])
+                state["bg"] = target_name
+                dd_bg.value = target_name
+                persist_and_queue_ui()
+
+                prog_upload.visible = False
+                lbl_upload_status.value = f"✅ '{target_name}' gravado no SD e aplicado na tela!"
+                append_log(f"Upload concluído: '{target_name}' definido como fundo.")
+                try:
+                    page.update()
+                except Exception:
+                    pass
+
+            threading.Thread(target=worker, daemon=True).start()
+
+        def on_click_upload(_e):
+            def pick_native_file():
+                try:
+                    import tkinter as tk
+                    from tkinter import filedialog
+                    r = tk.Tk()
+                    r.withdraw()
+                    r.attributes("-topmost", True)
+                    init_dir = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "imagens-referencia")
+                    p = filedialog.askopenfilename(
+                        initialdir=init_dir if os.path.isdir(init_dir) else None,
+                        title="Selecione uma imagem para o Cartão SD da CYD (JPG, PNG, BMP, GIF)",
+                        filetypes=[("Imagens", "*.jpg *.jpeg *.png *.bmp *.gif")],
+                    )
+                    r.destroy()
+                    if p:
+                        start_file_transfer(p)
+                except Exception as ex:
+                    append_log(f"Erro ao abrir seletor de arquivos: {ex}")
+
+            threading.Thread(target=pick_native_file, daemon=True).start()
+
+        # Controle de Brilho PWM
+        lbl_brt_value = ft.Text(
+            f"{int(state['brt'] * 100 / 255)}% ({state['brt']})",
+            size=13,
+            weight=ft.FontWeight.BOLD,
+            color="#E2E8F0",
+            font_family="Consolas",
+        )
+
+        def on_brt_change(_e):
+            b = int(slider_brt.value or 200)
+            state["brt"] = b
+            lbl_brt_value.value = f"{int(b * 100 / 255)}% ({b})"
+            now = time.time()
+            if now - state["last_brt_ev"] > 0.08:
+                state["last_brt_ev"] = now
+                persist_and_queue_ui()
+            try:
+                page.update()
+            except Exception:
+                pass
+
+        slider_brt = ft.Slider(
+            min=10,
+            max=255,
+            divisions=245,
+            value=state["brt"],
+            active_color=state["hex_color"],
+            on_change=on_brt_change,
+            expand=True,
+        )
+
+        sec_bg_and_brt = ft.Row(
+            [
+                # Coluna Esquerda: Cartao SD
+                ft.Container(
+                    content=ft.Column(
+                        [
+                            ft.Text("🖼️ 3. FUNDO DE TELA (CARTÃO SD)", size=13, weight=ft.FontWeight.BOLD, color="#94A3B8"),
+                            ft.Row(
+                                [
+                                    dd_bg,
+                                    _Button("Aplicar", on_click=on_bg_selected),
+                                    ft.OutlinedButton("🔄 Ler SD", on_click=request_sd_files),
+                                ],
+                                spacing=8,
+                            ),
+                            _Button(
+                                "📤 Enviar Imagem do PC p/ SD (Auto 320x240 JPG/GIF)",
+                                icon=icon_val("UPLOAD_FILE"),
+                                on_click=on_click_upload,
+                            ),
+                            prog_upload,
+                            lbl_upload_status,
+                        ],
+                        spacing=10,
+                    ),
+                    bgcolor="#0B0F17",
+                    border=border_all(1, "#1A2232"),
+                    border_radius=14,
+                    padding=14,
+                    expand=3,
+                ),
+                # Coluna Direita: Brilho PWM
+                ft.Container(
+                    content=ft.Column(
+                        [
+                            ft.Row(
+                                [
+                                    ft.Text("☀️ 4. BRILHO (PWM)", size=13, weight=ft.FontWeight.BOLD, color="#94A3B8"),
+                                    lbl_brt_value,
+                                ],
+                                alignment=ft.MainAxisAlignment.SPACE_BETWEEN,
+                            ),
+                            ft.Text("Ajuste instantâneo do backlight da CYD (Pino 21):", size=11, color="#8B95A8"),
+                            slider_brt,
+                            ft.Row(
+                                [
+                                    ft.OutlinedButton("25%", on_click=lambda e: (setattr(slider_brt, "value", 64), on_brt_change(e))),
+                                    ft.OutlinedButton("50%", on_click=lambda e: (setattr(slider_brt, "value", 128), on_brt_change(e))),
+                                    ft.OutlinedButton("80%", on_click=lambda e: (setattr(slider_brt, "value", 204), on_brt_change(e))),
+                                    ft.OutlinedButton("100%", on_click=lambda e: (setattr(slider_brt, "value", 255), on_brt_change(e))),
+                                ],
+                                alignment=ft.MainAxisAlignment.SPACE_BETWEEN,
+                            ),
+                        ],
+                        spacing=10,
+                    ),
+                    bgcolor="#0B0F17",
+                    border=border_all(1, "#1A2232"),
+                    border_radius=14,
+                    padding=14,
+                    expand=2,
+                ),
+            ],
+            spacing=12,
+        )
+
+        # ---------------- 4. CONSOLE SERIAL & LOG ----------------------------
+        txt_console = ft.Text(
+            value="Inicializando agente de telemetria, mercado financeiro e comunicação USB Serial...",
+            size=11,
+            color="#94A3B8",
+            font_family="Consolas",
+            selectable=True,
+        )
+        sec_console = ft.Container(
+            content=ft.Column(
+                [
+                    ft.Text("📡 CONSOLE SERIAL & TELEMETRIA EM TEMPO REAL", size=12, weight=ft.FontWeight.BOLD, color="#94A3B8"),
+                    ft.Container(
+                        content=txt_console,
+                        bgcolor="#05070B",
+                        border=border_all(1, "#151C28"),
+                        border_radius=8,
+                        padding=10,
+                        width=float("inf"),
+                    ),
+                ],
+                spacing=6,
+            ),
+            bgcolor="#0B0F17",
+            border=border_all(1, "#1A2232"),
+            border_radius=14,
+            padding=12,
+        )
+
+        page.add(
+            header_row,
+            ft.Divider(height=8, color="#151C28"),
+            telemetry_row,
+            sec_market_live,
+            sec_screens,
+            sec_colors,
+            sec_bg_and_brt,
+            sec_console,
+        )
+
+        # ---------------- THREAD DE COMUNICACAO SERIAL -----------------------
+        def read_serial_responses(ser):
+            while ser.in_waiting > 0:
+                try:
+                    raw = ser.readline().decode("utf-8", errors="ignore").strip()
+                except Exception:
+                    break
+                if not raw:
+                    continue
+                if raw == "MONITOR_READY":
+                    state["ui_dirty"] = True
+                    request_sd_files()
+                elif raw.startswith("SD_FILES:"):
+                    try:
+                        files = json.loads(raw.split("SD_FILES:", 1)[1])
+                        if isinstance(files, list):
+                            base_opts = ["none", "terminal", "z1p0"]
+                            merged = base_opts + [f for f in files if f not in base_opts]
+                            state["sd_files"] = merged
+                            cfg["sd_files"] = merged
+                            save_ui_config(cfg)
+                            dd_bg.options = make_dropdown_options(merged)
+                            append_log(f"SD Card sincronizado: {len(files)} imagem(ns) encontrada(s).")
+                    except Exception:
+                        pass
+
+        def _fmt_chg(lbl_c, chg_val: float):
+            lbl_c.value = f"{'+' if chg_val >= 0 else ''}{chg_val:.2f}%"
+            lbl_c.color = "#22C55E" if chg_val >= 0 else "#EF4444"
+
+        def update_pc_telemetry_cards(sys_m: dict, mkt_m: dict):
+            cpu_v = sys_m.get("cpu", 0.0)
+            cput_v = sys_m.get("cput")
+            lbl_cpu_val.value = f"{cpu_v:.1f}%"
+            lbl_cpu_sub.value = f"{cput_v:.0f} °C" if cput_v is not None else f"{sys_m.get('cpuf', 0)} MHz"
+            bar_cpu.value = min(max(cpu_v / 100.0, 0.0), 1.0)
+
+            ram_v = sys_m.get("ram", 0.0)
+            lbl_ram_val.value = f"{ram_v:.1f}%"
+            lbl_ram_sub.value = f"{sys_m.get('ramu', 0):.1f}/{sys_m.get('ramt', 0):.0f} GB"
+            bar_ram.value = min(max(ram_v / 100.0, 0.0), 1.0)
+
+            gpu_v = sys_m.get("gpu", 0.0)
+            gput_v = sys_m.get("gput")
+            lbl_gpu_val.value = f"{gpu_v:.1f}%"
+            lbl_gpu_sub.value = f"{gput_v:.0f} °C" if gput_v is not None else (sys_m.get("gpuname") or "GPU")
+            bar_gpu.value = min(max(gpu_v / 100.0, 0.0), 1.0)
+
+            dsk_v = sys_m.get("dsk", 0.0)
+            lbl_dsk_val.value = f"DSK {dsk_v:.0f}%"
+            lbl_dsk_sub.value = f"↓{sys_m.get('rx', 0):.1f} ↑{sys_m.get('tx', 0):.1f} MB/s"
+            bar_dsk.value = min(max(dsk_v / 100.0, 0.0), 1.0)
+
+            # Atualiza faixa de mercado financeiro no PC
+            if mkt_m.get("usd", 0) > 0:
+                lbl_usd_p.value = f"R$ {mkt_m['usd']:.2f}"
+                _fmt_chg(lbl_usd_c, mkt_m.get("usdc", 0.0))
+            if mkt_m.get("eur", 0) > 0:
+                lbl_eur_p.value = f"R$ {mkt_m['eur']:.2f}"
+                _fmt_chg(lbl_eur_c, mkt_m.get("eurc", 0.0))
+            if mkt_m.get("btc", 0) > 0:
+                lbl_btc_p.value = f"$ {mkt_m['btc']:,.0f}"
+                _fmt_chg(lbl_btc_c, mkt_m.get("btcc", 0.0))
+            if mkt_m.get("eth", 0) > 0:
+                lbl_eth_p.value = f"$ {mkt_m['eth']:,.0f}"
+                _fmt_chg(lbl_eth_c, mkt_m.get("ethc", 0.0))
+            if mkt_m.get("sol", 0) > 0:
+                lbl_sol_p.value = f"$ {mkt_m['sol']:.2f}"
+                _fmt_chg(lbl_sol_c, mkt_m.get("solc", 0.0))
+            if mkt_m.get("ibov", 0) > 0:
+                lbl_ibov_p.value = f"{mkt_m['ibov']/1000.0:.1f}k pts"
+                _fmt_chg(lbl_ibov_c, mkt_m.get("ibovc", 0.0))
+
+            try:
+                page.update()
+            except Exception:
+                pass
+
+        def serial_worker():
+            import serial
+            ser = None
+            last_telemetry_t = 0.0
+
+            while state["running"]:
+                try:
+                    now = time.time()
+                    sys_metrics = None
+                    mkt_metrics = mkt_col.get_market_dict()
+                    if now - last_telemetry_t >= cli_args.interval:
+                        last_telemetry_t = now
+                        sys_metrics = col.sample_sys()
+                        update_pc_telemetry_cards(sys_metrics, mkt_metrics)
+
+                    if ser is None:
+                        port = cli_args.port or find_port()
+                        if not port:
+                            status_dot.bgcolor = "#F59E0B"
+                            lbl_usb_status.value = "Aguardando CYD na USB..."
+                            try:
+                                page.update()
+                            except Exception:
+                                pass
+                            time.sleep(1.5)
+                            continue
+
+                        ser = serial.Serial(port, BAUD, timeout=0.5)
+                        time.sleep(1.8)
+                        ser.reset_input_buffer()
+                        state["ui_dirty"] = True
+                        status_dot.bgcolor = "#22C55E"
+                        lbl_usb_status.value = f"Conectado em {port} ({BAUD} bps)"
+                        append_log(f"Conectado com sucesso na porta {port}")
+                        request_sd_files()
+
+                    read_serial_responses(ser)
+
+                    # 1) Prioridade maxima: Transferencia de imagem em andamento
+                    if not transfer_queue.empty():
+                        pkt = transfer_queue.get_nowait()
+                        line = json.dumps(pkt, separators=(",", ":")) + "\n"
+                        ser.write(line.encode("utf-8"))
+                        ser.flush()
+                        time.sleep(0.035)
+                        continue
+
+                    # 2) Prioridade alta: Mudanca de UI instantanea (Event-Driven <50ms)
+                    if not ui_event_queue.empty():
+                        ev_pkt = ui_event_queue.get_nowait()
+                        line = json.dumps(ev_pkt, separators=(",", ":")) + "\n"
+                        ser.write(line.encode("utf-8"))
+                        ser.flush()
+                        state["ui_dirty"] = False
+                        state["last_ui_sync"] = time.time()
+
+                    # 3) Envio de telemetria periodica + dados do Mercado Financeiro
+                    if sys_metrics is not None:
+                        payload = {"sys": sys_metrics}
+                        if state["ui_dirty"] or (now - state["last_ui_sync"] >= 10.0):
+                            payload["ui"] = get_ui_dict()
+                            state["ui_dirty"] = False
+                            state["last_ui_sync"] = now
+
+                        if (now - state["last_mkt_sync"] >= 5.0) or ("ui" in payload):
+                            if mkt_metrics.get("usd", 0) > 0 or mkt_metrics.get("btc", 0) > 0:
+                                payload["mkt"] = mkt_metrics
+                                state["last_mkt_sync"] = now
+
+                        line = json.dumps(payload, separators=(",", ":")) + "\n"
+                        ser.write(line.encode("utf-8"))
+                        ser.flush()
+
+                except Exception as ex:
+                    status_dot.bgcolor = "#EF4444"
+                    lbl_usb_status.value = "Reconectando USB..."
+                    append_log(f"Conexão USB interrompida ({ex})")
+                    if ser:
+                        try:
+                            ser.close()
+                        except Exception:
+                            pass
+                    ser = None
+                    time.sleep(2.0)
+                    continue
+
+                time.sleep(0.04)
+
+            if ser:
+                ser.close()
+
+        threading.Thread(target=serial_worker, daemon=True).start()
+
+    # Inicializa Flet compativel com versoes 1.0+ (ft.run) e 0.2x (ft.app)
+    if hasattr(ft, "run"):
+        ft.run(build_app)
+    else:
+        ft.app(target=build_app)
+
+
 def main():
-    ap = argparse.ArgumentParser(description="Agente Mike Monitor (CYD)")
-    ap.add_argument("-p", "--port", help="porta serial, ex: /dev/ttyUSB0")
+    ap = argparse.ArgumentParser(description="Agente CYD Hardware & Financial Market Monitor (Flet / Flutter Edition)")
+    ap.add_argument("-p", "--port", help="Porta serial, ex: COM5 ou /dev/ttyUSB0")
     ap.add_argument("-i", "--interval", type=float, default=INTERVAL)
-    ap.add_argument("--stdout", action="store_true", help="imprime o JSON em vez de enviar")
-    ap.add_argument("--once", action="store_true", help="coleta uma amostra e sai")
-    ap.add_argument("--no-logs", action="store_true", help="nao acompanha o journalctl")
-    ap.add_argument("-u", "--unit", action="append", default=[],
-                    help="limita os logs a uma unit (pode repetir)")
-    ap.add_argument("--log-boot", action="store_true",
-                    help="conta tambem os erros que ja estavam no journal deste boot")
-    ap.add_argument("--game-proc", action="append", default=[],
-                    help="nome de processo extra para o modo game (pode repetir)")
+    ap.add_argument("--stdout", action="store_true", help="Imprime o JSON no terminal e nao abre GUI")
+    ap.add_argument("--once", action="store_true", help="Coleta uma amostra JSON e sai")
+    ap.add_argument("--game-proc", action="append", default=[], help="Processo extra de jogo")
     args = ap.parse_args()
 
-    journal = None
-    if not args.no_logs:
-        if JournalFollower.available():
-            journal = JournalFollower(units=args.unit, since_boot=args.log_boot)
-            journal.start()
-            time.sleep(0.4)
-            if journal.error:
-                print(f"[mike] journalctl falhou: {journal.error}", file=sys.stderr)
-                journal = None
-        else:
-            print("[mike] journalctl nao encontrado, seguindo sem logs", file=sys.stderr)
-
-    col = Collector(journal, game_processes=args.game_proc)
-    time.sleep(0.3)
+    col = Collector(game_processes=args.game_proc)
+    mkt_col = MarketCollector(refresh_interval=20.0)
+    time.sleep(0.35)
 
     if args.stdout or args.once:
+        cfg = load_ui_config()
+        mkt_col.fetch_once()
         while True:
-            print(json.dumps(col.sample(), ensure_ascii=False))
+            payload = {
+                "sys": col.sample_sys(),
+                "mkt": mkt_col.get_market_dict(),
+                "ui": {
+                    "screen": cfg["screen"],
+                    "color": cfg["color"],
+                    "bg": cfg["bg"],
+                    "brt": cfg["brt"],
+                    "ticker": cfg.get("ticker", True),
+                },
+            }
+            print(json.dumps(payload, ensure_ascii=False))
             sys.stdout.flush()
             if args.once:
                 return
             time.sleep(args.interval)
-            
-    try:
-        import tkinter as tk
-        from tkinter import ttk, filedialog, messagebox
-        import queue
-        import base64
-        import os
-        
-        class AgentGUI:
-            def __init__(self, root, col, args):
-                self.root = root
-                self.col = col
-                self.args = args
-                self.cmd_queue = queue.Queue()
-                self.transfer_queue = queue.Queue()
-                self.current_color = "#00FF00"
-                
-                self.root.title("CYD Hardware Monitor - Controle")
-                self.root.geometry("480x620")
-                self.root.configure(bg="#050505")
-                
-                self.style = ttk.Style()
-                if "clam" in self.style.theme_names():
-                    self.style.theme_use("clam")
-                
-                self.update_styles()
-        
-                self.setup_ui()
-                
-                self.running = True
-                self.thread = threading.Thread(target=self.serial_loop, daemon=True)
-                self.thread.start()
-                
-                self.root.protocol("WM_DELETE_WINDOW", self.on_close)
-                
-            def update_styles(self):
-                self.style.configure(".", background="#050505", foreground=self.current_color, font=("Consolas", 10))
-                self.style.configure("TFrame", background="#050505")
-                self.style.configure("TLabel", background="#050505", foreground=self.current_color)
-                self.style.configure("TButton", background="#1a1a1a", foreground=self.current_color, borderwidth=1, bordercolor=self.current_color)
-                self.style.map("TButton", background=[("active", "#333333")])
-                self.style.configure("TRadiobutton", background="#050505", foreground=self.current_color)
-                self.style.configure("Horizontal.TScale", background="#050505")
-        
-            def setup_ui(self):
-                self.frame = ttk.Frame(self.root, padding=15)
-                self.frame.pack(fill=tk.BOTH, expand=True)
-        
-                ttk.Label(self.frame, text="CYD HARDWARE MONITOR", font=("Consolas", 16, "bold")).pack(pady=5)
-                
-                self.lbl_status = ttk.Label(self.frame, text="Status: Aguardando conexão...")
-                self.lbl_status.pack(pady=5)
-                
-                # Cores
-                self.lf_color = tk.LabelFrame(self.frame, text=" Cor da Chuva Matrix ", bg="#050505", fg=self.current_color, font=("Consolas", 10))
-                self.lf_color.pack(fill=tk.X, pady=5, padx=5)
-                
-                self.color_var = tk.IntVar(value=0)
-                colors = [("Verde", 0, "#00FF00"), ("Ciano", 1, "#00FFFF"), ("Laranja", 2, "#FFA500"), ("Magenta", 3, "#FF00FF"), ("Vermelho", 4, "#FF0000")]
-                
-                col_frame = tk.Frame(self.lf_color, bg="#050505")
-                col_frame.pack(fill=tk.X, padx=10, pady=5)
-                for text, val, hex_col in colors:
-                    rb = tk.Radiobutton(col_frame, text=text, variable=self.color_var, value=val, 
-                                        bg="#050505", fg=hex_col, selectcolor="#1a1a1a", activebackground="#333333", activeforeground=hex_col,
-                                        command=lambda h=hex_col: self.change_color(h))
-                    rb.pack(side=tk.LEFT, padx=3)
 
-                # Tema
-                self.lf_theme = tk.LabelFrame(self.frame, text=" Tema do Monitor ", bg="#050505", fg=self.current_color, font=("Consolas", 10))
-                self.lf_theme.pack(fill=tk.X, pady=5, padx=5)
-                
-                self.theme_var = tk.IntVar(value=0)
-                ttk.Radiobutton(self.lf_theme, text="Terminal Minimalista", variable=self.theme_var, value=0, command=self.send_commands).pack(anchor=tk.W, padx=10, pady=2)
-                ttk.Radiobutton(self.lf_theme, text="z1p0 (Cannabis Bg)", variable=self.theme_var, value=1, command=self.send_commands).pack(anchor=tk.W, padx=10, pady=2)
-                ttk.Radiobutton(self.lf_theme, text="GIF do Cartão SD", variable=self.theme_var, value=2, command=self.send_commands).pack(anchor=tk.W, padx=10, pady=2)
-                ttk.Radiobutton(self.lf_theme, text="Heavy Metal (heavymetal.gif)", variable=self.theme_var, value=3, command=self.send_commands).pack(anchor=tk.W, padx=10, pady=2)
-                
-                # CYD Remote Control
-                btn_frame_remote = tk.Frame(self.lf_theme, bg="#050505")
-                btn_frame_remote.pack(fill=tk.X, padx=10, pady=5)
-                ttk.Button(btn_frame_remote, text="Abrir Configurações na Placa", command=lambda: self.cmd_queue.put({"cmd_settings": 1})).pack(side=tk.LEFT, padx=5)
-                
-                # Brilho
-                self.lf_bright = tk.LabelFrame(self.frame, text=" Brilho ", bg="#050505", fg=self.current_color, font=("Consolas", 10))
-                self.lf_bright.pack(fill=tk.X, pady=5, padx=5)
-                
-                self.bright_var = tk.DoubleVar(value=128)
-                scale = ttk.Scale(self.lf_bright, from_=10, to=255, variable=self.bright_var, orient=tk.HORIZONTAL)
-                scale.pack(fill=tk.X, padx=10, pady=5)
-                scale.bind("<ButtonRelease-1>", lambda e: self.send_commands())
-                
-                # GIF do SD
-                self.lf_gif = tk.LabelFrame(self.frame, text=" Cartão SD (GIFs) ", bg="#050505", fg=self.current_color, font=("Consolas", 10))
-                self.lf_gif.pack(fill=tk.X, pady=5, padx=5)
-                
-                self.txt_gif = tk.Entry(self.lf_gif, bg="#1a1a1a", fg=self.current_color, insertbackground=self.current_color, font=("Consolas", 10))
-                self.txt_gif.insert(0, "/background.gif")
-                self.txt_gif.pack(fill=tk.X, padx=10, pady=5)
-                
-                btn_frame = tk.Frame(self.lf_gif, bg="#050505")
-                btn_frame.pack(fill=tk.X, padx=10, pady=5)
-                ttk.Button(btn_frame, text="Tocar este GIF", command=self.send_commands).pack(side=tk.LEFT, padx=5)
-                ttk.Button(btn_frame, text="Transferir GIF...", command=self.upload_gif).pack(side=tk.RIGHT, padx=5)
-                
-                self.prog_var = tk.DoubleVar()
-                self.prog_bar = ttk.Progressbar(self.lf_gif, variable=self.prog_var, maximum=100)
-                
-                # Log
-                self.txt_log = tk.Text(self.frame, height=8, bg="#0a0a0a", fg=self.current_color, font=("Consolas", 8))
-                self.txt_log.pack(fill=tk.BOTH, expand=True, pady=5)
+    launch_flet_gui(col, mkt_col, args)
 
-            def change_color(self, hex_col):
-                self.current_color = hex_col
-                self.update_styles()
-                self.lf_color.config(fg=hex_col)
-                self.lf_theme.config(fg=hex_col)
-                self.lf_bright.config(fg=hex_col)
-                self.lf_gif.config(fg=hex_col)
-                self.txt_gif.config(fg=hex_col, insertbackground=hex_col)
-                self.txt_log.config(fg=hex_col)
-                self.send_commands()
-
-            def upload_gif(self):
-                filepath = filedialog.askopenfilename(title="Selecione um arquivo GIF", filetypes=[("Arquivos GIF", "*.gif")])
-                if not filepath: return
-                filename = "/" + os.path.basename(filepath)
-                if len(filename) > 30:
-                    messagebox.showerror("Erro", "Nome do arquivo muito longo.")
-                    return
-                try:
-                    with open(filepath, "rb") as f:
-                        data = f.read()
-                except Exception as e:
-                    messagebox.showerror("Erro", str(e))
-                    return
-                    
-                self.txt_gif.delete(0, tk.END)
-                self.txt_gif.insert(0, filename)
-                
-                def transfer_task():
-                    self.prog_var.set(0)
-                    self.prog_bar.pack(fill=tk.X, padx=10, pady=5)
-                    chunk_size = 512
-                    total = len(data)
-                    self.transfer_queue.put({"file_name": filename, "file_mode": "w", "file_data": ""})
-                    for i in range(0, total, chunk_size):
-                        chunk = data[i:i+chunk_size]
-                        b64 = base64.b64encode(chunk).decode('ascii')
-                        self.transfer_queue.put({"file_name": filename, "file_mode": "a", "file_data": b64})
-                        pct = (i + len(chunk)) / total * 100
-                        self.root.after(0, lambda p=pct: self.prog_var.set(p))
-                    self.root.after(0, lambda: self.prog_bar.pack_forget())
-                    self.root.after(0, lambda: messagebox.showinfo("Sucesso", "GIF transferido com sucesso!"))
-                    self.root.after(0, self.send_commands) # Força o tema a tocar o novo GIF
-        
-                threading.Thread(target=transfer_task, daemon=True).start()
-
-            def log(self, msg):
-                self.txt_log.insert(tk.END, msg + "\n")
-                self.txt_log.see(tk.END)
-                if int(self.txt_log.index('end-1c').split('.')[0]) > 50:
-                    self.txt_log.delete('1.0', '2.0')
-                
-            def send_commands(self):
-                cmd = {
-                    "cmd_theme": self.theme_var.get(),
-                    "cmd_bright": int(self.bright_var.get()),
-                    "cmd_gif": self.txt_gif.get(),
-                    "cmd_color": self.color_var.get()
-                }
-                self.cmd_queue.put(cmd)
-        
-            def on_close(self):
-                self.root.withdraw()
-                threading.Thread(target=self.setup_tray, daemon=True).start()
-                
-            def setup_tray(self):
-                try:
-                    import pystray
-                    from PIL import Image, ImageDraw
-                    
-                    def create_image():
-                        image = Image.new('RGB', (64, 64), color=(0, 0, 0))
-                        dc = ImageDraw.Draw(image)
-                        dc.rectangle((16, 16, 48, 48), fill=(0, 255, 0))
-                        return image
-
-                    def show_window(icon, item):
-                        icon.stop()
-                        self.root.after(0, self.root.deiconify)
-                        
-                    def quit_app(icon, item):
-                        icon.stop()
-                        self.running = False
-                        self.root.after(0, self.root.destroy)
-                        
-                    menu = pystray.Menu(
-                        pystray.MenuItem('Abrir CYD Monitor', show_window, default=True),
-                        pystray.MenuItem('Sair', quit_app)
-                    )
-                    
-                    self.tray_icon = pystray.Icon("CYDMonitor", create_image(), "CYD Hardware Monitor", menu)
-                    self.tray_icon.run()
-                except ImportError:
-                    # Fallback se pystray não estiver instalado
-                    self.running = False
-                    self.root.after(0, self.root.destroy)
-                
-            def serial_loop(self):
-                import serial
-                ser = None
-                while self.running:
-                    try:
-                        if ser is None:
-                            port = self.args.port or find_port()
-                            if not port:
-                                self.root.after(0, lambda: self.lbl_status.config(text="Status: Nenhuma porta serial encontrada..."))
-                                time.sleep(3)
-                                continue
-                            ser = serial.Serial(port, BAUD, timeout=1)
-                            time.sleep(2.0)
-                            ser.reset_input_buffer()
-                            msg = f"Conectado em {port}"
-                            self.root.after(0, lambda m=msg: self.lbl_status.config(text=f"Status: {m}"))
-                            self.root.after(0, lambda m=msg: self.log(f"[{m}]"))
-        
-                        if not self.transfer_queue.empty():
-                            pkt = self.transfer_queue.get_nowait()
-                            line = json.dumps(pkt, separators=(",", ":")) + "\n"
-                            ser.write(line.encode())
-                            ser.flush()
-                            time.sleep(0.05)
-                            continue
-                            
-                        pkt = self.col.sample()
-                        while not self.cmd_queue.empty():
-                            cmd = self.cmd_queue.get_nowait()
-                            pkt.update(cmd)
-                        
-                        line = json.dumps(pkt, separators=(",", ":")) + "\n"
-                        ser.write(line.encode())
-                        ser.flush()
-                        
-                        if "fps" in pkt:
-                            fps_txt = f"FPS: {pkt['fps']:>3} | "
-                        else:
-                            fps_txt = ""
-                        log_msg = f"{fps_txt}CPU: {pkt.get('cpu',0):>4}% | RAM: {pkt.get('ram',0):>4}% | T: {pkt.get('cput',0):>3}°C"
-                        self.root.after(0, lambda m=log_msg: self.log(m))
-        
-                    except Exception as e:
-                        self.root.after(0, lambda err=e: self.lbl_status.config(text=f"Status: Erro de conexão"))
-                        if ser:
-                            try:
-                                ser.close()
-                            except:
-                                pass
-                        ser = None
-                        time.sleep(3)
-                        continue
-        
-                    time.sleep(self.args.interval)
-        
-                if ser:
-                    ser.close()
-
-        root = tk.Tk()
-        app = AgentGUI(root, col, args)
-        root.mainloop()
-        
-    except ImportError:
-        # Fallback to CLI if tkinter is missing
-        print("[mike] Tkinter não encontrado. Rodando em modo texto.")
-        import serial
-        ser = None
-        while True:
-            try:
-                if ser is None:
-                    port = args.port or find_port()
-                    if not port:
-                        time.sleep(3)
-                        continue
-                    ser = serial.Serial(port, BAUD, timeout=1)
-                    time.sleep(2.0)
-                    ser.reset_input_buffer()
-                line = json.dumps(col.sample(), separators=(",", ":")) + "\n"
-                ser.write(line.encode())
-                ser.flush()
-            except KeyboardInterrupt:
-                break
-            except Exception:
-                if ser:
-                    try:
-                        ser.close()
-                    except:
-                        pass
-                ser = None
-                time.sleep(3)
-                continue
-            time.sleep(args.interval)
-        if ser:
-            ser.close()
 
 if __name__ == "__main__":
     main()
