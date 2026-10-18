@@ -1,9 +1,9 @@
 {
-  "screen": 0,
-  "hex_color": "#FF2020",
-  "color": "0xF904",
+  "screen": 1,
+  "hex_color": "#B3EA6A",
+  "color": "0xB74D",
   "bg": "megadeth-rust-in-p.jpg",
-  "brt": 255,
+  "brt": 158,
   "ticker": true,
   "sd_files": [
     "none",

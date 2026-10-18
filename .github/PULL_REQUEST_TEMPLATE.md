@@ -44,3 +44,4 @@ Antes de submeter o PR, certifique-se de que cumpriu os seguintes passos:
 
 ## 🔗 Issues Relacionadas
 Closes # (insira o número da issue relacionada, se houver).
+
