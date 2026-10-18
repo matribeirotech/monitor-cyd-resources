@@ -1004,6 +1004,8 @@ def launch_flet_gui(col: Collector, mkt_col: MarketCollector, cli_args):
 
         ui_event_queue = queue.Queue()
         transfer_queue = queue.Queue()
+        ack_event = threading.Event()
+        last_ack = {"val": None}
         log_lines = []
 
         def get_ui_dict():
@@ -1488,7 +1490,11 @@ def launch_flet_gui(col: Collector, mkt_col: MarketCollector, cli_args):
 
         # ---------------- 3. FUNDO DO CARTAO SD & BRILHO PWM -----------------
         def make_dropdown_options(items):
-            return [ft.dropdown.Option(x) for x in items]
+            opts = list(items)
+            current_bg = state.get("bg", "none")
+            if current_bg and current_bg not in opts:
+                opts.append(current_bg)
+            return [ft.dropdown.Option(x) for x in opts]
 
         dd_kwargs = {
             "label": "Imagem de Fundo / Tema no Cartão SD",
@@ -1527,48 +1533,110 @@ def launch_flet_gui(col: Collector, mkt_col: MarketCollector, cli_args):
                 append_log(f"Erro ao preparar imagem: {ex}")
                 return
 
-            append_log(f"Enviando '{target_name}' ({len(data)/1024:.1f} KB) via Serial para o SD...")
+            append_log(f"Iniciando envio de '{target_name}' ({len(data)/1024:.1f} KB) para o SD da CYD...")
 
             def worker():
                 prog_upload.visible = True
                 lbl_upload_status.visible = True
                 prog_upload.value = 0.0
-                lbl_upload_status.value = f"Transferindo {target_name} (0%)..."
+                lbl_upload_status.value = f"Conectando com SD para gravar '{target_name}'..."
                 try:
                     page.update()
                 except Exception:
                     pass
 
+                def wait_for_ack(expected_prefix, timeout=4.0):
+                    t0 = time.time()
+                    while time.time() - t0 < timeout:
+                        if ack_event.wait(timeout=0.08):
+                            ack_event.clear()
+                            val = last_ack.get("val") or ""
+                            if val.startswith("ERR_NO_SD"):
+                                return False, "ERR_NO_SD"
+                            if val.startswith("ERR_OPEN"):
+                                return False, "ERR_OPEN"
+                            if val.startswith(expected_prefix):
+                                return True, val
+                    return False, "TIMEOUT"
+
+                # 1) Inicia gravacao no SD
+                ack_event.clear()
+                transfer_queue.put({"file_name": f"/{target_name}", "file_mode": "w"})
+                ok, resp = wait_for_ack("ACK_START", timeout=4.5)
+                if not ok:
+                    prog_upload.visible = False
+                    if resp == "ERR_NO_SD":
+                        lbl_upload_status.value = "❌ Cartão MicroSD não detectado na CYD! Formate em FAT32."
+                        append_log("Upload cancelado: Cartão MicroSD ausente ou não montado. Formate em FAT32.")
+                    else:
+                        lbl_upload_status.value = f"❌ Falha ao iniciar gravação no SD ({resp})."
+                        append_log(f"Upload cancelado: Placa não respondeu ACK_START ({resp}).")
+                    try:
+                        page.update()
+                    except Exception:
+                        pass
+                    return
+
+                # 2) Envia chunks de 512 bytes com sincronizacao por pacote
                 chunk_size = 512
                 total = len(data)
-                transfer_queue.put({"file_name": f"/{target_name}", "file_mode": "w"})
+                seq = 0
                 for i in range(0, total, chunk_size):
                     chunk = data[i:i + chunk_size]
                     b64 = base64.b64encode(chunk).decode("ascii")
+                    ack_event.clear()
                     transfer_queue.put({
                         "file_name": f"/{target_name}",
                         "file_mode": "a",
+                        "seq": seq,
                         "file_data": b64,
                     })
-                    pct = (i + len(chunk)) / total
+                    ok, resp = wait_for_ack("ACK_CHUNK", timeout=3.5)
+                    if not ok:
+                        prog_upload.visible = False
+                        lbl_upload_status.value = f"❌ Erro ao gravar bloco {seq} no SD ({resp})."
+                        append_log(f"Upload falhou no bloco {seq} ({resp}).")
+                        try:
+                            page.update()
+                        except Exception:
+                            pass
+                        return
+
+                    seq += 1
+                    pct = min((i + len(chunk)) / float(total), 1.0)
                     prog_upload.value = pct
-                    lbl_upload_status.value = f"Transferindo {target_name} ({int(pct * 100)}%)..."
+                    lbl_upload_status.value = f"Gravando '{target_name}' no SD ({int(pct * 100)}%)..."
                     try:
                         page.update()
                     except Exception:
                         pass
 
+                # 3) Finaliza gravacao
+                ack_event.clear()
                 transfer_queue.put({"file_name": f"/{target_name}", "file_mode": "eof"})
-                if target_name not in state["sd_files"]:
-                    state["sd_files"].append(target_name)
-                    dd_bg.options = make_dropdown_options(state["sd_files"])
-                state["bg"] = target_name
-                dd_bg.value = target_name
-                persist_and_queue_ui()
+                ok, resp = wait_for_ack("ACK_EOF", timeout=5.0)
+                if not ok:
+                    prog_upload.visible = False
+                    lbl_upload_status.value = f"❌ Falha ao finalizar arquivo ({resp})."
+                    append_log(f"Upload: Falha ao fechar arquivo no SD ({resp}).")
+                    try:
+                        page.update()
+                    except Exception:
+                        pass
+                    return
 
+                # 4) Sucesso total!
+                prog_upload.value = 1.0
                 prog_upload.visible = False
                 lbl_upload_status.value = f"✅ '{target_name}' gravado no SD e aplicado na tela!"
-                append_log(f"Upload concluído: '{target_name}' definido como fundo.")
+                append_log(f"Upload concluído com sucesso: '{target_name}' gravado no SD e definido como fundo.")
+
+                if target_name not in state["sd_files"]:
+                    state["sd_files"].append(target_name)
+                state["bg"] = target_name
+                dd_bg.options = make_dropdown_options(state["sd_files"])
+                dd_bg.value = target_name
+                persist_and_queue_ui()
                 try:
                     page.update()
                 except Exception:
@@ -1745,7 +1813,10 @@ def launch_flet_gui(col: Collector, mkt_col: MarketCollector, cli_args):
                     break
                 if not raw:
                     continue
-                if raw == "MONITOR_READY":
+                if raw.startswith("ACK_") or raw.startswith("ERR_"):
+                    last_ack["val"] = raw
+                    ack_event.set()
+                elif raw == "MONITOR_READY":
                     state["ui_dirty"] = True
                     request_sd_files()
                 elif raw.startswith("SD_FILES:"):
@@ -1758,9 +1829,18 @@ def launch_flet_gui(col: Collector, mkt_col: MarketCollector, cli_args):
                             cfg["sd_files"] = merged
                             save_ui_config(cfg)
                             dd_bg.options = make_dropdown_options(merged)
-                            append_log(f"SD Card sincronizado: {len(files)} imagem(ns) encontrada(s).")
+                            if files:
+                                append_log(f"SD Card sincronizado: {len(files)} imagem(ns) encontrada(s): {', '.join(files)}")
+                            else:
+                                append_log("SD Card sincronizado: Nenhuma imagem encontrada ou cartão não detectado.")
                     except Exception:
                         pass
+                elif raw.startswith("SD_INIT:OK"):
+                    append_log(f"Cartão MicroSD detectado e montado com sucesso ({raw}).")
+                elif raw.startswith("SD_INIT:FAIL"):
+                    append_log("⚠️ Cartão MicroSD não detectado pela placa CYD. Verifique se está inserido e formatado em FAT32.")
+                elif raw.startswith("JPG_ERR:"):
+                    append_log(f"⚠️ Erro no hardware CYD ao decodificar imagem JPEG ({raw}).")
 
         def _fmt_chg(lbl_c, chg_val: float):
             lbl_c.value = f"{'+' if chg_val >= 0 else ''}{chg_val:.2f}%"
@@ -1869,7 +1949,6 @@ def launch_flet_gui(col: Collector, mkt_col: MarketCollector, cli_args):
                         line = json.dumps(pkt, separators=(",", ":")) + "\n"
                         ser.write(line.encode("utf-8"))
                         ser.flush()
-                        time.sleep(0.035)
                         continue
 
                     # 2) Prioridade alta: Mudanca de UI instantanea (Event-Driven <50ms)

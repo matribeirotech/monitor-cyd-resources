@@ -66,8 +66,10 @@ Preferences prefs;
 // Decodificador de GIFs (mantido para retrocompatibilidade caso bg seja .gif)
 AnimatedGIF gif;
 File gifFile;
+File uploadFile;
 bool hasSD = false;
 bool isGifPlaying = false;
+bool initOrVerifySD();
 
 // ------------------------------------------------------- estado da UI ------
 uint16_t C_BG        = 0x0000;
@@ -187,16 +189,50 @@ void setBacklight(int brt) {
 }
 
 // ========================================== Carregamento de Imagens do SD ==
+// Inicializa ou re-detecta o Cartao MicroSD dinamicamente (suporte a Hot-Plug)
+bool initOrVerifySD() {
+  if (hasSD) return true;
+
+  pinMode(SD_CS, OUTPUT);
+  digitalWrite(SD_CS, HIGH);
+  delay(15);
+
+  sdSPI.begin(SD_SCK, SD_MISO, SD_MOSI, SD_CS);
+
+  // Inicializa em 4 MHz (frequencia padrao estavel para microSD em modo SPI no ESP32)
+  if (SD.begin(SD_CS, sdSPI, 4000000)) {
+    hasSD = true;
+    gif.begin(LITTLE_ENDIAN_PIXELS);
+    Serial.println("SD_INIT:OK_4MHZ");
+    return true;
+  }
+
+  // Fallback para 1 MHz caso haja interferencia ou trilhas longas
+  if (SD.begin(SD_CS, sdSPI, 1000000)) {
+    hasSD = true;
+    gif.begin(LITTLE_ENDIAN_PIXELS);
+    Serial.println("SD_INIT:OK_1MHZ");
+    return true;
+  }
+
+  hasSD = false;
+  uint8_t cType = SD.cardType();
+  Serial.printf("SD_INIT:FAIL (cardType=%d)\n", cType);
+  return false;
+}
+
 // Callback chamado pela biblioteca TJpg_Decoder para desenhar blocos no TFT
 bool tft_output(int16_t x, int16_t y, uint16_t w, uint16_t h, uint16_t* bitmap) {
-  if (y >= tft.height() || x >= tft.width()) return 0;
+  if (y >= tft.height() || x >= tft.width()) return 1; // clip, mas retorna 1 para nao abortar a decodificacao!
+  if (x + w > tft.width())  w = tft.width() - x;
+  if (y + h > tft.height()) h = tft.height() - y;
   tft.pushImage(x, y, w, h, bitmap);
   return 1;
 }
 
 // Resolve o caminho do arquivo no Cartao SD (procura em "/", "/bg/" e "/wallpapers/")
 String resolveSdPath(const char* name) {
-  if (!hasSD || !name || !name[0]) return "";
+  if (!initOrVerifySD() || !name || !name[0]) return "";
   String base = String(name);
   if (base.startsWith("/")) base = base.substring(1);
 
@@ -207,6 +243,27 @@ String resolveSdPath(const char* name) {
   };
   for (int i = 0; i < 3; i++) {
     if (SD.exists(candidates[i])) return candidates[i];
+  }
+
+  // Fallback: Busca ignorando diferencas de maiusculas/minusculas
+  File root = SD.open("/");
+  if (root && root.isDirectory()) {
+    File f = root.openNextFile();
+    while (f) {
+      if (!f.isDirectory()) {
+        String fn = String(f.name());
+        int slash = fn.lastIndexOf('/');
+        if (slash >= 0) fn = fn.substring(slash + 1);
+        if (fn.equalsIgnoreCase(base)) {
+          String matchPath = "/" + fn;
+          f.close();
+          root.close();
+          return matchPath;
+        }
+      }
+      f = root.openNextFile();
+    }
+    root.close();
   }
   return "";
 }
@@ -329,15 +386,15 @@ void GIFDraw(GIFDRAW *pDraw) {
 
 // Lista arquivos de imagem do Cartao SD e envia para o PC via Serial
 void listSdFilesToSerial() {
-  if (!hasSD) {
+  if (!initOrVerifySD()) {
     Serial.println("SD_FILES:[]");
     return;
   }
   JsonDocument doc;
   JsonArray arr = doc.to<JsonArray>();
 
-  const char* dirs[2] = {"/", "/bg"};
-  for (int d = 0; d < 2; d++) {
+  const char* dirs[3] = {"/", "/bg", "/wallpapers"};
+  for (int d = 0; d < 3; d++) {
     File root = SD.open(dirs[d]);
     if (!root || !root.isDirectory()) continue;
     File file = root.openNextFile();
@@ -350,7 +407,14 @@ void listSdFilesToSerial() {
         low.toLowerCase();
         if (low.endsWith(".jpg") || low.endsWith(".jpeg") ||
             low.endsWith(".bmp") || low.endsWith(".gif")) {
-          arr.add(fname);
+          bool exists = false;
+          for (JsonVariant v : arr) {
+            if (fname.equalsIgnoreCase(v.as<const char*>())) {
+              exists = true;
+              break;
+            }
+          }
+          if (!exists) arr.add(fname);
         }
       }
       file = root.openNextFile();
@@ -500,33 +564,47 @@ void renderBackground() {
   }
 
   // Caso contrario, e um arquivo no Cartao SD (.jpg, .jpeg, .bmp, .gif)
-  if (!hasSD) {
+  if (!initOrVerifySD()) {
     tft.fillScreen(C_BG);
-    tft.setTextDatum(BC_DATUM);
+    tft.setTextDatum(MC_DATUM);
     tft.setTextColor(C_HOT, C_BG);
-    tft.drawString("SD CARD AUSENTE", SCR_W / 2, TICKER_Y - 2, 1);
+    tft.drawString("CARTAO SD NAO DETECTADO", SCR_W / 2, 60, 2);
+    tft.setTextColor(C_TEXT, C_BG);
+    tft.drawString("Insira o MicroSD na CYD", SCR_W / 2, 85, 2);
+    tft.setTextColor(C_DIM, C_BG);
+    tft.drawString("Formato obrigatorio: FAT32", SCR_W / 2, 105, 1);
+    tft.drawString("Pressione 'Ler SD' no Agente do PC", SCR_W / 2, 125, 1);
     return;
   }
 
   String path = resolveSdPath(bg.c_str());
   if (path.length() == 0) {
     tft.fillScreen(C_BG);
-    tft.setTextDatum(BC_DATUM);
+    tft.setTextDatum(MC_DATUM);
     tft.setTextColor(C_WARN, C_BG);
-    String err = "SD: " + bg + " nao encontrado";
-    tft.drawString(err.c_str(), SCR_W / 2, TICKER_Y - 2, 1);
+    char buf[64];
+    snprintf(buf, sizeof(buf), "Imagem '%s'", bg.c_str());
+    tft.drawString(buf, SCR_W / 2, 60, 2);
+    tft.drawString("nao encontrada no Cartao SD", SCR_W / 2, 82, 2);
+    tft.setTextColor(C_TEXT, C_BG);
+    tft.drawString("Copie para a raiz do cartao ou", SCR_W / 2, 105, 1);
+    tft.drawString("use o botao 'Enviar Imagem' no PC", SCR_W / 2, 120, 1);
     return;
   }
 
   if (bgLow.endsWith(".jpg") || bgLow.endsWith(".jpeg")) {
-    bool oldSwap = tft.getSwapBytes();
-    tft.setSwapBytes(true);
     JRESULT res = TJpgDec.drawSdJpg(0, 0, path.c_str());
-    tft.setSwapBytes(oldSwap);
-    if (res == JDR_OK) {
+    if (res == JDR_OK || res == JDR_INTR) {
       hasBgBitmap = true;
     } else {
+      Serial.printf("JPG_ERR:%d\n", res);
       tft.fillScreen(C_BG);
+      tft.setTextDatum(MC_DATUM);
+      tft.setTextColor(C_WARN, C_BG);
+      char buf[64];
+      snprintf(buf, sizeof(buf), "Erro ao decodificar JPG (%d)", res);
+      tft.drawString(buf, SCR_W / 2, 70, 2);
+      tft.drawString(bg.c_str(), SCR_W / 2, 95, 2);
     }
   } else if (bgLow.endsWith(".bmp")) {
     if (drawSdBmp(path.c_str(), 0, 0)) {
@@ -1434,7 +1512,7 @@ void applyJson(const char *json) {
   JsonVariant vFile = doc["file_name"];
   JsonVariant vMode = doc["file_mode"];
   if (!vFile.isNull() && !vMode.isNull()) {
-    if (!hasSD) {
+    if (!initOrVerifySD()) {
       Serial.println("ERR_NO_SD");
       return;
     }
@@ -1444,14 +1522,25 @@ void applyJson(const char *json) {
 
     if (strcmp(fMode, "w") == 0) {
       if (isGifPlaying) { gif.close(); isGifPlaying = false; }
+      if (uploadFile) { uploadFile.close(); }
       if (SD.exists(fName)) SD.remove(fName);
-      File f = SD.open(fName, FILE_WRITE);
-      if (f) f.close();
+      uploadFile = SD.open(fName, FILE_WRITE);
+      if (!uploadFile) {
+        Serial.println("ERR_OPEN");
+        return;
+      }
       Serial.println("ACK_START");
       return;
     }
 
     if (strcmp(fMode, "a") == 0) {
+      if (!uploadFile) {
+        uploadFile = SD.open(fName, FILE_APPEND);
+      }
+      if (!uploadFile) {
+        Serial.println("ERR_OPEN");
+        return;
+      }
       JsonVariant vData = doc["file_data"];
       if (!vData.isNull()) {
         const char* b64 = vData.as<const char*>();
@@ -1461,21 +1550,23 @@ void applyJson(const char *json) {
           if (bin) {
             size_t olen = 0;
             if (mbedtls_base64_decode(bin, b64Len, &olen, (const unsigned char*)b64, b64Len) == 0) {
-              File f = SD.open(fName, FILE_APPEND);
-              if (f) {
-                f.write(bin, olen);
-                f.close();
-              }
+              uploadFile.write(bin, olen);
+              uploadFile.flush();
             }
             free(bin);
           }
         }
       }
-      Serial.println("ACK_CHUNK");
+      int seq = doc["seq"] | 0;
+      Serial.printf("ACK_CHUNK:%d\n", seq);
       return;
     }
 
     if (strcmp(fMode, "eof") == 0) {
+      if (uploadFile) {
+        uploadFile.flush();
+        uploadFile.close();
+      }
       String cleanName = fName.startsWith("/") ? fName.substring(1) : fName;
       strlcpy(bgImage, cleanName.c_str(), sizeof(bgImage));
       prefs.putString("bg", bgImage);
@@ -1725,16 +1816,10 @@ void setup() {
   // Inicializa decodificador JPEG para imagens estaticas do Cartao SD
   TJpgDec.setJpgScale(1);
   TJpgDec.setCallback(tft_output);
+  TJpgDec.setSwapBytes(true);
 
   // Inicializa Cartao SD no barramento VSPI (Pinos 18, 19, 23, CS=5)
-  sdSPI.begin(SD_SCK, SD_MISO, SD_MOSI, SD_CS);
-  if (SD.begin(SD_CS, sdSPI, 20000000)) {
-    hasSD = true;
-    gif.begin(LITTLE_ENDIAN_PIXELS);
-  } else if (SD.begin(SD_CS, sdSPI, 4000000)) {
-    hasSD = true;
-    gif.begin(LITTLE_ENDIAN_PIXELS);
-  }
+  initOrVerifySD();
 
   memset(hCpu, 0, sizeof(hCpu));
   memset(hGpu, 0, sizeof(hGpu));
@@ -1752,7 +1837,7 @@ void setup() {
   tft.setTextColor(C_TEXT, C_CARD);
   tft.drawString("Hardware + Bolsa & Cripto em Tempo Real", SCR_W / 2, 142, 2);
   tft.setTextColor(hasSD ? C_OK : C_WARN, C_CARD);
-  tft.drawString(hasSD ? "SD Card: OK (JPG/BMP/GIF Prontos)" : "SD Card: Nao Detectado", SCR_W / 2, 166, 2);
+  tft.drawString(hasSD ? "SD Card: OK (JPG/BMP/GIF Prontos)" : "SD Card: Nao Detectado (FAT32)", SCR_W / 2, 166, 2);
   delay(900);
 
   Serial.println("MONITOR_READY");
