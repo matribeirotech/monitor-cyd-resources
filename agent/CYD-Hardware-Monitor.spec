@@ -6,7 +6,7 @@ a = Analysis(
     pathex=[],
     binaries=[],
     datas=[],
-    hiddenimports=['serial', 'serial.tools.list_ports', 'psutil', 'wmi', 'win32com.client', 'PIL'],
+    hiddenimports=['serial', 'serial.tools.list_ports', 'psutil', 'wmi', 'win32com.client', 'PIL', 'pystray', 'pystray._win32'],
     hookspath=[],
     hooksconfig={},
     runtime_hooks=[],
@@ -35,5 +35,5 @@ exe = EXE(
     target_arch=None,
     codesign_identity=None,
     entitlements_file=None,
-    version='C:/Users/MATHEU~1/AppData/Local/Temp/9ebcd07a-0e83-4c73-9363-a6e65de62f19',
+    version='C:/Users/MATHEU~1/AppData/Local/Temp/703305b7-559b-42e4-87e9-d2e9f9ca2a96',
 )

@@ -842,18 +842,6 @@ def launch_flet_gui(col: Collector, mkt_col: MarketCollector, cli_args):
         page.scroll = ft.ScrollMode.AUTO
         page.theme_mode = ft.ThemeMode.DARK
 
-        try:
-            if hasattr(page, "window") and page.window is not None:
-                page.window.width = 900
-                page.window.height = 940
-                page.window.min_width = 740
-                page.window.min_height = 740
-            else:
-                page.window_width = 900
-                page.window_height = 940
-        except Exception:
-            pass
-
         cfg = load_ui_config()
         state = {
             "screen": int(cfg.get("screen", 1)),
@@ -869,6 +857,92 @@ def launch_flet_gui(col: Collector, mkt_col: MarketCollector, cli_args):
             "last_mkt_sync": 0.0,
             "last_brt_ev": 0.0,
         }
+
+        def restore_window(icon=None, item=None):
+            try:
+                if hasattr(page, "window") and page.window is not None:
+                    page.window.minimized = False
+                    page.window.visible = True
+                    page.update()
+                    if hasattr(page, "run_task") and hasattr(page.window, "to_front"):
+                        try:
+                            page.run_task(page.window.to_front)
+                        except Exception:
+                            pass
+            except Exception:
+                pass
+
+        def minimize_window(icon=None, item=None):
+            try:
+                if hasattr(page, "window") and page.window is not None:
+                    page.window.minimized = True
+                    page.update()
+            except Exception:
+                pass
+
+        def quit_app(icon=None, item=None):
+            state["running"] = False
+            try:
+                if tray_icon:
+                    tray_icon.stop()
+            except Exception:
+                pass
+            try:
+                if hasattr(page, "window") and hasattr(page.window, "destroy"):
+                    page.run_task(page.window.destroy)
+            except Exception:
+                pass
+            time.sleep(0.1)
+            os._exit(0)
+
+        def on_window_event(e):
+            ev_data = str(getattr(e, "data", "")).lower()
+            ev_type = str(getattr(e, "type", "")).lower()
+            if "close" in ev_data or "close" in ev_type:
+                minimize_window()
+
+        try:
+            if hasattr(page, "window") and page.window is not None:
+                page.window.width = 900
+                page.window.height = 940
+                page.window.min_width = 740
+                page.window.min_height = 740
+                page.window.prevent_close = True
+                page.window.on_event = on_window_event
+            else:
+                page.window_width = 900
+                page.window_height = 940
+        except Exception:
+            pass
+
+        # ---------------------- BANDEJA DO SISTEMA (SYSTEM TRAY) -------------
+        tray_icon = None
+        try:
+            import pystray
+            from PIL import Image, ImageDraw
+
+            def create_tray_image():
+                img = Image.new("RGBA", (64, 64), (0, 0, 0, 0))
+                draw = ImageDraw.Draw(img)
+                draw.rounded_rectangle([2, 2, 62, 62], radius=12, fill=(15, 23, 42, 255), outline=(0, 255, 128, 255), width=3)
+                draw.line([(10, 44), (22, 28), (34, 38), (46, 18), (54, 26)], fill=(0, 255, 128, 255), width=4)
+                return img
+
+            tray_menu = pystray.Menu(
+                pystray.MenuItem("Abrir Painel", restore_window, default=True),
+                pystray.MenuItem("Minimizar para Segundo Plano", minimize_window),
+                pystray.Menu.SEPARATOR,
+                pystray.MenuItem("Encerrar Agente", quit_app),
+            )
+            tray_icon = pystray.Icon(
+                "cyd_monitor",
+                create_tray_image(),
+                "CYD Hardware & Market Monitor (Ativo em Segundo Plano)",
+                menu=tray_menu,
+            )
+            threading.Thread(target=tray_icon.run, daemon=True).start()
+        except Exception:
+            tray_icon = None
 
         ui_event_queue = queue.Queue()
         transfer_queue = queue.Queue()
@@ -950,10 +1024,23 @@ def launch_flet_gui(col: Collector, mkt_col: MarketCollector, cli_args):
             padding=pad_sym(horizontal=14, vertical=6),
         )
 
+        btn_minimize = ft.IconButton(
+            icon=ft.Icons.MINIMIZE,
+            icon_color="#94A3B8",
+            tooltip="Minimizar (continua em segundo plano)",
+            on_click=lambda e: minimize_window(),
+        )
+        btn_quit = ft.IconButton(
+            icon=ft.Icons.POWER_SETTINGS_NEW,
+            icon_color="#EF4444",
+            tooltip="Encerrar Agente",
+            on_click=lambda e: quit_app(),
+        )
+
         header_row = ft.Row(
             [
-                ft.Column([lbl_title, lbl_subtitle], spacing=2),
-                status_badge,
+                ft.Column([lbl_title, lbl_subtitle], spacing=2, expand=True),
+                ft.Row([status_badge, btn_minimize, btn_quit], spacing=6, tight=True),
             ],
             alignment=ft.MainAxisAlignment.SPACE_BETWEEN,
         )

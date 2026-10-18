@@ -1,0 +1,13 @@
+{
+  "screen": 1,
+  "hex_color": "#00FF00",
+  "color": "0x07E0",
+  "bg": "none",
+  "brt": 200,
+  "ticker": true,
+  "sd_files": [
+    "none",
+    "terminal",
+    "z1p0"
+  ]
+}
