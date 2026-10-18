@@ -659,15 +659,16 @@ def save_ui_config(cfg):
 # ========================================== COLETOR DE MERCADO FINANCEIRO ====
 class MarketCollector:
     """
-    Coleta cotacoes do mercado financeiro em tempo real em uma thread separada
-    (nao bloqueia o loop de 1s de telemetria de hardware):
-      - Cambio Fiat: Dolar (USD/BRL) e Euro (EUR/BRL) via AwesomeAPI (fallback Yahoo Finance)
-      - Criptomoedas Principais: BTC, ETH, SOL, BNB, XRP + Curva 24h do BTC via Binance Public API
-      - Bolsa de Valores: IBOVESPA (^BVSP) e S&P 500 (^GSPC) via Yahoo Finance
+    Coletor Financeiro & Cripto em Tempo Real de Alta Performance (Multi-Threaded).
+      - Criptomoedas (Coinbase Spot USD + Binance 24h chg): atualizadas a cada 3.0s.
+        Garante alinhamento centavo por centavo com a busca do Google ("preço do bitcoin em dolar").
+      - Indices (IBOVESPA, S&P 500) e Câmbio Oficial (USD/BRL, EUR/BRL): atualizados a cada 12.0s.
+      - Sparkline de 24h do Bitcoin (48 candles) da Binance.
     """
 
-    def __init__(self, refresh_interval: float = 20.0):
-        self.refresh_interval = refresh_interval
+    def __init__(self, crypto_interval: float = 3.0, stock_interval: float = 12.0):
+        self.crypto_interval = crypto_interval
+        self.stock_interval = stock_interval
         self._lock = threading.Lock()
         self._data = {
             "usd": 0.0, "usdc": 0.0,
@@ -680,13 +681,16 @@ class MarketCollector:
             "bnb": 0.0, "bnbc": 0.0,
             "xrp": 0.0, "xrpc": 0.0,
             "btch": [],
+            "last_str": "--:--:--",
         }
         self._updated_at = 0.0
         self._running = True
-        self._trigger_ev = threading.Event()
-        threading.Thread(target=self._worker, daemon=True).start()
+        self._trigger_crypto = threading.Event()
+        self._trigger_stock = threading.Event()
+        threading.Thread(target=self._crypto_worker, daemon=True).start()
+        threading.Thread(target=self._stock_worker, daemon=True).start()
 
-    def _http_json(self, url: str, timeout: float = 5.0):
+    def _http_json(self, url: str, timeout: float = 3.5):
         req = urllib.request.Request(
             url,
             headers={
@@ -700,7 +704,7 @@ class MarketCollector:
     def _fetch_yahoo_quote(self, ticker_encoded: str) -> tuple[float, float] | None:
         try:
             url = f"https://query1.finance.yahoo.com/v8/finance/chart/{ticker_encoded}?interval=1d&range=2d"
-            raw = self._http_json(url, timeout=4.5)
+            raw = self._http_json(url, timeout=3.5)
             meta = raw["chart"]["result"][0]["meta"]
             price = float(meta["regularMarketPrice"])
             prev = float(meta.get("chartPreviousClose") or meta.get("previousClose") or price)
@@ -709,13 +713,80 @@ class MarketCollector:
         except Exception:
             return None
 
-    def fetch_once(self) -> bool:
-        updated = False
+    def fetch_crypto_now(self) -> bool:
         new_d = {}
+        updated = False
 
-        # 1) Cambio USD/BRL e EUR/BRL via AwesomeAPI (com fallback para Yahoo Finance)
+        # 1) Spot Prices em USD direto da Coinbase (mesma fonte primária exibida pelo Google)
+        rates = None
         try:
-            fx = self._http_json("https://economia.awesomeapi.com.br/last/USD-BRL,EUR-BRL", timeout=4.5)
+            raw_cb = self._http_json("https://api.coinbase.com/v2/exchange-rates?currency=USD", timeout=3.0)
+            rates = raw_cb.get("data", {}).get("rates", {})
+            if rates:
+                if "BTC" in rates and float(rates["BTC"]) > 0:
+                    new_d["btc"] = round(1.0 / float(rates["BTC"]), 0)
+                    updated = True
+                if "ETH" in rates and float(rates["ETH"]) > 0:
+                    new_d["eth"] = round(1.0 / float(rates["ETH"]), 0)
+                    updated = True
+                if "SOL" in rates and float(rates["SOL"]) > 0:
+                    new_d["sol"] = round(1.0 / float(rates["SOL"]), 2)
+                    updated = True
+                if "BNB" in rates and float(rates["BNB"]) > 0:
+                    new_d["bnb"] = round(1.0 / float(rates["BNB"]), 2)
+                    updated = True
+                if "XRP" in rates and float(rates["XRP"]) > 0:
+                    new_d["xrp"] = round(1.0 / float(rates["XRP"]), 4)
+                    updated = True
+                if "BRL" in rates and float(rates["BRL"]) > 0:
+                    new_d["usd"] = round(float(rates["BRL"]), 3)
+                    if "EUR" in rates and float(rates["EUR"]) > 0:
+                        new_d["eur"] = round(float(rates["BRL"]) / float(rates["EUR"]), 3)
+                    updated = True
+        except Exception:
+            pass
+
+        # 2) Variação Percentual 24h e Fallback de Cotações via Binance Ticker API
+        try:
+            syms = "%5B%22BTCUSDT%22,%22ETHUSDT%22,%22SOLUSDT%22,%22BNBUSDT%22,%22XRPUSDT%22%5D"
+            tickers = self._http_json(f"https://api.binance.com/api/v3/ticker/24hr?symbols={syms}", timeout=3.0)
+            mapping = {
+                "BTCUSDT": ("btc", "btcc", 0),
+                "ETHUSDT": ("eth", "ethc", 0),
+                "SOLUSDT": ("sol", "solc", 2),
+                "BNBUSDT": ("bnb", "bnbc", 2),
+                "XRPUSDT": ("xrp", "xrpc", 4),
+            }
+            for item in tickers:
+                sym = item.get("symbol")
+                if sym in mapping:
+                    k_p, k_c, dec = mapping[sym]
+                    if k_p not in new_d:
+                        p_val = float(item.get("lastPrice", 0.0))
+                        new_d[k_p] = round(p_val, dec) if dec > 0 else round(p_val, 0)
+                    new_d[k_c] = round(float(item.get("priceChangePercent", 0.0)), 2)
+                    updated = True
+        except Exception:
+            pass
+
+        if updated:
+            with self._lock:
+                self._data.update(new_d)
+                usd_now = self._data.get("usd", 0.0)
+                btc_now = self._data.get("btc", 0.0)
+                if usd_now > 0 and btc_now > 0:
+                    self._data["btc_brl"] = round(btc_now * usd_now, 0)
+                self._data["last_str"] = brasilia_now().strftime("%H:%M:%S")
+                self._updated_at = time.time()
+        return updated
+
+    def fetch_stock_now(self) -> bool:
+        new_d = {}
+        updated = False
+
+        # 1) Câmbio USD/BRL e EUR/BRL oficial (AwesomeAPI)
+        try:
+            fx = self._http_json("https://economia.awesomeapi.com.br/last/USD-BRL,EUR-BRL", timeout=3.5)
             if "USDBRL" in fx:
                 new_d["usd"] = round(float(fx["USDBRL"]["bid"]), 3)
                 new_d["usdc"] = round(float(fx["USDBRL"].get("pctChange", 0.0)), 2)
@@ -725,53 +796,9 @@ class MarketCollector:
                 new_d["eurc"] = round(float(fx["EURBRL"].get("pctChange", 0.0)), 2)
                 updated = True
         except Exception:
-            y_usd = self._fetch_yahoo_quote("BRL=X")
-            if y_usd:
-                new_d["usd"], new_d["usdc"] = round(y_usd[0], 3), y_usd[1]
-                updated = True
-            y_eur = self._fetch_yahoo_quote("EURBRL=X")
-            if y_eur:
-                new_d["eur"], new_d["eurc"] = round(y_eur[0], 3), y_eur[1]
-                updated = True
-
-        # 2) Criptomoedas Principais via Binance Public 24hr Ticker API
-        try:
-            syms = "%5B%22BTCUSDT%22,%22ETHUSDT%22,%22SOLUSDT%22,%22BNBUSDT%22,%22XRPUSDT%22%5D"
-            tickers = self._http_json(f"https://api.binance.com/api/v3/ticker/24hr?symbols={syms}", timeout=4.5)
-            mapping = {
-                "BTCUSDT": ("btc", "btcc", 0),
-                "ETHUSDT": ("eth", "ethc", 1),
-                "SOLUSDT": ("sol", "solc", 2),
-                "BNBUSDT": ("bnb", "bnbc", 2),
-                "XRPUSDT": ("xrp", "xrpc", 3),
-            }
-            for item in tickers:
-                sym = item.get("symbol")
-                if sym in mapping:
-                    k_p, k_c, dec = mapping[sym]
-                    p_val = float(item.get("lastPrice", 0.0))
-                    c_val = float(item.get("priceChangePercent", 0.0))
-                    new_d[k_p] = round(p_val, dec) if dec > 0 else round(p_val, 0)
-                    new_d[k_c] = round(c_val, 2)
-                    updated = True
-        except Exception:
             pass
 
-        # 3) Curva de 24h do Bitcoin (48 candles de 30m normalizados 0..100 para o grafico da CYD)
-        try:
-            klines = self._http_json(
-                "https://api.binance.com/api/v3/klines?symbol=BTCUSDT&interval=30m&limit=48",
-                timeout=4.5,
-            )
-            closes = [float(k[4]) for k in klines if len(k) > 4]
-            if len(closes) >= 4:
-                lo, hi = min(closes), max(closes)
-                span = (hi - lo) if (hi > lo) else 1.0
-                new_d["btch"] = [int(round((c - lo) / span * 100.0)) for c in closes]
-        except Exception:
-            pass
-
-        # 4) Indices da Bolsa de Valores: IBOVESPA (^BVSP) e S&P 500 (^GSPC)
+        # 2) Índices da Bolsa: IBOVESPA (^BVSP) e S&P 500 (^GSPC) via Yahoo Finance
         ibov = self._fetch_yahoo_quote("%5EBVSP")
         if ibov:
             new_d["ibov"] = round(ibov[0], 0)
@@ -784,27 +811,58 @@ class MarketCollector:
             new_d["sp500c"] = sp500[1]
             updated = True
 
-        with self._lock:
-            self._data.update(new_d)
-            usd_now = self._data.get("usd", 0.0)
-            btc_now = self._data.get("btc", 0.0)
-            if usd_now > 0 and btc_now > 0:
-                self._data["btc_brl"] = round(btc_now * usd_now, 0)
-            if updated:
+        # 3) Curva Sparkline de 24h do Bitcoin (48 candles de 30m da Binance)
+        try:
+            klines = self._http_json(
+                "https://api.binance.com/api/v3/klines?symbol=BTCUSDT&interval=30m&limit=48",
+                timeout=3.5,
+            )
+            closes = [float(k[4]) for k in klines if len(k) > 4]
+            if len(closes) >= 4:
+                lo, hi = min(closes), max(closes)
+                span = (hi - lo) if (hi > lo) else 1.0
+                new_d["btch"] = [int(round((c - lo) / span * 100.0)) for c in closes]
+                updated = True
+        except Exception:
+            pass
+
+        if updated:
+            with self._lock:
+                self._data.update(new_d)
+                usd_now = self._data.get("usd", 0.0)
+                btc_now = self._data.get("btc", 0.0)
+                if usd_now > 0 and btc_now > 0:
+                    self._data["btc_brl"] = round(btc_now * usd_now, 0)
+                self._data["last_str"] = brasilia_now().strftime("%H:%M:%S")
                 self._updated_at = time.time()
         return updated
 
-    def _worker(self):
+    def _crypto_worker(self):
         while self._running:
             try:
-                self.fetch_once()
+                self.fetch_crypto_now()
             except Exception:
                 pass
-            self._trigger_ev.wait(timeout=self.refresh_interval)
-            self._trigger_ev.clear()
+            self._trigger_crypto.wait(timeout=self.crypto_interval)
+            self._trigger_crypto.clear()
+
+    def _stock_worker(self):
+        while self._running:
+            try:
+                self.fetch_stock_now()
+            except Exception:
+                pass
+            self._trigger_stock.wait(timeout=self.stock_interval)
+            self._trigger_stock.clear()
+
+    def fetch_once(self) -> bool:
+        r1 = self.fetch_crypto_now()
+        r2 = self.fetch_stock_now()
+        return r1 or r2
 
     def force_refresh(self):
-        self._trigger_ev.set()
+        self._trigger_crypto.set()
+        self._trigger_stock.set()
 
     def get_market_dict(self) -> dict:
         with self._lock:
@@ -1132,25 +1190,64 @@ def launch_flet_gui(col: Collector, mkt_col: MarketCollector, cli_args):
             on_click=on_toggle_ticker,
         )
 
+        lbl_market_status = ft.Text(
+            "🟢 Cripto: Ao Vivo (Coinbase / Binance • 3s) • 🟡 B3 & Câmbio: Fechado (Fim de semana)",
+            size=11,
+            color="#F59E0B",
+            weight=ft.FontWeight.W_500,
+        )
+        lbl_market_time = ft.Text("Última cotação: --:--:--", size=11, color="#64748B", font_family="Consolas")
+
         def on_manual_mkt_refresh(_e):
-            mkt_col.force_refresh()
-            append_log("Atualizando cotações de Câmbio, Cripto e Bolsa...")
+            def run_refresh():
+                btn_refresh_mkt.text = "⏳ Atualizando..."
+                btn_refresh_mkt.disabled = True
+                try:
+                    page.update()
+                except Exception:
+                    pass
+                mkt_col.force_refresh()
+                time.sleep(0.5)
+                m = mkt_col.get_market_dict()
+                append_log(f"Cotações atualizadas: BTC ${m.get('btc', 0):,.0f} | USD R$ {m.get('usd', 0):.2f}")
+                btn_refresh_mkt.text = "✅ Atualizado!"
+                try:
+                    page.update()
+                except Exception:
+                    pass
+                time.sleep(1.2)
+                btn_refresh_mkt.text = "🔄 Atualizar Cotações"
+                btn_refresh_mkt.disabled = False
+                try:
+                    page.update()
+                except Exception:
+                    pass
+
+            threading.Thread(target=run_refresh, daemon=True).start()
+
+        btn_refresh_mkt = ft.OutlinedButton("🔄 Atualizar Cotações", on_click=on_manual_mkt_refresh)
 
         sec_market_live = ft.Container(
             content=ft.Column(
                 [
                     ft.Row(
                         [
-                            ft.Text(
-                                "📊 MERCADO FINANCEIRO & CRIPTO AO VIVO (EXIBIDO NA TELA 6 E NO LETREIRO INFINITO DA TELA PRINCIPAL)",
-                                size=12,
-                                weight=ft.FontWeight.BOLD,
-                                color="#94A3B8",
+                            ft.Column(
+                                [
+                                    ft.Text(
+                                        "📊 MERCADO FINANCEIRO & CRIPTO AO VIVO (EXIBIDO NA TELA 6 E NO LETREIRO INFINITO DA TELA PRINCIPAL)",
+                                        size=12,
+                                        weight=ft.FontWeight.BOLD,
+                                        color="#94A3B8",
+                                    ),
+                                    ft.Row([lbl_market_status, lbl_market_time], spacing=12),
+                                ],
+                                spacing=2,
                             ),
                             ft.Row(
                                 [
                                     btn_ticker_toggle,
-                                    ft.OutlinedButton("🔄 Atualizar Cotações", on_click=on_manual_mkt_refresh),
+                                    btn_refresh_mkt,
                                 ],
                                 spacing=8,
                             ),
@@ -1712,6 +1809,17 @@ def launch_flet_gui(col: Collector, mkt_col: MarketCollector, cli_args):
                 lbl_ibov_p.value = f"{mkt_m['ibov']/1000.0:.1f}k pts"
                 _fmt_chg(lbl_ibov_c, mkt_m.get("ibovc", 0.0))
 
+            if mkt_m.get("last_str") and mkt_m["last_str"] != "--:--:--":
+                lbl_market_time.value = f"Última cotação: {mkt_m['last_str']}"
+
+            now_br = brasilia_now()
+            if now_br.weekday() in (5, 6):
+                lbl_market_status.value = "🟢 Cripto: Ao Vivo (Coinbase / Binance • 3s) • 🟡 B3 & Câmbio: Fechado (Fim de semana)"
+                lbl_market_status.color = "#F59E0B"
+            else:
+                lbl_market_status.value = "🟢 Cripto: Ao Vivo (Coinbase / 3s) • 🟢 B3 & Câmbio: Mercado Aberto"
+                lbl_market_status.color = "#10B981"
+
             try:
                 page.update()
             except Exception:
@@ -1781,7 +1889,7 @@ def launch_flet_gui(col: Collector, mkt_col: MarketCollector, cli_args):
                             state["ui_dirty"] = False
                             state["last_ui_sync"] = now
 
-                        if (now - state["last_mkt_sync"] >= 5.0) or ("ui" in payload):
+                        if (now - state["last_mkt_sync"] >= 2.0) or ("ui" in payload):
                             if mkt_metrics.get("usd", 0) > 0 or mkt_metrics.get("btc", 0) > 0:
                                 payload["mkt"] = mkt_metrics
                                 state["last_mkt_sync"] = now
@@ -1827,7 +1935,7 @@ def main():
     args = ap.parse_args()
 
     col = Collector(game_processes=args.game_proc)
-    mkt_col = MarketCollector(refresh_interval=20.0)
+    mkt_col = MarketCollector(crypto_interval=3.0, stock_interval=12.0)
     time.sleep(0.35)
 
     if args.stdout or args.once:
