@@ -56,10 +56,31 @@ O projeto encontra-se atualmente no **Estágio v3.0 (Estável & Pronto para Prod
 | :--- | :--- | :---: |
 | **Fase 1** | Telemetria básica de Hardware (CPU, GPU, RAM, Disco, Rede) via USB Serial | ✅ Concluído |
 | **Fase 2** | **Arquitetura *No-Touch***: Remoção do `XPT2046`, suporte a Wallpapers `.JPG`/`.BMP`/`.GIF` no SD Card, Color Picker RGB565 e Brilho PWM | ✅ Concluído |
-| **Fase 3 (Atual)** | **Painel Desktop em Flet (Flutter)** + **Gráfico Duplo CPU vs RAM** + **Terminal de Mercado Financeiro (`USD`, `EUR`, `BTC`, `ETH`, `SOL`, `BNB`, `XRP`, `IBOV`, `S&P500`)** + **Letreiro Infinito (*Ticker Tape*) a 28 FPS** | ✅ **Concluído (v3.0)** |
-| **Fase 4 (Roadmap)** | Alertas visuais/sonoros de preço de Cripto/Dólar no buzzer e LED RGB da CYD | 🚧 Aberto a PRs |
-| **Fase 5 (Roadmap)** | Modo sem fio opcional (Envio do payload JSON via **Wi-Fi / UDP / WebSocket**) | 🚧 Aberto a PRs |
-| **Fase 6 (Roadmap)** | Suporte a múltiplos perfis de placas (ex: CYD 3.5" `480x320` e ESP32-S3) | 🚧 Aberto a PRs |
+| **Fase 3** | **Painel Desktop em Flet (Flutter)** + **Gráfico Duplo CPU vs RAM** + **Terminal de Mercado Financeiro (`USD`, `EUR`, `BTC`, `ETH`, `SOL`, `BNB`, `XRP`, `IBOV`, `S&P500`)** + **Letreiro Infinito (*Ticker Tape*) a 28 FPS** | ✅ Concluído (v3.0) |
+| **Fase 4 (Atual)** | **📱 Controle Remoto pelo Celular (Wi-Fi PWA com QR Code & App Flutter Nativo em `mobile/`)** + **Upload de fotos do smartphone direto para o SD da CYD** | ✅ **Concluído (v3.1)** |
+| **Fase 5 (Roadmap)** | Alertas visuais/sonoros de preço de Cripto/Dólar no buzzer e LED RGB da CYD | 🚧 Aberto a PRs |
+| **Fase 6 (Roadmap)** | Modo sem fio opcional (Envio do payload JSON via **Wi-Fi / UDP / WebSocket**) | 🚧 Aberto a PRs |
+| **Fase 7 (Roadmap)** | Suporte a múltiplos perfis de placas (ex: CYD 3.5" `480x320` e ESP32-S3) | 🚧 Aberto a PRs |
+
+---
+
+## 📱 Controle Remoto pelo Celular (Wi-Fi PWA & App Flutter Nativo)
+
+Agora você pode controlar 100% da sua placa CYD à distância utilizando o seu smartphone (Android ou iPhone) conectado à mesma rede Wi-Fi local:
+
+1. **Zero Instalação (Web PWA com QR Code Instantâneo):**
+   - Ao abrir o painel desktop no PC, o agente inicializa um servidor web de alta performance na porta `8088`.
+   - Um card dedicado exibe o link local (ex: `http://192.168.0.109:8088`) e um **QR Code dinâmico**.
+   - Basta apontar a câmera do celular para o monitor do PC e abrir o link no navegador!
+2. **100% das Funcionalidades do Desktop no Celular:**
+   - 📺 **Seletor de 7 Telas:** Alternância instantânea com um toque e vibração tátil nativa (`navigator.vibrate`).
+   - 🎨 **Estúdio de Cores RGB565:** Paletas rápidas (Matrix, Neon, Chama, Cyber, etc.), Color Picker e sliders R/G/B com pré-visualização.
+   - 📊 **Telemetria do PC em Tempo Real:** CPU %, RAM %, GPU %, Temperatura, Disco e Rede sincronizados via *Server-Sent Events* (SSE).
+   - 💰 **Mercado Financeiro & Cripto:** Cotações ao vivo de Dólar, Euro, IBOVESPA, Bitcoin, Ethereum e Solana, com botão de ligar/desligar o Letreiro Infinito na CYD.
+   - 📸 **Upload de Fotos da Câmera / Galeria:** Tire uma foto com o celular ou escolha da galeria; o app envia para o PC, redimensiona automaticamente para 320×240 JPEG otimizado e grava no MicroSD da placa via Serial!
+   - ☀️ **Brilho Backlight (PWM):** Slider de 0 a 255 e atalhos rápidos (25%, 50%, 80%, 100%).
+3. **Aplicativo Nativo Flutter (`mobile/`):**
+   - Para quem deseja compilar um APK para Android ou pacote iOS, o diretório `mobile/` possui a codebase completa em Flutter pronta (`flutter run` ou `flutter build apk --release`). Consulte [mobile/README.md](mobile/README.md) para detalhes.
 
 ---
 
@@ -103,7 +124,8 @@ minimal-monitor/
 │   └── User_Setup.h                 # Mapeamento de pinos SPI do display da placa CYD (ST7789 / ILI9341)
 │
 ├── agent/                           # Agente Desktop (PC) e Painel de Controle Total em Flet (Flutter)
-│   ├── agent.py                     # Coletor Hardware + Coletor Mercado Financeiro + GUI Flet + Uploader SD
+│   ├── agent.py                     # Coletor Hardware + Coletor Mercado Financeiro + GUI Flet + Servidor Web Wi-Fi
+│   ├── mobile_web.py                # Interface Web Mobile (PWA) de alta performance integrada
 │   ├── requirements.txt             # Dependências Python do projeto
 │   ├── ui_config.example.json       # Modelo do arquivo de configuração persistida pelo Agente
 │   ├── CYD-Hardware-Monitor.spec    # Especificação PyInstaller / Flet Pack
@@ -111,6 +133,11 @@ minimal-monitor/
 │   │   └── CYD-Hardware-Monitor.exe # Executável standalone pronto para Windows (sem precisar instalar Python)
 │   ├── 99-mike-cyd.rules            # Regra udev para porta USB Serial no Linux
 │   └── mike-agent.service           # Serviço systemd opcional para Linux
+│
+├── mobile/                          # Aplicativo Mobile para Smartphones (Controle Remoto Wi-Fi)
+│   ├── README.md                    # Instruções de uso do Web PWA e compilação do App Nativo Flutter
+│   ├── pubspec.yaml                 # Dependências e manifesto do projeto Flutter
+│   └── lib/                         # Código Dart (main.dart, models, services)
 │
 ├── docs/                            # Documentação Técnica e Arquitetura
 │   └── ARCHITECTURE.md              # Especificação completa do Protocolo Serial JSON v3.0 e pinagem da CYD

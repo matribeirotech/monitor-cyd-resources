@@ -15,6 +15,7 @@ Formato do Payload Serial:
 
 import argparse
 import base64
+import http.server
 import inspect
 import io
 import json
@@ -30,8 +31,23 @@ import subprocess
 import sys
 import threading
 import time
+import urllib.parse
 import urllib.request
+import webbrowser
 from datetime import datetime, timedelta, timezone
+
+try:
+    import qrcode
+except ImportError:
+    qrcode = None
+
+try:
+    import mobile_web
+except ImportError:
+    try:
+        from . import mobile_web
+    except Exception:
+        import agent.mobile_web as mobile_web
 
 IS_WINDOWS = platform.system() == "Windows"
 if sys.stdout is None:
@@ -590,31 +606,65 @@ def find_port():
     return None
 
 
-def prepare_image_for_cyd(filepath: str) -> tuple[str, bytes]:
+def get_local_lan_ip() -> str:
+    """Detecta o IP do PC na rede local Wi-Fi/Ethernet (ex: 192.168.0.109)."""
+    try:
+        s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        s.connect(("8.8.8.8", 80))
+        ip = s.getsockname()[0]
+        s.close()
+        return ip
+    except Exception:
+        return "127.0.0.1"
+
+
+def generate_qr_base64(url: str) -> str:
+    """Gera imagem PNG Base64 do QR Code apontando para o URL mobile."""
+    if not qrcode:
+        return ""
+    try:
+        qr = qrcode.QRCode(box_size=4, border=1)
+        qr.add_data(url)
+        qr.make(fit=True)
+        img = qr.make_image(fill_color="#000000", back_color="#FFFFFF")
+        buf = io.BytesIO()
+        img.save(buf, format="PNG")
+        return base64.b64encode(buf.getvalue()).decode("ascii")
+    except Exception:
+        return ""
+
+
+def prepare_image_bytes_for_cyd(filename: str, raw_bytes: bytes) -> tuple[str, bytes]:
     """
-    Prepara uma imagem do PC para o Cartao SD da CYD (320x240):
-    - Se for .gif: envia os bytes originais.
+    Prepara bytes de imagem (enviados do celular ou carregados do disco) para o Cartao SD da CYD (320x240):
+    - Se for .gif: mantem bytes originais.
     - Se for .jpg, .jpeg, .png, .bmp: redimensiona/recorta em 320x240 usando Pillow
-      e converte para JPEG Baseline otimizado (~15 KB) para transferencia rapida
-      via Serial e compatibilidade 100% com o TJpg_Decoder do ESP32.
+      e converte para JPEG Baseline otimizado (~15 KB) para streaming serial rapido
+      e compatibilidade total com o TJpg_Decoder do ESP32.
     """
-    ext = os.path.splitext(filepath)[1].lower()
-    raw_base = re.sub(r"[^a-zA-Z0-9_\-]", "_", os.path.splitext(os.path.basename(filepath))[0])[:18]
+    ext = os.path.splitext(filename)[1].lower()
+    raw_base = re.sub(r"[^a-zA-Z0-9_\-]", "_", os.path.splitext(os.path.basename(filename))[0])[:18]
+    if not raw_base:
+        raw_base = "mob_wall"
 
     if ext == ".gif":
-        with open(filepath, "rb") as f:
-            return f"{raw_base}.gif", f.read()
+        return f"{raw_base}.gif", raw_bytes
 
     try:
         from PIL import Image, ImageOps
-        img = Image.open(filepath).convert("RGB")
+        img = Image.open(io.BytesIO(raw_bytes)).convert("RGB")
         img = ImageOps.fit(img, (320, 240), method=Image.Resampling.LANCZOS)
         buf = io.BytesIO()
         img.save(buf, format="JPEG", quality=82, optimize=True, progressive=False)
         return f"{raw_base}.jpg", buf.getvalue()
-    except ImportError:
-        with open(filepath, "rb") as f:
-            return f"{raw_base}{ext}", f.read()
+    except Exception:
+        return f"{raw_base}{ext if ext else '.jpg'}", raw_bytes
+
+
+def prepare_image_for_cyd(filepath: str) -> tuple[str, bytes]:
+    """Prepara uma imagem do disco local para a CYD delegando para prepare_image_bytes_for_cyd."""
+    with open(filepath, "rb") as f:
+        return prepare_image_bytes_for_cyd(os.path.basename(filepath), f.read())
 
 
 def load_ui_config():
@@ -1007,6 +1057,12 @@ def launch_flet_gui(col: Collector, mkt_col: MarketCollector, cli_args):
         ack_event = threading.Event()
         last_ack = {"val": None}
         log_lines = []
+        upload_state = {
+            "active": False,
+            "pct": 0.0,
+            "status": "",
+            "target": "",
+        }
 
         def get_ui_dict():
             bg = (state["bg"] or "none").strip()
@@ -1399,6 +1455,11 @@ def launch_flet_gui(col: Collector, mkt_col: MarketCollector, cli_args):
             lbl_rgb565_badge.value = f"RGB565: {state['color']}"
             lbl_rgb565_badge.color = h
             lbl_title.color = h
+            try:
+                sec_mobile_remote.border = border_all(1, h)
+                lbl_mobile_title.color = h
+            except Exception:
+                pass
             bar_cpu.color = h
             bar_ram.color = h
             bar_gpu.color = h
@@ -1524,11 +1585,14 @@ def launch_flet_gui(col: Collector, mkt_col: MarketCollector, cli_args):
             ui_event_queue.put({"cmd": "list_sd"})
             append_log("Solicitando lista de imagens do Cartão SD da CYD...")
 
-        def start_file_transfer(filepath: str):
-            if not filepath:
+        def start_file_transfer(filepath: str = None, filename: str = None, raw_bytes: bytes = None):
+            if not filepath and not raw_bytes:
                 return
             try:
-                target_name, data = prepare_image_for_cyd(filepath)
+                if raw_bytes is not None and filename:
+                    target_name, data = prepare_image_bytes_for_cyd(filename, raw_bytes)
+                else:
+                    target_name, data = prepare_image_for_cyd(filepath)
             except Exception as ex:
                 append_log(f"Erro ao preparar imagem: {ex}")
                 return
@@ -1536,6 +1600,10 @@ def launch_flet_gui(col: Collector, mkt_col: MarketCollector, cli_args):
             append_log(f"Iniciando envio de '{target_name}' ({len(data)/1024:.1f} KB) para o SD da CYD...")
 
             def worker():
+                upload_state["active"] = True
+                upload_state["pct"] = 0.0
+                upload_state["status"] = f"Conectando com SD para gravar '{target_name}'..."
+                upload_state["target"] = target_name
                 prog_upload.visible = True
                 lbl_upload_status.visible = True
                 prog_upload.value = 0.0
@@ -1564,6 +1632,8 @@ def launch_flet_gui(col: Collector, mkt_col: MarketCollector, cli_args):
                 transfer_queue.put({"file_name": f"/{target_name}", "file_mode": "w"})
                 ok, resp = wait_for_ack("ACK_START", timeout=4.5)
                 if not ok:
+                    upload_state["active"] = False
+                    upload_state["status"] = f"Falha ({resp})"
                     prog_upload.visible = False
                     if resp == "ERR_NO_SD":
                         lbl_upload_status.value = "❌ Cartão MicroSD não detectado na CYD! Formate em FAT32."
@@ -1593,6 +1663,8 @@ def launch_flet_gui(col: Collector, mkt_col: MarketCollector, cli_args):
                     })
                     ok, resp = wait_for_ack("ACK_CHUNK", timeout=3.5)
                     if not ok:
+                        upload_state["active"] = False
+                        upload_state["status"] = f"Erro no bloco {seq} ({resp})"
                         prog_upload.visible = False
                         lbl_upload_status.value = f"❌ Erro ao gravar bloco {seq} no SD ({resp})."
                         append_log(f"Upload falhou no bloco {seq} ({resp}).")
@@ -1604,6 +1676,8 @@ def launch_flet_gui(col: Collector, mkt_col: MarketCollector, cli_args):
 
                     seq += 1
                     pct = min((i + len(chunk)) / float(total), 1.0)
+                    upload_state["pct"] = pct
+                    upload_state["status"] = f"Gravando '{target_name}' no SD ({int(pct * 100)}%)..."
                     prog_upload.value = pct
                     lbl_upload_status.value = f"Gravando '{target_name}' no SD ({int(pct * 100)}%)..."
                     try:
@@ -1616,6 +1690,8 @@ def launch_flet_gui(col: Collector, mkt_col: MarketCollector, cli_args):
                 transfer_queue.put({"file_name": f"/{target_name}", "file_mode": "eof"})
                 ok, resp = wait_for_ack("ACK_EOF", timeout=5.0)
                 if not ok:
+                    upload_state["active"] = False
+                    upload_state["status"] = f"Falha ao fechar arquivo ({resp})"
                     prog_upload.visible = False
                     lbl_upload_status.value = f"❌ Falha ao finalizar arquivo ({resp})."
                     append_log(f"Upload: Falha ao fechar arquivo no SD ({resp}).")
@@ -1626,6 +1702,9 @@ def launch_flet_gui(col: Collector, mkt_col: MarketCollector, cli_args):
                     return
 
                 # 4) Sucesso total!
+                upload_state["active"] = False
+                upload_state["pct"] = 1.0
+                upload_state["status"] = f"'{target_name}' gravado com sucesso!"
                 prog_upload.value = 1.0
                 prog_upload.visible = False
                 lbl_upload_status.value = f"✅ '{target_name}' gravado no SD e aplicado na tela!"
@@ -1793,11 +1872,320 @@ def launch_flet_gui(col: Collector, mkt_col: MarketCollector, cli_args):
             padding=12,
         )
 
+        # ---------------- 4. SERVIDOR WEB / REST API MOBILE (WI-FI) ----------
+        class MobileRequestHandler(http.server.BaseHTTPRequestHandler):
+            def log_message(self, format, *args):
+                pass  # Mantem o terminal limpo
+
+            def _send_cors(self):
+                self.send_header("Access-Control-Allow-Origin", "*")
+                self.send_header("Access-Control-Allow-Methods", "GET, POST, OPTIONS")
+                self.send_header("Access-Control-Allow-Headers", "Content-Type, Authorization")
+
+            def do_OPTIONS(self):
+                self.send_response(204)
+                self._send_cors()
+                self.end_headers()
+
+            def do_GET(self):
+                parsed = urllib.parse.urlparse(self.path)
+                p = parsed.path
+
+                if p in ("/", "/index.html"):
+                    content = mobile_web.HTML_MOBILE_APP.encode("utf-8")
+                    self.send_response(200)
+                    self.send_header("Content-Type", "text/html; charset=utf-8")
+                    self.send_header("Content-Length", str(len(content)))
+                    self.send_header("Cache-Control", "no-cache")
+                    self._send_cors()
+                    self.end_headers()
+                    self.wfile.write(content)
+
+                elif p == "/api/status":
+                    payload = {
+                        "screen": state["screen"],
+                        "hex_color": state["hex_color"],
+                        "color": state["color"],
+                        "bg": state["bg"],
+                        "brt": state["brt"],
+                        "ticker": state["ticker"],
+                        "sd_files": state["sd_files"],
+                        "sys": col.sample_sys() if col else {},
+                        "mkt": mkt_col.get_market_dict() if mkt_col else {},
+                        "upload": upload_state,
+                        "connected": True,
+                    }
+                    content = json.dumps(payload, ensure_ascii=False).encode("utf-8")
+                    self.send_response(200)
+                    self.send_header("Content-Type", "application/json; charset=utf-8")
+                    self.send_header("Content-Length", str(len(content)))
+                    self._send_cors()
+                    self.end_headers()
+                    self.wfile.write(content)
+
+                elif p == "/api/stream":
+                    self.send_response(200)
+                    self.send_header("Content-Type", "text/event-stream; charset=utf-8")
+                    self.send_header("Cache-Control", "no-cache")
+                    self.send_header("Connection", "keep-alive")
+                    self._send_cors()
+                    self.end_headers()
+                    while state["running"]:
+                        payload = {
+                            "screen": state["screen"],
+                            "hex_color": state["hex_color"],
+                            "color": state["color"],
+                            "bg": state["bg"],
+                            "brt": state["brt"],
+                            "ticker": state["ticker"],
+                            "sd_files": state["sd_files"],
+                            "sys": col.sample_sys() if col else {},
+                            "mkt": mkt_col.get_market_dict() if mkt_col else {},
+                            "upload": upload_state,
+                        }
+                        chunk = f"data: {json.dumps(payload, ensure_ascii=False)}\n\n".encode("utf-8")
+                        try:
+                            self.wfile.write(chunk)
+                            self.wfile.flush()
+                        except (ConnectionResetError, BrokenPipeError, ConnectionAbortedError, OSError):
+                            break
+                        time.sleep(1.0)
+
+                elif p == "/api/screen":
+                    qs = urllib.parse.parse_qs(parsed.query)
+                    val = qs.get("s", qs.get("screen", [None]))[0]
+                    if val is not None:
+                        try:
+                            scr_idx = int(val)
+                            if 0 <= scr_idx <= 6:
+                                on_select_screen(scr_idx)
+                                append_log(f"📱 Smartphone selecionou Tela {scr_idx}")
+                        except Exception:
+                            pass
+                    content = json.dumps({"ok": True, "screen": state["screen"]}).encode("utf-8")
+                    self.send_response(200)
+                    self.send_header("Content-Type", "application/json; charset=utf-8")
+                    self.send_header("Content-Length", str(len(content)))
+                    self._send_cors()
+                    self.end_headers()
+                    self.wfile.write(content)
+
+                else:
+                    self.send_response(404)
+                    self._send_cors()
+                    self.end_headers()
+
+            def do_POST(self):
+                parsed = urllib.parse.urlparse(self.path)
+                p = parsed.path
+                length = int(self.headers.get("Content-Length", 0))
+                body = {}
+                if length > 0:
+                    try:
+                        raw = self.rfile.read(length).decode("utf-8", errors="ignore")
+                        body = json.loads(raw)
+                    except Exception:
+                        pass
+
+                ok = True
+                err_msg = ""
+
+                if p == "/api/screen":
+                    scr = int(body.get("screen", state["screen"]))
+                    if 0 <= scr <= 6:
+                        on_select_screen(scr)
+                        append_log(f"📱 Smartphone selecionou Tela {scr}")
+                    else:
+                        ok = False
+                        err_msg = "Tela inválida (0-6)"
+
+                elif p == "/api/color":
+                    hex_c = body.get("hex", state["hex_color"])
+                    apply_new_hex(hex_c, update_sliders=True)
+                    append_log(f"📱 Smartphone alterou cor para {hex_c}")
+
+                elif p == "/api/brightness":
+                    brt = max(0, min(255, int(body.get("brt", state["brt"]))))
+                    slider_brt.value = brt
+                    lbl_brt_value.value = f"{int(round(brt / 255.0 * 100))}% ({brt}/255)"
+                    state["brt"] = brt
+                    persist_and_queue_ui()
+                    append_log(f"📱 Smartphone alterou brilho para {brt}")
+
+                elif p == "/api/bg":
+                    bg_val = body.get("bg", state["bg"])
+                    state["bg"] = bg_val
+                    dd_bg.value = bg_val
+                    persist_and_queue_ui()
+                    append_log(f"📱 Smartphone alterou fundo para '{bg_val}'")
+
+                elif p == "/api/ticker":
+                    if "ticker" in body:
+                        state["ticker"] = bool(body["ticker"])
+                    else:
+                        state["ticker"] = not state["ticker"]
+                    btn_ticker_toggle.text = f"Ticker Bolsa: {'LIGADO' if state['ticker'] else 'DESLIGADO'}"
+                    persist_and_queue_ui()
+                    append_log(f"📱 Smartphone alterou letreiro para {'LIGADO' if state['ticker'] else 'DESLIGADO'}")
+
+                elif p == "/api/refresh_sd":
+                    request_sd_files()
+                    append_log("📱 Smartphone solicitou sincronização com Cartão SD")
+
+                elif p == "/api/upload":
+                    fname = body.get("filename", "mobile_wall.jpg")
+                    b64_data = body.get("data", "")
+                    if b64_data:
+                        try:
+                            raw_bytes = base64.b64decode(b64_data)
+                            start_file_transfer(filename=fname, raw_bytes=raw_bytes)
+                            append_log(f"📱 Smartphone enviou foto '{fname}' ({len(raw_bytes)/1024:.1f} KB)")
+                        except Exception as ex:
+                            ok = False
+                            err_msg = str(ex)
+                    else:
+                        ok = False
+                        err_msg = "Nenhum dado de imagem recebido"
+
+                else:
+                    self.send_response(404)
+                    self._send_cors()
+                    self.end_headers()
+                    return
+
+                res_payload = {"ok": ok, "state": get_ui_dict()}
+                if err_msg:
+                    res_payload["error"] = err_msg
+                content = json.dumps(res_payload, ensure_ascii=False).encode("utf-8")
+                self.send_response(200 if ok else 400)
+                self.send_header("Content-Type", "application/json; charset=utf-8")
+                self.send_header("Content-Length", str(len(content)))
+                self._send_cors()
+                self.end_headers()
+                self.wfile.write(content)
+
+        mobile_port = 8088
+        mobile_server = None
+        for test_port in (8088, 8089, 8550, 8551, 8552):
+            try:
+                mobile_server = http.server.ThreadingHTTPServer(("0.0.0.0", test_port), MobileRequestHandler)
+                mobile_port = test_port
+                break
+            except OSError:
+                continue
+
+        lan_ip = get_local_lan_ip()
+        mobile_url = f"http://{lan_ip}:{mobile_port}"
+        qr_b64 = generate_qr_base64(mobile_url)
+
+        if mobile_server:
+            threading.Thread(target=mobile_server.serve_forever, daemon=True).start()
+
+        lbl_mobile_title = ft.Text(
+            "📱 CONTROLE REMOTO PELO CELULAR (WI-FI)",
+            size=13,
+            weight=ft.FontWeight.BOLD,
+            color=state["hex_color"],
+        )
+
+        def on_copy_url(_e):
+            try:
+                if IS_WINDOWS:
+                    subprocess.run(["clip"], input=mobile_url.encode("utf-16le"), check=False)
+                append_log(f"Link copiado: {mobile_url}")
+            except Exception:
+                pass
+
+        def on_open_browser(_e):
+            try:
+                webbrowser.open(mobile_url)
+                append_log(f"Abrindo interface mobile no navegador: {mobile_url}")
+            except Exception:
+                pass
+
+        qr_widget = (
+            ft.Image(
+                src=f"data:image/png;base64,{qr_b64}",
+                width=100,
+                height=100,
+                fit=ft.ImageFit.CONTAIN,
+            )
+            if qr_b64
+            else ft.Icon(icon_val("QR_CODE_2") or ft.Icons.QR_CODE_2, size=70, color=state["hex_color"])
+        )
+
+        sec_mobile_remote = ft.Container(
+            content=ft.Row(
+                [
+                    ft.Column(
+                        [
+                            ft.Row(
+                                [
+                                    lbl_mobile_title,
+                                    ft.Container(
+                                        content=ft.Text(f"PORTA {mobile_port}", size=10, weight=ft.FontWeight.BOLD, color="#22C55E"),
+                                        bgcolor="#142B1F",
+                                        border=border_all(1, "#22C55E44"),
+                                        border_radius=6,
+                                        padding=pad_sym(horizontal=8, vertical=2),
+                                    ),
+                                ],
+                                spacing=8,
+                            ),
+                            ft.Text(
+                                "Aponte a câmera do seu celular para o QR Code ou acesse o link abaixo na mesma rede Wi-Fi.\n"
+                                "Alterne as 7 telas, mude cores RGB565, brilho PWM e envie fotos da galeria diretamente para a CYD!",
+                                size=11,
+                                color="#94A3B8",
+                            ),
+                            ft.Row(
+                                [
+                                    ft.Container(
+                                        content=ft.Text(mobile_url, size=13, weight=ft.FontWeight.BOLD, font_family="Consolas", color="#FFFFFF"),
+                                        bgcolor="#05070B",
+                                        border=border_all(1, "#1E2738"),
+                                        border_radius=8,
+                                        padding=pad_sym(horizontal=12, vertical=6),
+                                    ),
+                                    ft.OutlinedButton("Copiar Link", icon=icon_val("CONTENT_COPY"), on_click=on_copy_url),
+                                    ft.OutlinedButton("Abrir no PC", icon=icon_val("OPEN_IN_BROWSER"), on_click=on_open_browser),
+                                ],
+                                spacing=8,
+                            ),
+                        ],
+                        spacing=6,
+                        expand=True,
+                    ),
+                    ft.Column(
+                        [
+                            ft.Container(
+                                content=qr_widget,
+                                bgcolor="#FFFFFF",
+                                padding=4,
+                                border_radius=8,
+                                border=border_all(1, "#FFFFFF33"),
+                            ),
+                            ft.Text("Aponte a câmera", size=10, color="#64748B", weight=ft.FontWeight.W_500),
+                        ],
+                        horizontal_alignment=ft.CrossAxisAlignment.CENTER,
+                        spacing=4,
+                    ),
+                ],
+                alignment=ft.MainAxisAlignment.SPACE_BETWEEN,
+                vertical_alignment=ft.CrossAxisAlignment.CENTER,
+            ),
+            bgcolor="#0B0F17",
+            border=border_all(1, state["hex_color"]),
+            border_radius=14,
+            padding=14,
+        )
+
         page.add(
             header_row,
             ft.Divider(height=8, color="#151C28"),
             telemetry_row,
             sec_market_live,
+            sec_mobile_remote,
             sec_screens,
             sec_colors,
             sec_bg_and_brt,
