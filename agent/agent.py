@@ -2108,7 +2108,7 @@ def launch_flet_gui(col: Collector, mkt_col: MarketCollector, cli_args):
                 src=f"data:image/png;base64,{qr_b64}",
                 width=100,
                 height=100,
-                fit=ft.ImageFit.CONTAIN,
+                fit="contain",
             )
             if qr_b64
             else ft.Icon(icon_val("QR_CODE_2") or ft.Icons.QR_CODE_2, size=70, color=state["hex_color"])
