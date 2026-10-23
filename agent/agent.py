@@ -65,6 +65,22 @@ INTERVAL = 1.0
 APP_DIR = os.path.dirname(sys.executable) if getattr(sys, "frozen", False) else os.path.dirname(os.path.abspath(__file__))
 CONFIG_FILE = os.path.join(APP_DIR, "ui_config.json")
 
+
+def get_resource_path(relative_path: str) -> str:
+    """Retorna o caminho absoluto do recurso, compativel com PyInstaller (--onefile) e modo script."""
+    base_path = getattr(sys, "_MEIPASS", APP_DIR)
+    p = os.path.join(base_path, relative_path)
+    if os.path.exists(p):
+        return p
+    p1 = os.path.join(APP_DIR, relative_path)
+    if os.path.exists(p1):
+        return p1
+    root_dir = os.path.dirname(APP_DIR) if os.path.basename(APP_DIR) == "agent" else APP_DIR
+    p2 = os.path.join(root_dir, relative_path)
+    if os.path.exists(p2):
+        return p2
+    return p
+
 # Fuso horario de Brasilia (UTC-3)
 try:
     from zoneinfo import ZoneInfo
@@ -1010,6 +1026,7 @@ def launch_flet_gui(col: Collector, mkt_col: MarketCollector, cli_args):
                 minimize_window()
 
         try:
+            ico_file = get_resource_path(os.path.join("imgs", "imgsCYD.ico"))
             if hasattr(page, "window") and page.window is not None:
                 page.window.width = 900
                 page.window.height = 940
@@ -1017,9 +1034,13 @@ def launch_flet_gui(col: Collector, mkt_col: MarketCollector, cli_args):
                 page.window.min_height = 740
                 page.window.prevent_close = True
                 page.window.on_event = on_window_event
+                if os.path.exists(ico_file):
+                    page.window.icon = ico_file
             else:
                 page.window_width = 900
                 page.window_height = 940
+                if os.path.exists(ico_file) and hasattr(page, "window_icon"):
+                    page.window_icon = ico_file
         except Exception:
             pass
 
@@ -1030,6 +1051,12 @@ def launch_flet_gui(col: Collector, mkt_col: MarketCollector, cli_args):
             from PIL import Image, ImageDraw
 
             def create_tray_image():
+                ico_file = get_resource_path(os.path.join("imgs", "imgsCYD.ico"))
+                if os.path.exists(ico_file):
+                    try:
+                        return Image.open(ico_file)
+                    except Exception:
+                        pass
                 img = Image.new("RGBA", (64, 64), (0, 0, 0, 0))
                 draw = ImageDraw.Draw(img)
                 draw.rounded_rectangle([2, 2, 62, 62], radius=12, fill=(15, 23, 42, 255), outline=(0, 255, 128, 255), width=3)

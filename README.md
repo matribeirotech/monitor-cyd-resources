@@ -1,6 +1,6 @@
-# ⚡ CYD Hardware & Financial Market Monitor (v3.0)
+# ⚡ CYD Hardware & Financial Market Monitor (v3.1)
 
-![Versão](https://img.shields.io/badge/vers%C3%A3o-3.0.0-00FF00?style=for-the-badge)
+![Versão](https://img.shields.io/badge/vers%C3%A3o-3.1.0-00FF00?style=for-the-badge)
 ![Plataforma](https://img.shields.io/badge/ESP32-2432S028R%20(CYD)-blue?style=for-the-badge&logo=espressif)
 ![Interface PC](https://img.shields.io/badge/GUI%20PC-Flet%20%2F%20Flutter-02569B?style=for-the-badge&logo=flutter)
 ![Autor](https://img.shields.io/badge/Autor-Matheus%20Ribeiro%20(z1po)-FF5500?style=for-the-badge)

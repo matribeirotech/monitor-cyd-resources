@@ -5,7 +5,7 @@ a = Analysis(
     ['agent.py'],
     pathex=[],
     binaries=[],
-    datas=[],
+    datas=[('../imgs/imgsCYD.ico', 'imgs')],
     hiddenimports=['serial', 'serial.tools.list_ports', 'psutil', 'wmi', 'win32com.client', 'PIL', 'pystray', 'pystray._win32', 'qrcode', 'mobile_web'],
     hookspath=[],
     hooksconfig={},
@@ -35,5 +35,6 @@ exe = EXE(
     target_arch=None,
     codesign_identity=None,
     entitlements_file=None,
+    icon=['../imgs/imgsCYD.ico'],
     version='C:/Users/MATHEU~1/AppData/Local/Temp/799018de-fefc-4f34-86ee-abe8958086f6',
 )
