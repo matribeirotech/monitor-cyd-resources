@@ -28,9 +28,11 @@ void applyColor565(uint16_t color565);
 #define T_NET_HEAVY     25.0f    // MB/s (rx+tx)
 
 // ---- Dimensoes do Display (320x240 Landscape) ----
-#define SCR_W 320
-#define SCR_H 240
-#define HDR_H 24
+#define SCR_W    320
+#define SCR_H    240
+#define HDR_H    24
+#define TICKER_H 18
+#define TICKER_Y (SCR_H - TICKER_H) // y = 222..239
 
 // ---- Historico dos graficos em tempo real ----
 #define HIST 140
@@ -41,7 +43,7 @@ void applyColor565(uint16_t color565);
 #define LOG_MSG_MAX  37
 
 // ---- Layouts / Telas (Controladas 100% pelo Agente Python no PC) ----
-#define SCREENS          7
+#define SCREENS          10
 #define SCR_RESUMO       0   // Tela 0: Resumo Geral (Gauges de CPU & RAM + Barras Disco/Rede/Temp)
 #define SCR_CPU_RAM      1   // Tela 1: Painel CPU + RAM (Barras + Graficos de CPU e RAM lado a lado, estilo sys.monitor_)
 #define SCR_CPU_RAM_DUAL 2   // Tela 2: Grafico Combinado CPU + RAM (2 curvas sobrepostas no mesmo grafico grande)
@@ -49,6 +51,9 @@ void applyColor565(uint16_t color565);
 #define SCR_GRAPH        4   // Tela 4: 4 Graficos em Tempo Real (CPU, RAM, GPU, TEMP)
 #define SCR_WALLPAPER    5   // Tela 5: Wallpaper Mode (Destaque para a imagem de fundo do SD + HUD CPU/RAM)
 #define SCR_MARKET       6   // Tela 6: Mercado Financeiro, Cambio (USD/EUR) & Criptomoedas + Bolsa
+#define SCR_PORTFOLIO    7   // Tela 7: Gestao de Portfolio Pessoal (Patrimonio, PnL & Top 3 Ativos)
+#define SCR_POMODORO     8   // Tela 8: Hub de Produtividade Pomodoro (Trabalho / Pausa + Buzzer)
+#define SCR_MEDIA        9   // Tela 9: Hub Multimidia (Spotify & YouTube Music + Capa SD + Overlay)
 
 // Estrutura geometrica auxiliar
 struct Rect { int16_t x, y, w, h; };

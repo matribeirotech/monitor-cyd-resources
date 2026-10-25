@@ -1,265 +1,217 @@
-# ⚡ CYD Hardware & Financial Market Monitor (v3.1)
+# ⚡ CYD Hardware & Financial Market Monitor (v4.0)
 
-![Versão](https://img.shields.io/badge/vers%C3%A3o-3.1.0-00FF00?style=for-the-badge)
+![Versão](https://img.shields.io/badge/vers%C3%A3o-4.0.0-00FF00?style=for-the-badge)
 ![Plataforma](https://img.shields.io/badge/ESP32-2432S028R%20(CYD)-blue?style=for-the-badge&logo=espressif)
 ![Interface PC](https://img.shields.io/badge/GUI%20PC-Flet%20%2F%20Flutter-02569B?style=for-the-badge&logo=flutter)
 ![Autor](https://img.shields.io/badge/Autor-Matheus%20Ribeiro%20(z1po)-FF5500?style=for-the-badge)
 ![Licença](https://img.shields.io/badge/Licen%C3%A7a-MIT-green?style=for-the-badge)
 
-Um **monitor de hardware e terminal de mercado financeiro em tempo real** de código aberto para a placa **ESP32-2432S028R (*Cheap Yellow Display* / CYD 2.8" 320×240)**, controlado **100% pelo PC via USB Serial** através de um painel desktop moderno construído em **Flet (Flutter para Python)**.
+Um **monitor de hardware, terminal de mercado financeiro e hub de produtividade multimídia em tempo real** de código aberto para a placa **ESP32-2432S028R (*Cheap Yellow Display* / CYD 2.8" 320×240)**, controlado **100% pelo PC via USB Serial** através de uma interface desktop moderna em abas construída em **Flet (Flutter para Python)** e controle remoto pelo smartphone via **Wi-Fi local (PWA)**.
 
 ---
 
-## 📸 Galeria do Projeto (v3.0 em Funcionamento Real)
+## 📸 Galeria do Projeto (v4.0 em Funcionamento Real)
 
-### 💻 Painel de Controle Total no PC (Flet / Flutter)
+### 💻 1. Painel de Controle Desktop v4.0 — Navegação em 6 Abas Organizadas
+
+#### 📊 Aba 0: Painel Geral, Telemetria & Grade das 10 Telas
 <p align="center">
-  <img src="preview/preview-tela-pc-1.jpg" alt="Painel de Controle Total no PC em Flet / Flutter" width="90%" />
+  <img src="preview/v4-aba0-painel-telas.png" alt="Aba 0: Painel Geral e Seletor das 10 Telas da CYD" width="95%" />
 </p>
 
-### 📈 Terminal Bolsa de Valores & Criptomoedas (`LIVE MARKET`) na Placa CYD
+#### 🍅🎵 Aba 1: Foco & Mídia — Pomodoro Focus Hub (Tela 8) + Player Spotify & YouTube Music (Tela 9)
 <p align="center">
-  <img src="preview/preview-tela-4.jpg" alt="Tela Bolsa e Cripto - Dólar, Euro, IBOVESPA, S&P500 e Bitcoin 24h" width="49%" />
+  <img src="preview/v4-aba1-foco-midia.png" alt="Aba 1: Pomodoro Timer e Player de Mídia com Capa ao Vivo" width="95%" />
+</p>
+
+#### 💼 Aba 2: Mercado Financeiro (Tela 6) & Portfólio Pessoal de Investimentos (Tela 7)
+<p align="center">
+  <img src="preview/v4-aba2-mercado-carteira.png" alt="Aba 2: Cotações ao Vivo e Gestão de Carteira Pessoal" width="95%" />
+</p>
+
+#### 🎨☀️ Aba 3: Estúdio de Cores RGB565, Fundo SD, Brilho PWM & Modo Sleep/Noturno
+<p align="center">
+  <img src="preview/v4-aba3-estudio-energia.png" alt="Aba 3: Seletor de Cores em Tempo Real, Wallpapers e Gestão de Energia" width="95%" />
+</p>
+
+#### 🔔 Aba 4: Sistema de Alertas Físicos Avançados (Buzzer & LED RGB)
+<p align="center">
+  <img src="preview/v4-aba4-alertas-fisicos.png" alt="Aba 4: Configuração de Gatilhos de Alerta Físico na CYD" width="95%" />
+</p>
+
+---
+
+### 🖥️ Telas em Execução na Placa CYD (Hardware Real)
+<p align="center">
+  <img src="preview/preview-tela-4.jpg" alt="Tela Bolsa e Cripto - Dólar, Euro, IBOVESPA e Bitcoin 24h" width="49%" />
   <img src="preview/preview-tela-5.jpg" alt="Tela Bolsa e Cripto com Ticker Tape mostrando S&P500 e CPU" width="49%" />
 </p>
-
-### 🖥️ Customização de Cores em Tempo Real + Letreiro da Bolsa (*Ticker Tape*) no Rodapé
 <p align="center">
   <img src="preview/preview-tela-1.jpg" alt="Tela Resumo - Tema Verde Matrix com Ticker Tape" width="49%" />
-  <img src="preview/preview-tela-2.jpg" alt="Tela Resumo - Tema Azul Neon com Cotação Dólar e Euro no Rodapé" width="49%" />
+  <img src="preview/preview-tela-2.jpg" alt="Tela Resumo - Tema Azul Neon com Cotação Dólar e Euro" width="49%" />
 </p>
 <p align="center">
-  <img src="preview/preview-tela-3.jpg" alt="Tela Resumo - Tema Vermelho Crimson com Solana e BNB no Rodapé" width="49%" />
+  <img src="preview/preview-tela-3.jpg" alt="Tela Resumo - Tema Vermelho Crimson com Criptomoedas" width="49%" />
   <img src="preview/preview-tela-6.jpg" alt="Tela 4x Gráficos em Tempo Real (CPU, RAM, GPU, Temp) + Ticker Tape" width="49%" />
 </p>
 
 ---
 
-## 🎯 Por que este projeto existe? (Arquitetura *No-Touch*)
+## 🎯 Destaques e Novidades da Versão 4.0
 
-Muitas placas **ESP32-2432S028R (CYD)** sofrem com falhas no controlador resistivo de toque (`XPT2046`) ou leituras fantasmas após algum tempo de uso. Além disso, configurar temas, cores e telas diretamente em uma tela resistiva pequena é pouco prático.
-
-Na **versão 3.0**, toda a dependência de hardware do touch foi **100% removida do firmware** (economizando RAM, CPU e barramentos SPI no ESP32) e **100% do controle foi transferido para o Agente no PC**:
-- Troca instantânea de telas (`< 50ms` via fila *event-driven*).
-- Seletor de cores **RGB565 / HEX** em tempo real que repinta toda a interface da placa na hora (como visto nas fotos acima em Verde, Azul e Vermelho).
-- Controle de brilho do display via **PWM (Pino 21)**.
-- Upload e conversão automática de papéis de parede (`JPG`, `PNG`, `BMP`, `GIF`) do PC direto para o **Cartão MicroSD** da placa pelo próprio cabo USB.
-- **Letreiro Infinito da Bolsa de Valores (*Ticker Tape*)** correndo suavemente no rodapé das telas de hardware enquanto você joga ou trabalha, além de uma **Tela Dedicada ao Mercado Financeiro & Criptomoedas**.
+* **🗂️ Arquitetura por Abas (Desktop & Mobile):** Fim da rolagem vertical poluída. Agora o app desktop possui um cabeçalho fixo com micro-indicadores globais e **6 abas limpas e fluidas**. O app mobile (PWA) foi expandido para **5 abas navegáveis**.
+* **🍅 Módulo de Foco Pomodoro (Tela 8):** Máquina de estados completa no PC (Trabalho 25m, Pausa Curta 5m, Pausa Longa 15m), anel circular anti-flicker (`drawSmoothArc`) na CYD com interpolação de 1s, contador de ciclos diários e **bipes sonoros automáticos no Buzzer** ao concluir cada ciclo.
+* **🎵 Hub Multimídia Spotify & YouTube Music (Tela 9):**
+  * Integração nativa com Windows GSMTC (`winrt.windows.media.control`) identificando **Spotify** (Desktop/Store/Web) e **YouTube Music** (Chrome/Edge/Brave/Firefox/PWA/Desktop).
+  * Redimensionamento inteligente da capa para **320×240 JPEG** (com remoção automática de faixas pretas em thumbnails 16:9) e transmissão em blocos Base64 para o MicroSD (`_media_cov.jpg`).
+  * **Overlay Translúcido Real (*Alpha-Blending* RGB565 em Hardware):** Renderiza a capa do álbum com vidro fumê escuro mantendo a leitura nítida de Título, Artista, badge dinâmico da fonte e barra de progresso.
+* **💼 Gestão de Portfólio de Investimentos (Tela 7):** Monitoramento de patrimônio pessoal em Reais (`R$`), cálculo de Lucro/Prejuízo (PnL) histórico ou diário (24h) com cor dinâmica (verde/vermelho) e ranking dos Top 3 ativos da carteira (Cripto, B3, Câmbio e EUA).
+* **🔔 Sistema de Alertas Físicos Avançados:** Criação de gatilhos customizados (`CPU Temp > 85°C`, `GPU Uso > 95%`, `Bitcoin > $100k`, etc.) para disparar **bipes sonoros no Buzzer** e padrões visuais no **LED RGB traseiro** da CYD sem travar o processamento do ESP32.
+* **🌙 Controle de Brilho Dinâmico & Modo Sleep:** Monitoramento de inatividade do mouse/teclado no PC para apagar a tela (`brt: 0`), Modo Noturno automático entre 22h e 06h e transição suave por PWM no Pino 21.
 
 ---
 
 ## 📍 Estágio Atual do Projeto & Roadmap
 
-O projeto encontra-se atualmente no **Estágio v3.0 (Estável & Pronto para Produção)**. Abaixo está o histórico de evolução e o que está aberto para contribuições da comunidade:
-
-| Fase | Descrição | Status |
+| Versão | Descrição | Status |
 | :--- | :--- | :---: |
-| **Fase 1** | Telemetria básica de Hardware (CPU, GPU, RAM, Disco, Rede) via USB Serial | ✅ Concluído |
-| **Fase 2** | **Arquitetura *No-Touch***: Remoção do `XPT2046`, suporte a Wallpapers `.JPG`/`.BMP`/`.GIF` no SD Card, Color Picker RGB565 e Brilho PWM | ✅ Concluído |
-| **Fase 3** | **Painel Desktop em Flet (Flutter)** + **Gráfico Duplo CPU vs RAM** + **Terminal de Mercado Financeiro (`USD`, `EUR`, `BTC`, `ETH`, `SOL`, `BNB`, `XRP`, `IBOV`, `S&P500`)** + **Letreiro Infinito (*Ticker Tape*) a 28 FPS** | ✅ Concluído (v3.0) |
-| **Fase 4 (Atual)** | **📱 Controle Remoto pelo Celular (Wi-Fi PWA com QR Code & App Flutter Nativo em `mobile/`)** + **Upload de fotos do smartphone direto para o SD da CYD** | ✅ **Concluído (v3.1)** |
-| **Fase 5 (Roadmap)** | Alertas visuais/sonoros de preço de Cripto/Dólar no buzzer e LED RGB da CYD | 🚧 Aberto a PRs |
-| **Fase 6 (Roadmap)** | Modo sem fio opcional (Envio do payload JSON via **Wi-Fi / UDP / WebSocket**) | 🚧 Aberto a PRs |
-| **Fase 7 (Roadmap)** | Suporte a múltiplos perfis de placas (ex: CYD 3.5" `480x320` e ESP32-S3) | 🚧 Aberto a PRs |
+| **v1.0** | Telemetria básica de Hardware (CPU, GPU, RAM, Disco, Rede) via USB Serial | ✅ Concluído |
+| **v2.0** | **Arquitetura *No-Touch***: Suporte a Wallpapers no MicroSD, Color Picker RGB565 e Brilho PWM | ✅ Concluído |
+| **v3.0** | **Painel Desktop em Flet** + **Gráfico Duplo CPU vs RAM** + **Terminal Financeiro (Bolsa & Cripto)** + **Ticker Tape a ~28 FPS** | ✅ Concluído |
+| **v3.1** | **Controle Remoto pelo Celular (Wi-Fi PWA com QR Code & App Flutter em `mobile/`)** + **Upload de fotos do smartphone p/ SD** | ✅ Concluído |
+| **v4.0 (Atual)** | **Pomodoro (Tela 8) + Spotify & YouTube Music (Tela 9) + Portfólio Pessoal (Tela 7) + Alertas Físicos Buzzer/LED + Modo Sleep/Noturno + UI 6 Abas** | ✅ **Concluído (v4.0)** |
+| **v4.1 (Próximo)** | **Notificações Inteligentes no Ticker Tape** (interceptação temporária do rodapé para avisos do OS) | 🚧 Em Andamento |
+
+---
+
+## 🖥️ As 10 Telas da CYD (320×240)
+
+Todas as telas podem ser alternadas instantaneamente pelo painel Desktop, pelo aplicativo do celular (Wi-Fi) ou pelo botão físico `BOOT` traseiro:
+
+1. **Tela 0 — `Resumo Gauges` (`SCR_RESUMO`):** Gauges circulares suaves de CPU % e RAM %, clock, temperatura, GPU, VRAM, Disco, Rede e Letreiro da Bolsa no rodapé.
+2. **Tela 1 — `CPU + RAM Principal` (`SCR_CPU_RAM`):** Visual clássico *cyberpunk terminal* com barras duplas segmentadas, 2 gráficos dedicados de histórico lado a lado e Letreiro da Bolsa.
+3. **Tela 2 — `Gráfico Duplo CPU vs RAM` (`SCR_CPU_RAM_DUAL`):** Osciloscópio de tela cheia sobrepondo curvas históricas de uso de CPU e RAM em tempo real.
+4. **Tela 3 — `GPU Focus` (`SCR_GPU_FOCUS`):** Medidor grande de carga de GPU, temperatura, consumo em Watts (`W`), contador de FPS e barra de VRAM.
+5. **Tela 4 — `4x Gráficos em Tempo Real` (`SCR_GRAPH`):** Grid 2×2 com gráficos simultâneos para `CPU %`, `RAM %`, `GPU %` e `TEMP °C`.
+6. **Tela 5 — `Wallpaper HUD` (`SCR_WALLPAPER`):** Foco na imagem/arte do Cartão MicroSD com dock minimalista de hardware e Letreiro da Bolsa.
+7. **Tela 6 — `Mercado Financeiro & Bolsa` (`SCR_MARKET`):** Terminal Bloomberg/B3 com Dólar, Euro, IBOVESPA, Top 5 Criptos e Gráfico Sparkline de Bitcoin 24h.
+8. **💼 Tela 7 — `Portfólio de Investimentos` (`SCR_PORTFOLIO`):** Patrimônio total consolidado (`R$`), badge dinâmico de PnL (Lucro/Prejuízo) e Top 3 ativos da carteira.
+9. **🍅 Tela 8 — `Pomodoro Focus Hub` (`SCR_POMODORO`):** Cronômetro circular anti-flicker (25m Trabalho / 5m Pausa / 15m Longa), contador de ciclos, mini-status da música atual e bipe no Buzzer ao finalizar.
+10. **🎵 Tela 9 — `Player Spotify & YouTube Music` (`SCR_MEDIA`):** Capa do álbum em tela cheia do MicroSD com card de vidro fumê translúcido, Título, Artista, badge de fonte (`SPOTIFY` verde / `YT MUSIC` vermelho) e barra de progresso.
 
 ---
 
 ## 📱 Controle Remoto pelo Celular (Wi-Fi PWA & App Flutter Nativo)
 
-Agora você pode controlar 100% da sua placa CYD à distância utilizando o seu smartphone (Android ou iPhone) conectado à mesma rede Wi-Fi local:
+Controle 100% da sua placa CYD à distância sem instalar nada no smartphone:
 
-1. **Zero Instalação (Web PWA com QR Code Instantâneo):**
-   - Ao abrir o painel desktop no PC, o agente inicializa um servidor web de alta performance na porta `8088`.
-   - Um card dedicado exibe o link local (ex: `http://192.168.0.109:8088`) e um **QR Code dinâmico**.
-   - Basta apontar a câmera do celular para o monitor do PC e abrir o link no navegador!
-2. **100% das Funcionalidades do Desktop no Celular:**
-   - 📺 **Seletor de 7 Telas:** Alternância instantânea com um toque e vibração tátil nativa (`navigator.vibrate`).
-   - 🎨 **Estúdio de Cores RGB565:** Paletas rápidas (Matrix, Neon, Chama, Cyber, etc.), Color Picker e sliders R/G/B com pré-visualização.
-   - 📊 **Telemetria do PC em Tempo Real:** CPU %, RAM %, GPU %, Temperatura, Disco e Rede sincronizados via *Server-Sent Events* (SSE).
-   - 💰 **Mercado Financeiro & Cripto:** Cotações ao vivo de Dólar, Euro, IBOVESPA, Bitcoin, Ethereum e Solana, com botão de ligar/desligar o Letreiro Infinito na CYD.
-   - 📸 **Upload de Fotos da Câmera / Galeria:** Tire uma foto com o celular ou escolha da galeria; o app envia para o PC, redimensiona automaticamente para 320×240 JPEG otimizado e grava no MicroSD da placa via Serial!
-   - ☀️ **Brilho Backlight (PWM):** Slider de 0 a 255 e atalhos rápidos (25%, 50%, 80%, 100%).
-3. **Aplicativo Nativo Flutter (`mobile/`):**
-   - Para quem deseja compilar um APK para Android ou pacote iOS, o diretório `mobile/` possui a codebase completa em Flutter pronta (`flutter run` ou `flutter build apk --release`). Consulte [mobile/README.md](mobile/README.md) para detalhes.
-
----
-
-## 🖥️ As 7 Telas da CYD (320×240)
-
-Todas as telas podem ser alternadas com 1 clique no painel Flet do PC (ou pelo botão físico `BOOT` traseiro da placa):
-
-1. **Tela 0 — `Resumo Gauges` (`SCR_RESUMO`):**
-   - Medidores circulares suaves (*Smooth Arc Gauges*) para **CPU %** e **RAM %**, acompanhados de temperatura, clock, uso de GPU, VRAM/Swap, Disco e tráfego de Rede (`DL`/`UL`).
-2. **Tela 1 — `Painel CPU + RAM` (`SCR_CPU_RAM` - *Tela Principal*):**
-   - Inspirada no visual clássico *terminal cyberpunk* (`sys.monitor_`): barras de progresso segmentadas de **CPU** e **RAM** lado a lado no topo, **2 gráficos de histórico dedicados (`CPU USE %` e `RAM USE %`)** no centro, barra de Uptime/Rede/Disco abaixo e o **Letreiro da Bolsa** correndo no rodapé.
-3. **Tela 2 — `Gráfico Duplo CPU vs RAM` (`SCR_CPU_RAM_DUAL`):**
-   - Cards de CPU e RAM no topo e um **Gráfico Osciloscópio Grande Unificado** sobrepondo as curvas de **Uso de CPU (%)** e **Uso de RAM (%)** em cores contrastantes em tempo real.
-4. **Tela 3 — `GPU Focus` (`SCR_GPU_FOCUS`):**
-   - Medidor grande de carga da placa de vídeo, temperatura da GPU, consumo em Watts (`W`), contador de **FPS em jogos** (via RTSS/PresentMon), barra de VRAM e gráfico histórico da GPU.
-5. **Tela 4 — `4x Gráficos em Tempo Real` (`SCR_GRAPH`):**
-   - Grid 2×2 com gráficos simultâneos para `CPU %`, `RAM %`, `GPU %` e `TEMP °C`.
-6. **Tela 5 — `Wallpaper HUD` (`SCR_WALLPAPER`):**
-   - Deixa 75% da tela livre para exibir sua arte/foto do Cartão SD (`.jpg`, `.bmp` ou `.gif` animado) com um dock minimalista de CPU, RAM, GPU e Rede + Letreiro da Bolsa na parte inferior.
-7. **📈 Tela 6 — `Mercado Financeiro & Bolsa` (`SCR_MARKET`):**
-   - Transforma a CYD em um **Terminal Financeiro Bloomberg / B3**:
-     - **3 Cards Superiores:** **Dólar Comercial (`USD/BRL`)**, **Euro (`EUR/BRL`)** e **IBOVESPA (`B3`)** com badges coloridos de variação diária (`+` verde / `-` vermelho).
-     - **Coluna Esquerda (`CRIPTOMOEDAS 24H`):** Cotação ao vivo em Dólar e variação 24h das 5 principais criptos: **Bitcoin (`BTC`)**, **Ethereum (`ETH`)**, **Solana (`SOL`)**, **BNB (`BNB`)** e **Ripple (`XRP`)**.
-     - **Coluna Direita (`BITCOIN 24H`):** Preço do Bitcoin em **USD (`$`)**, valor convertido em **Reais (`R$ mil`)** e **Gráfico Sparkline das últimas 24h** (48 candles de 30m da Binance).
-
-### 📟 Letreiro Infinito da Bolsa (*Ticker Tape*) nas Telas de Hardware
-Em todas as telas (0 a 6), a faixa inferior (`y = 222..239`, 18px de altura) utiliza um buffer em memória RAM (`TFT_eSprite` de `320×18`) atualizado a **~28 FPS** para deslizar continuamente as cotações de **Dólar, Euro, Bitcoin ($ e R$), Ethereum, Solana, BNB, XRP, IBOVESPA e S&P 500** sem causar *flicker* nas métricas de hardware. Você pode ativar ou ocultar o letreiro a qualquer momento pelo painel do PC.
+1. **Acesso Instantâneo via QR Code:**
+   - Ao abrir o painel desktop, o servidor web local inicia na porta `8088` (com failover automático para portas seguintes caso ocupada).
+   - Aponte a câmera do celular para o QR Code exibido na Aba **Remoto & Serial** ou no ícone do cabeçalho.
+2. **5 Abas no Celular:**
+   - 📺 **Telas:** Seletor em grade 2 colunas para as 10 telas (`0` a `9`).
+   - 🎵 **Foco & Mídia:** Controles remotos completos do Pomodoro (`▶`, `↺`, `⏭`, seleção de fase) e do player Spotify / YouTube Music (`⏮`, `⏯`, `⏭`, reenviar capa ao SD).
+   - 📊 **Métricas:** Telemetria ao vivo do PC, resumo do Portfólio Pessoal e cotações de mercado.
+   - 🎨 **Cores:** Paletas de 1-toque, Color Picker RGB565 e disparador de teste do Buzzer/LED.
+   - 🖼️ **SD & Energia:** Upload de fotos da câmera/galeria para o MicroSD, ajuste de brilho PWM e toggles de **Modo Sleep** e **Modo Noturno**.
+3. **App Nativo Flutter:** O diretório [`mobile/`](mobile/) contém a codebase completa em Flutter pronta para compilação nativa em Android ou iOS.
 
 ---
 
 ## 📂 Estrutura do Repositório
 
-O projeto foi organizado de forma modular para facilitar o entendimento e a contribuição da comunidade:
-
 ```text
 minimal-monitor/
-├── firmware/                        # Firmware C++ / Arduino para o ESP32-2432S028R (CYD)
+├── firmware/                        # Firmware C++ para ESP32-2432S028R (CYD)
 │   ├── minimal_monitor/
-│   │   ├── minimal_monitor.ino      # Loop principal, renderizador TFT_eSPI (7 telas + Ticker Sprite) e parser JSON
-│   │   └── ui_theme.h               # Constantes das 7 telas (SCR_0..SCR_6), dimensões e paleta RGB565
-│   └── User_Setup.h                 # Mapeamento de pinos SPI do display da placa CYD (ST7789 / ILI9341)
+│   │   ├── minimal_monitor.ino      # Loop principal, decodificador JPEG com alpha-blending, 10 telas e parser JSON
+│   │   └── ui_theme.h               # Definições das 10 telas (SCR_0..SCR_9), pinos Buzzer/LED e paletas RGB565
+│   └── User_Setup.h                 # Configurações de barramento SPI e pinagem TFT_eSPI
 │
-├── agent/                           # Agente Desktop (PC) e Painel de Controle Total em Flet (Flutter)
-│   ├── agent.py                     # Coletor Hardware + Coletor Mercado Financeiro + GUI Flet + Servidor Web Wi-Fi
-│   ├── mobile_web.py                # Interface Web Mobile (PWA) de alta performance integrada
-│   ├── requirements.txt             # Dependências Python do projeto
-│   ├── ui_config.example.json       # Modelo do arquivo de configuração persistida pelo Agente
-│   ├── CYD-Hardware-Monitor.spec    # Especificação PyInstaller / Flet Pack
-│   ├── dist/
-│   │   └── CYD-Hardware-Monitor.exe # Executável standalone pronto para Windows (sem precisar instalar Python)
-│   ├── 99-mike-cyd.rules            # Regra udev para porta USB Serial no Linux
-│   └── mike-agent.service           # Serviço systemd opcional para Linux
+├── agent/                           # Agente Desktop (PC) em Flet (Flutter) e Servidor Web Mobile
+│   ├── agent.py                     # Coletor Hardware + Mercado + PomodoroEngine + MediaCollector + GUI Flet 6 Abas
+│   ├── mobile_web.py                # Interface Web Mobile (PWA) de alta performance em 5 abas
+│   ├── file_version_info.txt        # Metadados de versão Windows (v4.0.0.0) para o executável
+│   ├── requirements.txt             # Dependências Python (Flet, WinRT, Pillow, psutil, pyserial, etc.)
+│   ├── ui_config.json               # Configuração persistida de telas, cores, alertas e carteira
+│   ├── CYD-Hardware-Monitor.spec    # Especificação PyInstaller para build do executável
+│   └── dist/
+│       └── CYD-Hardware-Monitor.exe # Executável standalone Windows pronto para uso (v4.0)
 │
-├── mobile/                          # Aplicativo Mobile para Smartphones (Controle Remoto Wi-Fi)
-│   ├── README.md                    # Instruções de uso do Web PWA e compilação do App Nativo Flutter
-│   ├── pubspec.yaml                 # Dependências e manifesto do projeto Flutter
-│   └── lib/                         # Código Dart (main.dart, models, services)
+├── mobile/                          # Projeto Flutter nativo para Android e iOS
+│   ├── README.md                    # Instruções de compilação do APK nativo
+│   ├── pubspec.yaml                 # Dependências do app Flutter
+│   └── lib/                         # Código Dart (telas, modelos e serviços SSE)
 │
-├── docs/                            # Documentação Técnica e Arquitetura
-│   └── ARCHITECTURE.md              # Especificação completa do Protocolo Serial JSON v3.0 e pinagem da CYD
-│
-├── preview/                         # Fotos reais da placa CYD e screenshot do Painel Flet (v3.0)
-│   ├── preview-tela-pc-1.jpg        # Screenshot do Painel de Controle Total no PC (Flet / Flutter)
-│   ├── preview-tela-1.jpg           # Tela Resumo (Tema Verde) + Letreiro da Bolsa
-│   ├── preview-tela-2.jpg           # Tela Resumo (Tema Azul) + Letreiro Dólar/Euro
-│   ├── preview-tela-3.jpg           # Tela Resumo (Tema Vermelho) + Letreiro Cripto
-│   ├── preview-tela-4.jpg           # Tela Bolsa & Cripto (Dólar, Euro, IBOV, Criptos e Gráfico BTC)
-│   ├── preview-tela-5.jpg           # Tela Bolsa & Cripto + Ticker S&P500 / CPU
-│   └── preview-tela-6.jpg           # Tela 4x Gráficos em Tempo Real + Letreiro da Bolsa
-│
-├── imagens-referencia/              # Wallpapers de exemplo (JPG/GIF) prontos para enviar ao Cartão SD
-├── tools/                           # Utilitários de verificação e simulação offline das telas
-├── .github/ISSUE_TEMPLATE/          # Templates padronizados para relato de Bugs e sugestões de Features
-├── CONTRIBUTING.md                  # Guia rápido para desenvolvedores contribuírem com novas telas/sensores
-├── LICENSE                          # Licença MIT Open Source
-├── platformio.ini                   # Configuração de compilação e bibliotecas do PlatformIO
-└── README.md                        # Documentação principal do projeto
+├── preview/                         # Capturas de tela reais do Painel Desktop v4.0 e da placa CYD
+├── imgs/                            # Ícone oficial da aplicação (imgsCYD.ico)
+├── platformio.ini                   # Manifesto de compilação PlatformIO para ESP32 (CYD)
+└── README.md                        # Documentação completa do projeto
 ```
 
 ---
 
 ## 🚀 Como Usar e Instalar
 
-### Passo 1: Preparando o Computador (Leitura de Sensores)
-1. Para obter leituras precisas de temperatura de CPU/GPU, clock e consumo no Windows, baixe o **[LibreHardwareMonitor](https://github.com/LibreHardwareMonitor/LibreHardwareMonitor/releases)**.
-2. Abra o LibreHardwareMonitor, clique em **`Options` -> `Remote Web Server` -> `Run`** (porta padrão `8085`).
-   - *Nota:* Caso o LibreHardwareMonitor não esteja aberto, o Agente continuará funcionando normalmente usando fallbacks nativos (`psutil`, `WMI`, `nvidia-smi`).
-   - As cotações do **Mercado Financeiro & Cripto** são coletadas automaticamente de APIs públicas gratuitas (*AwesomeAPI*, *Binance Public API* e *Yahoo Finance*), **sem exigir nenhuma chave de API (API Key)**.
-3. Certifique-se de ter o driver USB **CH340** instalado caso o Windows não reconheça a porta COM da placa CYD.
-
----
-
-### Passo 2: Executando o Painel de Controle no PC (Flet / Flutter)
-
-#### Opção A: Usando o Executável Pronto (Windows)
-Basta abrir diretamente o executável empacotado:
+### Opção A: Executável Pronto para Windows (Sem instalar Python)
+Basta executar o binário compilado:
 ```powershell
 .\agent\dist\CYD-Hardware-Monitor.exe
 ```
 
-#### Opção B: Rodando pelo Código-Fonte Python
-1. Crie e ative um ambiente virtual Python (`.venv`) na raiz do repositório:
+### Opção B: Rodando a partir do Código-Fonte Python
+1. Ative o ambiente virtual e instale as dependências:
    ```powershell
-   python -m venv .venv
    .\.venv\Scripts\pip install -r agent\requirements.txt
    ```
-2. Inicie o Agente com a interface Flet:
+2. Inicie o agente com a nova interface em abas:
    ```powershell
    .\.venv\Scripts\python agent\agent.py
    ```
-   - Para testar a saída JSON no terminal sem abrir a interface gráfica:
-     ```powershell
-     .\.venv\Scripts\python agent\agent.py --stdout --once
-     ```
-
----
-
-### Passo 3: Gravando o Firmware na Placa CYD (PlatformIO)
-1. Instale o **[VS Code](https://code.visualstudio.com/)** com a extensão **[PlatformIO IDE](https://platformio.org/)**.
-2. Insira um **Cartão MicroSD formatado em FAT32** no slot da placa CYD caso deseje armazenar e exibir papéis de parede `.jpg`, `.bmp` ou `.gif`.
-3. Conecte a placa CYD ao PC via cabo Micro-USB / USB-C e compile/grave o firmware:
+3. Teste rápido de payload JSON no terminal:
    ```powershell
-   pio run -e cyd -t upload
+   .\.venv\Scripts\python agent\agent.py --stdout --once
    ```
-   *(O PlatformIO baixará automaticamente as bibliotecas `TFT_eSPI`, `ArduinoJson`, `TJpg_Decoder` e `AnimatedGIF` configuradas no [`platformio.ini`](platformio.ini)).*
+
+### Gravando o Firmware Atualizado na CYD (PlatformIO)
+Com o cabo USB conectado à placa CYD:
+```powershell
+& "C:\Users\Matheus Augusto\.platformio\penv\Scripts\pio.exe" run -e cyd -t upload
+```
 
 ---
 
-## 📡 Resumo do Protocolo Serial JSON (v3.0)
+## 📡 Resumo do Protocolo Serial JSON (v4.0)
 
-O Agente Python comunica-se com o ESP32 a `115200 bps` enviando linhas JSON terminadas por `\n` (`newline-delimited JSON`):
+O Agente envia dados via Serial a `115200 bps` no formato JSON terminado em `\n`:
 
 ```json
 {
-  "sys": {
-    "cpu": 24.5, "cput": 54.0, "cpuf": 4200, "cores": 12,
-    "ram": 62.1, "ramu": 9.9, "ramt": 16.0, "swap": 2.0,
-    "gpu": 45.0, "gput": 61.0, "gpuw": 115.0, "vram": 50.0, "gpuname": "RADEON",
-    "dsk": 55.6, "dskf": 412.3, "rx": 1.25, "tx": 0.18,
-    "hh": 16, "mm": 30, "up": 86400, "host": "z1popc"
+  "sys": {"cpu": 14.2, "cput": 52.0, "ram": 68.4, "gpu": 19.0, "gput": 49.0},
+  "mkt": {"usd": 4.97, "usdc": -1.72, "ibov": 205083, "btc": 80508, "btcc": 0.07},
+  "portf": {"tot": 15200.50, "pnl_pct": 2.50, "pnl_val": 380.00, "top3": ["BTC", "ETH", "PETR4"]},
+  "pomo": {"st": "WORK", "run": true, "rem": 1425, "tot": 1500, "cyc": 2},
+  "media": {
+    "src": "YT MUSIC",
+    "play": true,
+    "tit": "Starboy",
+    "art": "The Weeknd",
+    "alb": "Starboy",
+    "pos": 84,
+    "dur": 230,
+    "cov": "_media_cov.jpg",
+    "cid": "a91f4c02"
   },
-  "mkt": {
-    "usd": 5.06, "usdc": -0.69,
-    "eur": 5.70, "eurc": -0.20,
-    "ibov": 205430, "ibovc": -0.52,
-    "sp500": 7659, "sp500c": -0.77,
-    "btc": 81611, "btcc": -0.01, "btc_brl": 413200,
-    "eth": 2420.0, "ethc": 0.29,
-    "sol": 104.09, "solc": 0.42,
-    "bnb": 718.00, "bnbc": -0.48,
-    "xrp": 1.30, "xrpc": -0.12,
-    "btch": [42, 48, 51, 60, 75, 82, 95, 100]
-  },
-  "ui": {
-    "screen": 6,
-    "color": "0x07E0",
-    "bg": "megadeth-rust-in-p.jpg",
-    "brt": 220,
-    "ticker": true
-  }
+  "alrt": {"bz": true, "led": "0x07FF", "p": 3},
+  "ui": {"screen": 9, "color": "0x07E0", "bg": "none", "brt": 200, "ticker": true}
 }
 ```
-> 📖 Para detalhes completos sobre o protocolo de upload de imagens via Serial (Chunked Base64) e pinagem de hardware, consulte [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md).
-
----
-
-## 🤝 Como Contribuir
-
-Este é um projeto **Open Source** e contribuições da comunidade são muito bem-vindas! Seja criando novas telas em `TFT_eSPI`, adicionando novos indicadores financeiros, integrando novos sensores ou melhorando o painel em Flet:
-
-1. Leia o nosso **[Guia de Contribuição (`CONTRIBUTING.md`)](CONTRIBUTING.md)**.
-2. Consulte a **[Arquitetura Técnica (`docs/ARCHITECTURE.md`)](docs/ARCHITECTURE.md)**.
-3. Faça um *Fork* do repositório, crie sua *branch* (`git checkout -b feat/minha-nova-tela`) e abra um **Pull Request**!
 
 ---
 
 ## 📄 Licença
 
-Distribuído sob a licença **MIT**. Veja o arquivo [`LICENSE`](LICENSE) para mais informações.
+Distribuído sob a licença **MIT**. Veja o arquivo [`LICENSE`](LICENSE) para mais detalhes.
 
 ---
 *Projeto idealizado, arquitetado e desenvolvido por **Matheus Ribeiro -- z1po** & comunidade Open Source.*

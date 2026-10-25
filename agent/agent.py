@@ -14,7 +14,10 @@ Formato do Payload Serial:
 """
 
 import argparse
+import asyncio
 import base64
+import ctypes
+import hashlib
 import http.server
 import inspect
 import io
@@ -31,6 +34,7 @@ import subprocess
 import sys
 import threading
 import time
+import unicodedata
 import urllib.parse
 import urllib.request
 import webbrowser
@@ -683,6 +687,228 @@ def prepare_image_for_cyd(filepath: str) -> tuple[str, bytes]:
         return prepare_image_bytes_for_cyd(os.path.basename(filepath), f.read())
 
 
+def ascii_for_tft(text: str, max_len: int = 44) -> str:
+    """Normaliza acentos e caracteres especiais UTF-8 para ASCII limpo suportado pelas fontes nativas do TFT_eSPI."""
+    if not text:
+        return ""
+    s = str(text)
+    for src_ch, dst_ch in (("—", "-"), ("–", "-"), ("•", "-"), ("“", '"'), ("”", '"'), ("’", "'"), ("‘", "'")):
+        s = s.replace(src_ch, dst_ch)
+    s = unicodedata.normalize("NFKD", s).encode("ascii", "ignore").decode("ascii")
+    s = re.sub(r"\s+", " ", s).strip()
+    return s[:max_len]
+
+
+def prepare_media_cover_for_cyd(raw_bytes: bytes) -> tuple[bytes, str, str]:
+    """
+    Prepara a capa do álbum (Spotify 1:1 ou YouTube Music 16:9 / 1:1) em 320x240 JPEG Baseline (~12 KB)
+    para gravação rápida no Cartão SD da CYD + retorna (jpeg_cyd_bytes, preview_b64_png, cover_id_8hex).
+    Remove barras pretas laterais de thumbnails 16:9 do YouTube Music automaticamente!
+    """
+    from PIL import Image, ImageOps
+
+    img = Image.open(io.BytesIO(raw_bytes)).convert("RGB")
+    w, h = img.size
+
+    # Se vier thumbnail 16:9 do YouTube Music com barras laterais escuras, recorta o quadrado central da capa
+    if w > h * 1.28 and h > 40:
+        margin_w = int((w - h) / 2)
+        if margin_w > 8:
+            left_strip = img.crop((0, int(h * 0.15), min(margin_w, 24), int(h * 0.85)))
+            raw_strip = left_strip.tobytes()
+            if raw_strip:
+                avg_luma = sum(raw_strip) / float(len(raw_strip))
+                if avg_luma < 28.0:
+                    sq = int(h)
+                    x0 = max(0, (w - sq) // 2)
+                    img = img.crop((x0, 0, x0 + sq, h))
+
+    # Preview nítido 160x160 para a interface Flet Desktop e Smartphone WebApp
+    prev_img = ImageOps.fit(img, (160, 160), method=Image.Resampling.LANCZOS)
+    prev_buf = io.BytesIO()
+    prev_img.save(prev_buf, format="JPEG", quality=84)
+    prev_b64 = base64.b64encode(prev_buf.getvalue()).decode("ascii")
+
+    # Imagem 320x240 Baseline JPEG otimizada para o TJpg_Decoder do ESP32 (foco levemente superior p/ overlay)
+    cyd_img = ImageOps.fit(img, (320, 240), method=Image.Resampling.LANCZOS, centering=(0.5, 0.32))
+    cyd_buf = io.BytesIO()
+    cyd_img.save(cyd_buf, format="JPEG", quality=78, optimize=True, progressive=False)
+    cyd_bytes = cyd_buf.getvalue()
+    cid = hashlib.md5(cyd_bytes).hexdigest()[:8]
+    return cyd_bytes, prev_b64, cid
+
+
+DEFAULT_ALERT_RULES = [
+    {
+        "id": "cpu_temp",
+        "name": "CPU Temp Crítica",
+        "source": "cput",
+        "op": ">",
+        "val": 85.0,
+        "bz": True,
+        "led": "0xF800",
+        "p": 3,
+        "enabled": True,
+        "cooldown_s": 45.0,
+    },
+    {
+        "id": "gpu_temp",
+        "name": "GPU Temp Crítica",
+        "source": "gput",
+        "op": ">",
+        "val": 82.0,
+        "bz": True,
+        "led": "0xF800",
+        "p": 3,
+        "enabled": True,
+        "cooldown_s": 45.0,
+    },
+    {
+        "id": "cpu_load",
+        "name": "CPU Sobrecarga",
+        "source": "cpu",
+        "op": ">",
+        "val": 95.0,
+        "bz": False,
+        "led": "0xFD20",
+        "p": 2,
+        "enabled": True,
+        "cooldown_s": 30.0,
+    },
+    {
+        "id": "ram_load",
+        "name": "RAM Sobrecarga",
+        "source": "ram",
+        "op": ">",
+        "val": 92.0,
+        "bz": False,
+        "led": "0xFD20",
+        "p": 2,
+        "enabled": True,
+        "cooldown_s": 30.0,
+    },
+    {
+        "id": "btc_target",
+        "name": "Bitcoin > 100k USD",
+        "source": "btc",
+        "op": ">",
+        "val": 100000.0,
+        "bz": True,
+        "led": "0x07E0",
+        "p": 1,
+        "enabled": False,
+        "cooldown_s": 60.0,
+    },
+    {
+        "id": "usd_target",
+        "name": "Dólar > 6.00 BRL",
+        "source": "usd",
+        "op": ">",
+        "val": 6.00,
+        "bz": True,
+        "led": "0xF81F",
+        "p": 2,
+        "enabled": False,
+        "cooldown_s": 60.0,
+    },
+]
+
+
+def get_system_idle_seconds() -> float:
+    """Retorna o tempo de inatividade do usuário (sem uso de mouse/teclado) em segundos no Windows."""
+    try:
+        if sys.platform == "win32":
+            class LASTINPUTINFO(ctypes.Structure):
+                _fields_ = [("cbSize", ctypes.c_uint), ("dwTime", ctypes.c_uint)]
+
+            lii = LASTINPUTINFO()
+            lii.cbSize = ctypes.sizeof(LASTINPUTINFO)
+            if ctypes.windll.user32.GetLastInputInfo(ctypes.byref(lii)):
+                millis = ctypes.windll.kernel32.GetTickCount() - lii.dwTime
+                return max(0.0, millis / 1000.0)
+    except Exception:
+        pass
+    return 0.0
+
+
+def calculate_dynamic_brightness(base_brt: int, cfg_state: dict) -> tuple[int, str]:
+    """Calcula o brilho dinâmico (0-255) baseado em inatividade (Sleep) e horário (Modo Noturno)."""
+    # 1) Detecção de Sleep por inatividade de mouse/teclado
+    if cfg_state.get("sleep_enabled", True):
+        timeout_sec = cfg_state.get("sleep_timeout_min", 15) * 60
+        idle_sec = get_system_idle_seconds()
+        if idle_sec >= timeout_sec:
+            return 0, f"Sleep Mode (ocioso há {int(idle_sec // 60)} min)"
+
+    # 2) Modo Noturno automático (ex: 22h às 06h)
+    if cfg_state.get("night_mode_enabled", True):
+        cur_h = datetime.now().hour
+        start_h = cfg_state.get("night_start_hour", 22)
+        end_h = cfg_state.get("night_end_hour", 6)
+        is_night = False
+        if start_h > end_h:
+            is_night = (cur_h >= start_h or cur_h < end_h)
+        else:
+            is_night = (start_h <= cur_h < end_h)
+
+        if is_night:
+            night_brt = cfg_state.get("night_brightness", 40)
+            return min(base_brt, night_brt), f"Modo Noturno ({start_h}h-{end_h}h, máx {night_brt})"
+
+    return base_brt, "Normal"
+
+
+def evaluate_alert_rules(rules: list, sys_m: dict, mkt_m: dict, last_fired_dict: dict, now_t: float) -> dict | None:
+    """Avalia regras de gatilhos físicos. Retorna dicionário do alerta se disparado."""
+    for r in rules:
+        if not r.get("enabled", True):
+            continue
+        src = r.get("source")
+        op = r.get("op", ">")
+        target_val = float(r.get("val", 0.0))
+        rule_id = r.get("id", f"{src}_{op}_{target_val}")
+
+        curr_val = None
+        if sys_m and src in sys_m:
+            curr_val = sys_m[src]
+        elif mkt_m and src in mkt_m:
+            curr_val = mkt_m[src]
+
+        if curr_val is None:
+            continue
+
+        try:
+            curr_val = float(curr_val)
+        except (ValueError, TypeError):
+            continue
+
+        is_triggered = (curr_val > target_val) if op == ">" else (curr_val < target_val)
+        if is_triggered:
+            last_t = last_fired_dict.get(rule_id, 0.0)
+            cooldown = r.get("cooldown_s", 45.0)
+            if now_t - last_t >= cooldown:
+                last_fired_dict[rule_id] = now_t
+                return {
+                    "rule_name": r.get("name", rule_id),
+                    "curr_val": curr_val,
+                    "target_val": target_val,
+                    "op": op,
+                    "alrt": {
+                        "bz": bool(r.get("bz", False)),
+                        "led": str(r.get("led", "0xF800")),
+                        "p": int(r.get("p", 1)),
+                    },
+                }
+    return None
+
+
+DEFAULT_PORTFOLIO = [
+    {"ticker": "BTC", "qty": 0.025, "avg_price": 370000.0, "currency": "BRL"},
+    {"ticker": "ETH", "qty": 0.40, "avg_price": 11200.0, "currency": "BRL"},
+    {"ticker": "PETR4", "qty": 100.0, "avg_price": 35.80, "currency": "BRL"},
+]
+
+
 def load_ui_config():
     defaults = {
         "screen": 1,
@@ -691,6 +917,21 @@ def load_ui_config():
         "bg": "none",
         "brt": 200,
         "ticker": True,
+        "sleep_enabled": True,
+        "sleep_timeout_min": 15,
+        "night_mode_enabled": True,
+        "night_start_hour": 22,
+        "night_end_hour": 6,
+        "night_brightness": 40,
+        "alert_rules": [dict(r) for r in DEFAULT_ALERT_RULES],
+        "portfolio": [dict(p) for p in DEFAULT_PORTFOLIO],
+        "portfolio_pnl_mode": "hist",
+        "pomo_work_min": 25,
+        "pomo_break_min": 5,
+        "pomo_long_min": 15,
+        "pomo_buzzer": True,
+        "media_source_pref": "auto",
+        "media_auto_cover": True,
         "sd_files": [
             "none",
             "terminal",
@@ -709,6 +950,11 @@ def load_ui_config():
             with open(CONFIG_FILE, "r", encoding="utf-8") as f:
                 saved = json.load(f)
                 defaults.update(saved)
+                # Garante que regras novas ou atualizadas permaneçam íntegras
+                if "alert_rules" not in saved or not saved["alert_rules"]:
+                    defaults["alert_rules"] = [dict(r) for r in DEFAULT_ALERT_RULES]
+                if "portfolio" not in saved or not isinstance(saved["portfolio"], list):
+                    defaults["portfolio"] = [dict(p) for p in DEFAULT_PORTFOLIO]
         except Exception:
             pass
     return defaults
@@ -728,9 +974,12 @@ class MarketCollector:
     Coletor Financeiro & Cripto em Tempo Real de Alta Performance (Multi-Threaded).
       - Criptomoedas (Coinbase Spot USD + Binance 24h chg): atualizadas a cada 3.0s.
         Garante alinhamento centavo por centavo com a busca do Google ("preço do bitcoin em dolar").
-      - Indices (IBOVESPA, S&P 500) e Câmbio Oficial (USD/BRL, EUR/BRL): atualizados a cada 12.0s.
+      - Indices (IBOVESPA, S&P 500), Câmbio Oficial (USD/BRL, EUR/BRL) e Ações extras do Portfólio
+        (ex: PETR4, VALE3, ITUB4, NVDA): atualizados a cada 12.0s.
       - Sparkline de 24h do Bitcoin (48 candles) da Binance.
     """
+
+    BUILTIN_SYMBOLS = {"BTC", "ETH", "SOL", "BNB", "XRP", "USD", "USDT", "USDC", "EUR", "IBOV", "SP500"}
 
     def __init__(self, crypto_interval: float = 3.0, stock_interval: float = 12.0):
         self.crypto_interval = crypto_interval
@@ -749,6 +998,8 @@ class MarketCollector:
             "btch": [],
             "last_str": "--:--:--",
         }
+        self._custom_tickers: set[str] = set()
+        self._custom_quotes: dict[str, dict] = {}
         self._updated_at = 0.0
         self._running = True
         self._trigger_crypto = threading.Event()
@@ -756,11 +1007,22 @@ class MarketCollector:
         threading.Thread(target=self._crypto_worker, daemon=True).start()
         threading.Thread(target=self._stock_worker, daemon=True).start()
 
+    def set_custom_tickers(self, tickers: list[str]):
+        cleaned = {t.strip().upper() for t in tickers if t and t.strip()}
+        extras = cleaned - self.BUILTIN_SYMBOLS
+        trigger = False
+        with self._lock:
+            if extras - self._custom_tickers:
+                trigger = True
+            self._custom_tickers = extras
+        if trigger:
+            self._trigger_stock.set()
+
     def _http_json(self, url: str, timeout: float = 3.5):
         req = urllib.request.Request(
             url,
             headers={
-                "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) CYDMonitor/3.0",
+                "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) CYDMonitor/4.0",
                 "Accept": "application/json",
             },
         )
@@ -768,6 +1030,12 @@ class MarketCollector:
             return json.loads(resp.read().decode("utf-8", errors="ignore"))
 
     def _fetch_yahoo_quote(self, ticker_encoded: str) -> tuple[float, float] | None:
+        res = self._fetch_yahoo_quote_full(ticker_encoded)
+        if res is None:
+            return None
+        return res[0], res[1]
+
+    def _fetch_yahoo_quote_full(self, ticker_encoded: str) -> tuple[float, float, str] | None:
         try:
             url = f"https://query1.finance.yahoo.com/v8/finance/chart/{ticker_encoded}?interval=1d&range=2d"
             raw = self._http_json(url, timeout=3.5)
@@ -775,9 +1043,33 @@ class MarketCollector:
             price = float(meta["regularMarketPrice"])
             prev = float(meta.get("chartPreviousClose") or meta.get("previousClose") or price)
             chg = ((price - prev) / prev * 100.0) if prev > 0 else 0.0
-            return round(price, 4), round(chg, 2)
+            cur = str(meta.get("currency") or "USD").upper()
+            return round(price, 4), round(chg, 2), cur
         except Exception:
             return None
+
+    def _fetch_single_custom_ticker(self, sym: str) -> dict | None:
+        s = sym.strip().upper()
+        if not s:
+            return None
+        # Ações / FIIs / ETFs da B3 (ex: PETR4, VALE3, ITUB4, HGLG11, BOVA11)
+        if re.match(r"^[A-Z]{4}\d{1,2}F?$", s):
+            q = self._fetch_yahoo_quote_full(urllib.parse.quote(f"{s}.SA"))
+            if q:
+                return {"price": q[0], "chg": q[1], "currency": "BRL"}
+        if s.endswith(".SA"):
+            q = self._fetch_yahoo_quote_full(urllib.parse.quote(s))
+            if q:
+                return {"price": q[0], "chg": q[1], "currency": "BRL"}
+        # Tenta ticker direto (ações EUA como NVDA, AAPL, MSFT)
+        q = self._fetch_yahoo_quote_full(urllib.parse.quote(s))
+        if q:
+            return {"price": q[0], "chg": q[1], "currency": q[2]}
+        # Fallback cripto par USD no Yahoo (ex: ADA-USD, DOGE-USD, AVAX-USD)
+        q = self._fetch_yahoo_quote_full(urllib.parse.quote(f"{s}-USD"))
+        if q:
+            return {"price": q[0], "chg": q[1], "currency": "USD"}
+        return None
 
     def fetch_crypto_now(self) -> bool:
         new_d = {}
@@ -892,9 +1184,21 @@ class MarketCollector:
         except Exception:
             pass
 
+        # 4) Cotações extras dos ativos personalizados do Portfólio (ex: PETR4, VALE3, NVDA)
+        with self._lock:
+            extras = list(self._custom_tickers)
+        custom_res = {}
+        for sym in extras:
+            q_info = self._fetch_single_custom_ticker(sym)
+            if q_info:
+                custom_res[sym] = q_info
+                updated = True
+
         if updated:
             with self._lock:
                 self._data.update(new_d)
+                if custom_res:
+                    self._custom_quotes.update(custom_res)
                 usd_now = self._data.get("usd", 0.0)
                 btc_now = self._data.get("btc", 0.0)
                 if usd_now > 0 and btc_now > 0:
@@ -902,6 +1206,166 @@ class MarketCollector:
                 self._data["last_str"] = brasilia_now().strftime("%H:%M:%S")
                 self._updated_at = time.time()
         return updated
+
+    def resolve_asset_quote(self, ticker: str) -> dict | None:
+        """Retorna cotação atual do ativo convertida para BRL e USD + variação 24h."""
+        sym = (ticker or "").strip().upper()
+        if not sym:
+            return None
+        with self._lock:
+            d = dict(self._data)
+            cq = self._custom_quotes.get(sym)
+
+        usd_rate = float(d.get("usd") or 0.0)
+        if usd_rate <= 0:
+            usd_rate = 5.00
+
+        crypto_map = {
+            "BTC": ("btc", "btcc"),
+            "ETH": ("eth", "ethc"),
+            "SOL": ("sol", "solc"),
+            "BNB": ("bnb", "bnbc"),
+            "XRP": ("xrp", "xrpc"),
+        }
+        if sym in crypto_map:
+            kp, kc = crypto_map[sym]
+            p_usd = float(d.get(kp) or 0.0)
+            if p_usd <= 0:
+                return None
+            return {
+                "price_brl": p_usd * usd_rate,
+                "price_usd": p_usd,
+                "native_price": p_usd,
+                "native_currency": "USD",
+                "chg_24h": float(d.get(kc) or 0.0),
+            }
+        if sym in ("USD", "USDT", "USDC"):
+            if d.get("usd", 0.0) <= 0:
+                return None
+            return {
+                "price_brl": usd_rate,
+                "price_usd": 1.0,
+                "native_price": usd_rate,
+                "native_currency": "BRL",
+                "chg_24h": float(d.get("usdc") or 0.0),
+            }
+        if sym == "EUR":
+            p_eur = float(d.get("eur") or 0.0)
+            if p_eur <= 0:
+                return None
+            return {
+                "price_brl": p_eur,
+                "price_usd": p_eur / usd_rate,
+                "native_price": p_eur,
+                "native_currency": "BRL",
+                "chg_24h": float(d.get("eurc") or 0.0),
+            }
+        if cq and cq.get("price", 0.0) > 0:
+            p_nat = float(cq["price"])
+            cur = cq.get("currency", "BRL").upper()
+            p_brl = p_nat if cur == "BRL" else (p_nat * usd_rate)
+            p_usd = (p_nat / usd_rate) if cur == "BRL" else p_nat
+            return {
+                "price_brl": p_brl,
+                "price_usd": p_usd,
+                "native_price": p_nat,
+                "native_currency": cur,
+                "chg_24h": float(cq.get("chg") or 0.0),
+            }
+        return None
+
+    def compute_portfolio(self, items: list[dict], pnl_mode: str = "hist") -> tuple[dict, list[dict]]:
+        """
+        Calcula o Patrimônio Consolidado (R$), PnL Histórico (vs Preço Médio) e Diário (24h).
+        Retorna (portf_json_payload, lista_detalhada_para_ui).
+        """
+        with self._lock:
+            usd_rate = float(self._data.get("usd") or 0.0)
+        if usd_rate <= 0:
+            usd_rate = 5.00
+
+        enriched = []
+        tot_brl = 0.0
+        tot_cost_brl = 0.0
+        tot_prev_day_brl = 0.0
+
+        for it in items:
+            sym = str(it.get("ticker", "")).strip().upper()
+            if not sym:
+                continue
+            try:
+                qty = float(it.get("qty", 0.0))
+                avg_p = float(it.get("avg_price", 0.0))
+            except (ValueError, TypeError):
+                continue
+            if qty <= 0:
+                continue
+
+            cur_pm = str(it.get("currency", "BRL")).upper()
+            cost_unit_brl = avg_p * usd_rate if cur_pm == "USD" else avg_p
+            pos_cost_brl = qty * cost_unit_brl
+
+            q = self.resolve_asset_quote(sym)
+            if q:
+                unit_brl = q["price_brl"]
+                chg_24h = q["chg_24h"]
+                quote_ok = True
+            else:
+                unit_brl = cost_unit_brl
+                chg_24h = 0.0
+                quote_ok = False
+
+            pos_val_brl = qty * unit_brl
+            pos_pnl_val = pos_val_brl - pos_cost_brl
+            pos_pnl_pct = (pos_pnl_val / pos_cost_brl * 100.0) if pos_cost_brl > 0 else 0.0
+
+            denom = 1.0 + (chg_24h / 100.0)
+            prev_day_val = (pos_val_brl / denom) if denom > 0.01 else pos_val_brl
+
+            tot_brl += pos_val_brl
+            tot_cost_brl += pos_cost_brl
+            tot_prev_day_brl += prev_day_val
+
+            enriched.append({
+                "ticker": sym,
+                "qty": qty,
+                "avg_price": avg_p,
+                "currency": cur_pm,
+                "unit_brl": unit_brl,
+                "pos_val_brl": pos_val_brl,
+                "pos_cost_brl": pos_cost_brl,
+                "pnl_val": pos_pnl_val,
+                "pnl_pct": pos_pnl_pct,
+                "chg_24h": chg_24h,
+                "quote_ok": quote_ok,
+                "weight_pct": 0.0,
+            })
+
+        for row in enriched:
+            row["weight_pct"] = (row["pos_val_brl"] / tot_brl * 100.0) if tot_brl > 0 else 0.0
+
+        hist_pnl_val = tot_brl - tot_cost_brl
+        hist_pnl_pct = (hist_pnl_val / tot_cost_brl * 100.0) if tot_cost_brl > 0 else 0.0
+        day_pnl_val = tot_brl - tot_prev_day_brl
+        day_pnl_pct = (day_pnl_val / tot_prev_day_brl * 100.0) if tot_prev_day_brl > 0 else 0.0
+
+        sorted_top = sorted(enriched, key=lambda x: x["pos_val_brl"], reverse=True)
+        top3_syms = [x["ticker"][:8] for x in sorted_top[:3]]
+        use_day = (pnl_mode == "day")
+        top3_chgs = [round(x["chg_24h"] if use_day else x["pnl_pct"], 2) for x in sorted_top[:3]]
+        top3_weights = [round(x["weight_pct"], 1) for x in sorted_top[:3]]
+
+        portf_payload = {
+            "tot": round(tot_brl, 2),
+            "pnl_pct": round(day_pnl_pct if use_day else hist_pnl_pct, 2),
+            "pnl_val": round(day_pnl_val if use_day else hist_pnl_val, 2),
+            "day_pct": round(day_pnl_pct, 2),
+            "cnt": len(enriched),
+            "top3": top3_syms,
+            "top3c": top3_chgs,
+            "top3w": top3_weights,
+        }
+        return portf_payload, enriched
 
     def _crypto_worker(self):
         while self._running:
@@ -940,8 +1404,500 @@ class MarketCollector:
             return self._updated_at
 
 
+# ========================================== MODULO 3: POMODORO & MULTIMIDIA ==
+class PomodoroEngine:
+    """
+    Máquina de estados thread-safe para o Hub de Produtividade Pomodoro (Tela 8):
+      - WORK:  Foco profundo (padrão 25 min)
+      - BREAK: Pausa curta (padrão 5 min)
+      - LONG:  Pausa longa a cada 4 ciclos de foco (padrão 15 min)
+    Dispara evento de conclusão para acionar o Buzzer e LED RGB da CYD!
+    """
+
+    def __init__(self, work_min: int = 25, break_min: int = 5, long_min: int = 15, buzzer_enabled: bool = True):
+        self._lock = threading.Lock()
+        self.work_min = max(1, min(120, int(work_min)))
+        self.break_min = max(1, min(60, int(break_min)))
+        self.long_min = max(1, min(90, int(long_min)))
+        self.buzzer_enabled = bool(buzzer_enabled)
+
+        self.state = "WORK"  # "WORK" | "BREAK" | "LONG"
+        self.running = False
+        self.cycles = 0
+        self.total_focus_sec_today = 0
+        self.tot_sec = self.work_min * 60
+        self.rem_sec = float(self.tot_sec)
+        self._last_tick_t = time.monotonic()
+
+    def _phase_duration(self, phase: str) -> int:
+        if phase == "LONG":
+            return self.long_min * 60
+        if phase == "BREAK":
+            return self.break_min * 60
+        return self.work_min * 60
+
+    def set_durations(self, work_min: int, break_min: int, long_min: int):
+        with self._lock:
+            self.work_min = max(1, min(120, int(work_min)))
+            self.break_min = max(1, min(60, int(break_min)))
+            self.long_min = max(1, min(90, int(long_min)))
+            new_tot = self._phase_duration(self.state)
+            if not self.running:
+                self.tot_sec = new_tot
+                self.rem_sec = float(new_tot)
+            else:
+                self.tot_sec = new_tot
+                self.rem_sec = min(self.rem_sec, float(new_tot))
+
+    def set_phase(self, phase: str):
+        p = str(phase or "WORK").upper()
+        if p not in ("WORK", "BREAK", "LONG"):
+            p = "WORK"
+        with self._lock:
+            self.state = p
+            self.running = False
+            self.tot_sec = self._phase_duration(p)
+            self.rem_sec = float(self.tot_sec)
+            self._last_tick_t = time.monotonic()
+
+    def toggle(self) -> bool:
+        with self._lock:
+            self.running = not self.running
+            self._last_tick_t = time.monotonic()
+            return self.running
+
+    def reset(self):
+        with self._lock:
+            self.running = False
+            self.tot_sec = self._phase_duration(self.state)
+            self.rem_sec = float(self.tot_sec)
+            self._last_tick_t = time.monotonic()
+
+    def skip(self) -> str:
+        with self._lock:
+            self._advance_phase_unlocked(count_cycle=(self.state == "WORK"))
+            return self.state
+
+    def _advance_phase_unlocked(self, count_cycle: bool):
+        if self.state == "WORK":
+            if count_cycle:
+                self.cycles += 1
+            self.state = "LONG" if (self.cycles > 0 and self.cycles % 4 == 0) else "BREAK"
+        else:
+            self.state = "WORK"
+        self.tot_sec = self._phase_duration(self.state)
+        self.rem_sec = float(self.tot_sec)
+        self._last_tick_t = time.monotonic()
+
+    def tick(self) -> dict | None:
+        """Avança o relógio. Se um ciclo terminou agora, avança de fase e retorna evento de conclusão."""
+        now_m = time.monotonic()
+        with self._lock:
+            dt = max(0.0, now_m - self._last_tick_t)
+            self._last_tick_t = now_m
+            if not self.running:
+                return None
+
+            self.rem_sec -= dt
+            if self.state == "WORK":
+                self.total_focus_sec_today += dt
+
+            if self.rem_sec <= 0.0:
+                finished_phase = self.state
+                self._advance_phase_unlocked(count_cycle=(finished_phase == "WORK"))
+                # Mantém rodando na transição automática para fluxo contínuo Pomodoro
+                self.running = True
+                return {
+                    "finished_phase": finished_phase,
+                    "next_phase": self.state,
+                    "cycles": self.cycles,
+                    "buzzer": self.buzzer_enabled,
+                }
+            return None
+
+    def get_payload(self, done_flag: bool = False) -> dict:
+        with self._lock:
+            d = {
+                "st": self.state,
+                "run": self.running,
+                "rem": max(0, int(round(self.rem_sec))),
+                "tot": int(self.tot_sec),
+                "cyc": int(self.cycles),
+            }
+            if done_flag:
+                d["done"] = True
+            return d
+
+    def get_ui_snapshot(self) -> dict:
+        with self._lock:
+            rem_i = max(0, int(round(self.rem_sec)))
+            tot_i = max(1, int(self.tot_sec))
+            return {
+                "state": self.state,
+                "running": self.running,
+                "rem": rem_i,
+                "tot": tot_i,
+                "pct": min(1.0, max(0.0, (tot_i - rem_i) / float(tot_i))),
+                "cycles": int(self.cycles),
+                "focus_min_today": int(self.total_focus_sec_today // 60),
+                "work_min": self.work_min,
+                "break_min": self.break_min,
+                "long_min": self.long_min,
+                "buzzer": self.buzzer_enabled,
+            }
+
+
+def _scan_windows_media_titles() -> dict:
+    """
+    Inspeciona rapidamente (<0.5ms via Win32 EnumWindows) os títulos das janelas abertas
+    para distinguir com 100% de precisão YouTube Music (no Chrome/Edge/Brave/Firefox/PWA)
+    e Spotify Web de abas comuns do navegador.
+    """
+    info = {"ytmusic_open": False, "spotify_web_open": False, "ytmusic_titles": []}
+    if not IS_WINDOWS:
+        return info
+    try:
+        user32 = ctypes.windll.user32
+        WNDENUMPROC = ctypes.WINFUNCTYPE(ctypes.c_bool, ctypes.c_void_p, ctypes.c_void_p)
+
+        def _cb(hwnd, _lparam):
+            if user32.IsWindowVisible(hwnd):
+                length = user32.GetWindowTextLengthW(hwnd)
+                if 0 < length < 512:
+                    buf = ctypes.create_unicode_buffer(length + 1)
+                    user32.GetWindowTextW(hwnd, buf, length + 1)
+                    t = buf.value
+                    tl = t.lower()
+                    if "youtube music" in tl:
+                        info["ytmusic_open"] = True
+                        info["ytmusic_titles"].append(t)
+                    elif "spotify" in tl and (" - " in t or "web player" in tl):
+                        info["spotify_web_open"] = True
+            return True
+
+        user32.EnumWindows(WNDENUMPROC(_cb), 0)
+    except Exception:
+        pass
+    return info
+
+
+class MediaCollector:
+    """
+    Coletor Multimídia Assíncrono (Windows GSMTC via winrt / winsdk) com suporte nativo a:
+      - Spotify (App Desktop, Microsoft Store e Web Player)
+      - YouTube Music (Chrome, Edge, Brave, Firefox, PWA instalado e App Desktop)
+      - Qualquer reprodutor compatível com Windows Media Session
+    Extrai metadados em tempo real, baixa/lê a capa do álbum (com fallback Deezer HD),
+    prepara o arquivo 320x240 JPEG para o Cartão SD e executa comandos Play/Pause/Next/Prev!
+    """
+
+    BROWSER_HINTS = ("chrome", "msedge", "edge", "brave", "firefox", "opera", "vivaldi", "arc", "waterfox", "zen")
+
+    def __init__(self, source_pref: str = "auto"):
+        self._lock = threading.Lock()
+        self._running = True
+        self._source_pref = str(source_pref or "auto").lower()
+        self._cmd_queue: queue.Queue = queue.Queue()
+        self._online_cover_cache: dict[str, bytes] = {}
+        self._processed_cover_cache: dict[str, tuple[bytes, str, str]] = {}
+
+        self._state = {
+            "source": "NONE",       # "SPOTIFY" | "YT MUSIC" | "MEDIA" | "NONE"
+            "app_id": "",
+            "playing": False,
+            "title": "",
+            "artist": "",
+            "album": "",
+            "pos": 0,
+            "dur": 0,
+            "track_key": "",
+            "cover_id": "",
+            "cover_b64": "",        # Preview 160x160 para Flet e Mobile WebApp
+            "cover_cyd_bytes": b"", # JPEG 320x240 pronto para envio ao SD da CYD
+            "updated_at": 0.0,
+        }
+
+        if IS_WINDOWS:
+            threading.Thread(target=self._worker_loop, daemon=True).start()
+
+    def set_source_pref(self, pref: str):
+        with self._lock:
+            self._source_pref = str(pref or "auto").lower()
+
+    def control(self, action: str):
+        """Enfileira comando de transporte ('play_pause', 'next', 'prev') para a sessão ativa."""
+        if action in ("play_pause", "next", "prev"):
+            self._cmd_queue.put(action)
+
+    def get_ui_snapshot(self) -> dict:
+        with self._lock:
+            return {
+                "source": self._state["source"],
+                "playing": self._state["playing"],
+                "title": self._state["title"],
+                "artist": self._state["artist"],
+                "album": self._state["album"],
+                "pos": self._state["pos"],
+                "dur": self._state["dur"],
+                "track_key": self._state["track_key"],
+                "cover_id": self._state["cover_id"],
+                "cover_b64": self._state["cover_b64"],
+            }
+
+    def get_cover_for_sd(self) -> tuple[str, str, bytes]:
+        """Retorna (track_key, cover_id, cyd_jpeg_bytes) da música atual."""
+        with self._lock:
+            return (
+                self._state["track_key"],
+                self._state["cover_id"],
+                self._state["cover_cyd_bytes"],
+            )
+
+    def get_cyd_payload(self, synced_cover_id: str = "") -> dict:
+        with self._lock:
+            src = self._state["source"]
+            tit = ascii_for_tft(self._state["title"] or "Nenhuma midia ativa", 42)
+            art = ascii_for_tft(self._state["artist"] or "Abra Spotify ou YouTube Music", 36)
+            alb = ascii_for_tft(self._state["album"] or "", 30)
+            return {
+                "src": src,
+                "play": bool(self._state["playing"]),
+                "tit": tit,
+                "art": art,
+                "alb": alb,
+                "pos": int(self._state["pos"]),
+                "dur": int(self._state["dur"]),
+                "cov": "_media_cov.jpg",
+                "cid": synced_cover_id or self._state["cover_id"] or "",
+            }
+
+    def _classify_session(self, app_id: str, title: str, artist: str, album: str, win_info: dict) -> str:
+        aid = (app_id or "").lower()
+        if "spotify" in aid:
+            return "SPOTIFY"
+        if any(k in aid for k in ("youtubemusic", "youtube-music", "ytmdesktop", "ytmusic", "th-ch", "pear")):
+            return "YT MUSIC"
+
+        is_browser = any(b in aid for b in self.BROWSER_HINTS)
+        if is_browser:
+            # Verifica se o título da faixa bate com uma janela aberta do YouTube Music
+            if win_info.get("ytmusic_open"):
+                t_low = (title or "").lower()
+                for wt in win_info.get("ytmusic_titles", []):
+                    if not t_low or t_low[:16] in wt.lower() or "youtube music" in wt.lower():
+                        return "YT MUSIC"
+            # YouTube Music no navegador preenche album_title via MediaSession API (YouTube comum deixa vazio)
+            if album and album.strip():
+                if win_info.get("spotify_web_open") and not win_info.get("ytmusic_open"):
+                    return "SPOTIFY"
+                return "YT MUSIC"
+            if win_info.get("spotify_web_open"):
+                return "SPOTIFY"
+        return "MEDIA"
+
+    def _fetch_online_cover_fallback(self, title: str, artist: str) -> bytes:
+        key = f"{artist}|{title}".strip().lower()
+        if not title:
+            return b""
+        if key in self._online_cover_cache:
+            return self._online_cover_cache[key]
+        try:
+            q = urllib.parse.quote(f"{artist} {title}".strip())
+            req = urllib.request.Request(
+                f"https://api.deezer.com/search?q={q}&limit=1",
+                headers={"User-Agent": "Mozilla/5.0"},
+            )
+            with urllib.request.urlopen(req, timeout=2.8) as resp:
+                data = json.loads(resp.read().decode("utf-8", errors="ignore"))
+            items = data.get("data") or []
+            if items:
+                cov_url = items[0].get("album", {}).get("cover_big") or items[0].get("album", {}).get("cover_medium")
+                if cov_url:
+                    req_img = urllib.request.Request(cov_url, headers={"User-Agent": "Mozilla/5.0"})
+                    with urllib.request.urlopen(req_img, timeout=3.0) as r_img:
+                        raw = r_img.read()
+                        if len(raw) > 512:
+                            self._online_cover_cache[key] = raw
+                            return raw
+        except Exception:
+            pass
+        return b""
+
+    def _worker_loop(self):
+        try:
+            from winrt.windows.media.control import GlobalSystemMediaTransportControlsSessionManager as SessionManager
+            from winrt.windows.storage.streams import Buffer, DataReader, InputStreamOptions
+        except ImportError:
+            try:
+                from winsdk.windows.media.control import GlobalSystemMediaTransportControlsSessionManager as SessionManager
+                from winsdk.windows.storage.streams import Buffer, DataReader, InputStreamOptions
+            except ImportError:
+                return
+
+        async def _poll_once():
+            mgr = await SessionManager.request_async()
+            if not mgr:
+                return
+
+            sessions = list(mgr.get_sessions())
+            win_info = _scan_windows_media_titles()
+            with self._lock:
+                pref = self._source_pref
+
+            candidates = []
+            for s in sessions:
+                try:
+                    app_id = s.source_app_user_model_id or ""
+                    pb = s.get_playback_info()
+                    pb_status = int(pb.playback_status) if pb and pb.playback_status is not None else 0
+                    is_playing = (pb_status == 4)  # 4 = Playing no enum GSMTC
+
+                    props = await s.try_get_media_properties_async()
+                    title = (props.title or "").strip() if props else ""
+                    artist = (props.artist or "").strip() if props else ""
+                    album = (props.album_title or "").strip() if props else ""
+                    if not title and not artist:
+                        continue
+
+                    # Limpa sufixo " - Topic" comum em artistas do YouTube Music
+                    if artist.endswith(" - Topic"):
+                        artist = artist[:-8].strip()
+
+                    src_kind = self._classify_session(app_id, title, artist, album, win_info)
+
+                    # Filtra conforme preferência do usuário
+                    if pref == "spotify" and src_kind != "SPOTIFY":
+                        continue
+                    if pref == "ytmusic" and src_kind != "YT MUSIC":
+                        continue
+
+                    # Pontuação de prioridade: Tocando agora > Spotify / YT Music > Outras mídias
+                    score = 0
+                    if is_playing:
+                        score += 100
+                    if src_kind in ("SPOTIFY", "YT MUSIC"):
+                        score += 40
+                    if pref == "auto" and src_kind == "YT MUSIC" and win_info.get("ytmusic_open"):
+                        score += 10
+                    candidates.append((score, s, src_kind, app_id, is_playing, props, title, artist, album))
+                except Exception:
+                    continue
+
+            if not candidates:
+                while not self._cmd_queue.empty():
+                    try:
+                        self._cmd_queue.get_nowait()
+                    except Exception:
+                        break
+                with self._lock:
+                    self._state.update({
+                        "source": "NONE",
+                        "playing": False,
+                        "pos": 0,
+                        "dur": 0,
+                    })
+                return
+
+            candidates.sort(key=lambda x: x[0], reverse=True)
+            _, best_s, src_kind, app_id, is_playing, props, title, artist, album = candidates[0]
+
+            # Executa eventuais comandos remotos (Play/Pause, Next, Prev) na sessão selecionada
+            while not self._cmd_queue.empty():
+                cmd = self._cmd_queue.get_nowait()
+                try:
+                    if cmd == "play_pause":
+                        await best_s.try_toggle_play_pause_async()
+                    elif cmd == "next":
+                        await best_s.try_skip_next_async()
+                    elif cmd == "prev":
+                        await best_s.try_skip_previous_async()
+                except Exception:
+                    pass
+
+            # Posição na linha do tempo da música
+            pos_sec, dur_sec = 0, 0
+            try:
+                tl = best_s.get_timeline_properties()
+                if tl:
+                    if tl.position:
+                        pos_sec = max(0, int(tl.position.total_seconds()))
+                    if tl.end_time:
+                        dur_sec = max(0, int(tl.end_time.total_seconds()))
+            except Exception:
+                pass
+
+            track_key = f"{src_kind}|{title}|{artist}|{album}"
+
+            # Extrai e processa a capa apenas quando muda a faixa ou se ainda não temos capa para esta faixa
+            cyd_bytes, prev_b64, cid = b"", "", ""
+            if track_key in self._processed_cover_cache:
+                cyd_bytes, prev_b64, cid = self._processed_cover_cache[track_key]
+            else:
+                raw_thumb = b""
+                try:
+                    if props and props.thumbnail:
+                        stream = await props.thumbnail.open_read_async()
+                        if stream:
+                            sz = int(stream.size)
+                            if 64 < sz < 8_000_000:
+                                buf = Buffer(sz)
+                                await stream.read_async(buf, sz, InputStreamOptions.NONE)
+                                dr = DataReader.from_buffer(buf)
+                                arr = bytearray(sz)
+                                dr.read_bytes(arr)
+                                raw_thumb = bytes(arr)
+                                dr.close()
+                            stream.close()
+                except Exception:
+                    raw_thumb = b""
+
+                if not raw_thumb:
+                    raw_thumb = self._fetch_online_cover_fallback(title, artist)
+
+                if raw_thumb:
+                    try:
+                        cyd_bytes, prev_b64, cid = prepare_media_cover_for_cyd(raw_thumb)
+                        if len(self._processed_cover_cache) > 24:
+                            self._processed_cover_cache.clear()
+                        self._processed_cover_cache[track_key] = (cyd_bytes, prev_b64, cid)
+                    except Exception:
+                        pass
+
+            with self._lock:
+                self._state.update({
+                    "source": src_kind,
+                    "app_id": app_id,
+                    "playing": is_playing,
+                    "title": title,
+                    "artist": artist,
+                    "album": album,
+                    "pos": pos_sec,
+                    "dur": dur_sec,
+                    "track_key": track_key,
+                    "cover_id": cid,
+                    "cover_b64": prev_b64,
+                    "cover_cyd_bytes": cyd_bytes,
+                    "updated_at": time.time(),
+                })
+
+        loop = asyncio.new_event_loop()
+        asyncio.set_event_loop(loop)
+        while self._running:
+            try:
+                loop.run_until_complete(_poll_once())
+            except Exception:
+                pass
+            time.sleep(0.85)
+
+
 # ========================================== INTERFACE MODERNA EM FLET (FLUTTER) ==
-def launch_flet_gui(col: Collector, mkt_col: MarketCollector, cli_args):
+def launch_flet_gui(
+    col: Collector,
+    mkt_col: MarketCollector,
+    media_col: MediaCollector,
+    pomo_eng: PomodoroEngine,
+    cli_args,
+):
     import flet as ft
 
     # Helpers compativeis entre Flet 0.2x e Flet 1.0+
@@ -949,6 +1905,7 @@ def launch_flet_gui(col: Collector, mkt_col: MarketCollector, cli_args):
     _Border = getattr(ft, "Border", getattr(ft, "border", None))
     _Padding = getattr(ft, "Padding", getattr(ft, "padding", None))
     _Button = getattr(ft, "Button", getattr(ft, "ElevatedButton", None))
+    _dd_sig = inspect.signature(ft.Dropdown.__init__).parameters
 
     def icon_val(name: str):
         return getattr(_ICONS, name, None) if _ICONS else None
@@ -959,15 +1916,39 @@ def launch_flet_gui(col: Collector, mkt_col: MarketCollector, cli_args):
     def pad_sym(horizontal: float = 0, vertical: float = 0):
         return _Padding.symmetric(horizontal=horizontal, vertical=vertical)
 
+    def set_btn_text(btn, txt: str):
+        if hasattr(btn, "content") and not isinstance(getattr(btn, "content", None), ft.Control):
+            btn.content = txt
+        elif hasattr(btn, "text"):
+            btn.text = txt
+
+    def make_compat_dropdown(label: str, value: str, options: list, width: float = None, expand: bool = False, on_change=None):
+        kw = {
+            "label": label,
+            "value": value,
+            "options": options,
+        }
+        if width is not None:
+            kw["width"] = width
+        if expand:
+            kw["expand"] = True
+        if on_change is not None:
+            if "on_change" in _dd_sig:
+                kw["on_change"] = on_change
+            elif "on_select" in _dd_sig:
+                kw["on_select"] = on_change
+        return ft.Dropdown(**kw)
+
     def build_app(page: ft.Page):
-        page.title = "CYD Hardware & Financial Market Monitor — Painel de Controle Total (Flet / Flutter)"
+        page.title = "CYD Hardware & Financial Market Monitor v4.0 — Central de Controle"
         page.bgcolor = "#07090E"
-        page.padding = 16
-        page.scroll = ft.ScrollMode.AUTO
+        page.padding = 14
+        page.scroll = None  # Viewport fixo com abas independentes (zero poluicao visual!)
         page.theme_mode = ft.ThemeMode.DARK
 
         cfg = load_ui_config()
         state = {
+            "active_tab": 0,
             "screen": int(cfg.get("screen", 1)),
             "hex_color": cfg.get("hex_color", "#00FF00").upper(),
             "color": cfg.get("color", "0x07E0"),
@@ -975,12 +1956,34 @@ def launch_flet_gui(col: Collector, mkt_col: MarketCollector, cli_args):
             "brt": int(cfg.get("brt", 200)),
             "ticker": bool(cfg.get("ticker", True)),
             "sd_files": list(cfg.get("sd_files", [])),
+            "sleep_enabled": bool(cfg.get("sleep_enabled", True)),
+            "sleep_timeout_min": int(cfg.get("sleep_timeout_min", 15)),
+            "night_mode_enabled": bool(cfg.get("night_mode_enabled", True)),
+            "night_start_hour": int(cfg.get("night_start_hour", 22)),
+            "night_end_hour": int(cfg.get("night_end_hour", 6)),
+            "night_brightness": int(cfg.get("night_brightness", 40)),
+            "alert_rules": [dict(r) for r in cfg.get("alert_rules", DEFAULT_ALERT_RULES)],
+            "portfolio": [dict(p) for p in cfg.get("portfolio", DEFAULT_PORTFOLIO)],
+            "portfolio_pnl_mode": str(cfg.get("portfolio_pnl_mode", "hist")),
+            "pomo_work_min": int(cfg.get("pomo_work_min", 25)),
+            "pomo_break_min": int(cfg.get("pomo_break_min", 5)),
+            "pomo_long_min": int(cfg.get("pomo_long_min", 15)),
+            "pomo_buzzer": bool(cfg.get("pomo_buzzer", True)),
+            "media_source_pref": str(cfg.get("media_source_pref", "auto")),
+            "media_auto_cover": bool(cfg.get("media_auto_cover", True)),
+            "synced_cover_id": "",
+            "sd_missing_warned": False,
+            "current_effective_brt": int(cfg.get("brt", 200)),
             "running": True,
             "ui_dirty": True,
             "last_ui_sync": 0.0,
             "last_mkt_sync": 0.0,
             "last_brt_ev": 0.0,
         }
+        mkt_col.set_custom_tickers([p.get("ticker", "") for p in state["portfolio"]])
+        media_col.set_source_pref(state["media_source_pref"])
+        pomo_eng.set_durations(state["pomo_work_min"], state["pomo_break_min"], state["pomo_long_min"])
+        pomo_eng.buzzer_enabled = state["pomo_buzzer"]
 
         def restore_window(icon=None, item=None):
             try:
@@ -1028,17 +2031,17 @@ def launch_flet_gui(col: Collector, mkt_col: MarketCollector, cli_args):
         try:
             ico_file = get_resource_path(os.path.join("imgs", "imgsCYD.ico"))
             if hasattr(page, "window") and page.window is not None:
-                page.window.width = 900
-                page.window.height = 940
-                page.window.min_width = 740
-                page.window.min_height = 740
+                page.window.width = 1040
+                page.window.height = 820
+                page.window.min_width = 880
+                page.window.min_height = 660
                 page.window.prevent_close = True
                 page.window.on_event = on_window_event
                 if os.path.exists(ico_file):
                     page.window.icon = ico_file
             else:
-                page.window_width = 900
-                page.window_height = 940
+                page.window_width = 1040
+                page.window_height = 820
                 if os.path.exists(ico_file) and hasattr(page, "window_icon"):
                     page.window_icon = ico_file
         except Exception:
@@ -1099,7 +2102,7 @@ def launch_flet_gui(col: Collector, mkt_col: MarketCollector, cli_args):
                 "screen": int(state["screen"]),
                 "color": state["color"],
                 "bg": bg,
-                "brt": int(state["brt"]),
+                "brt": int(state.get("current_effective_brt", state["brt"])),
                 "ticker": bool(state["ticker"]),
             }
 
@@ -1112,20 +2115,43 @@ def launch_flet_gui(col: Collector, mkt_col: MarketCollector, cli_args):
                 "brt": state["brt"],
                 "ticker": state["ticker"],
                 "sd_files": state["sd_files"],
+                "sleep_enabled": state["sleep_enabled"],
+                "sleep_timeout_min": state["sleep_timeout_min"],
+                "night_mode_enabled": state["night_mode_enabled"],
+                "night_start_hour": state["night_start_hour"],
+                "night_end_hour": state["night_end_hour"],
+                "night_brightness": state["night_brightness"],
+                "alert_rules": state["alert_rules"],
+                "portfolio": state["portfolio"],
+                "portfolio_pnl_mode": state["portfolio_pnl_mode"],
+                "pomo_work_min": state["pomo_work_min"],
+                "pomo_break_min": state["pomo_break_min"],
+                "pomo_long_min": state["pomo_long_min"],
+                "pomo_buzzer": state["pomo_buzzer"],
+                "media_source_pref": state["media_source_pref"],
+                "media_auto_cover": state["media_auto_cover"],
             })
             save_ui_config(cfg)
+            mkt_col.set_custom_tickers([p.get("ticker", "") for p in state["portfolio"]])
+            portf_pkt, _ = mkt_col.compute_portfolio(state["portfolio"], state["portfolio_pnl_mode"])
             state["ui_dirty"] = True
             while not ui_event_queue.empty():
                 try:
                     ui_event_queue.get_nowait()
                 except Exception:
                     break
-            ui_event_queue.put({"ui": get_ui_dict(), "mkt": mkt_col.get_market_dict()})
+            ui_event_queue.put({
+                "ui": get_ui_dict(),
+                "mkt": mkt_col.get_market_dict(),
+                "portf": portf_pkt,
+                "pomo": pomo_eng.get_payload(),
+                "media": media_col.get_cyd_payload(state["synced_cover_id"]),
+            })
 
         def append_log(msg: str):
             ts = datetime.now().strftime("%H:%M:%S")
             log_lines.append(f"[{ts}] {msg}")
-            if len(log_lines) > 35:
+            if len(log_lines) > 60:
                 del log_lines[0]
             txt_console.value = "\n".join(log_lines)
             try:
@@ -1133,48 +2159,158 @@ def launch_flet_gui(col: Collector, mkt_col: MarketCollector, cli_args):
             except Exception:
                 pass
 
-        # ------------------------ CABECALHO & STATUS USB ---------------------
+        SCREEN_SHORT_NAMES = {
+            0: "Gauges",
+            1: "CPU+RAM",
+            2: "Dual Graph",
+            3: "GPU Focus",
+            4: "4x Graphs",
+            5: "Wallpaper",
+            6: "Mercado",
+            7: "Portfólio",
+            8: "Pomodoro",
+            9: "Mídia",
+        }
+
+        def switch_tab(tab_idx: int):
+            state["active_tab"] = int(tab_idx)
+            refresh_tabs_ui()
+            try:
+                page.update()
+            except Exception:
+                pass
+
+        # ------------------------ CABECALHO COMPACTO + CHIPS GLOBAIS ---------
         lbl_title = ft.Text(
-            "⚡ CYD HARDWARE & MARKET MONITOR",
-            size=22,
+            "⚡ CYD MONITOR v4.0",
+            size=18,
             weight=ft.FontWeight.BOLD,
             color=state["hex_color"],
             font_family="Consolas",
         )
-        lbl_subtitle = ft.Text(
-            "Painel de Controle Total • Hardware + Bolsa de Valores & Cripto em Tempo Real (USB Serial)",
-            size=12,
-            color="#8B95A8",
+        lbl_hdr_screen = ft.Text(
+            f"📺 TELA {state['screen']} • {SCREEN_SHORT_NAMES.get(state['screen'], '')}",
+            size=11,
+            weight=ft.FontWeight.BOLD,
+            color=state["hex_color"],
+            font_family="Consolas",
         )
+        chip_active_screen = ft.Container(
+            content=lbl_hdr_screen,
+            bgcolor="#111827",
+            border=border_all(1, state["hex_color"]),
+            border_radius=16,
+            padding=pad_sym(horizontal=10, vertical=4),
+            ink=True,
+            tooltip="Clique para gerenciar as 10 telas da CYD",
+            on_click=lambda e: switch_tab(0),
+        )
+
+        # Micro-indicador global Pomodoro no Header
+        lbl_hdr_pomo = ft.Text("🍅 25:00", size=11, weight=ft.FontWeight.BOLD, color="#94A3B8", font_family="Consolas")
+        pill_hdr_pomo = ft.Container(
+            content=lbl_hdr_pomo,
+            bgcolor="#111622",
+            border=border_all(1, "#1E293B"),
+            border_radius=16,
+            padding=pad_sym(horizontal=10, vertical=4),
+            ink=True,
+            tooltip="Pomodoro Focus — Clique para abrir Foco & Mídia",
+            on_click=lambda e: switch_tab(1),
+        )
+
+        # Micro-indicador global Spotify / YouTube Music no Header
+        dot_hdr_media = ft.Container(width=8, height=8, border_radius=4, bgcolor="#475569")
+        lbl_hdr_media = ft.Text(
+            "Sem mídia ativa",
+            size=11,
+            weight=ft.FontWeight.W_600,
+            color="#94A3B8",
+            max_lines=1,
+            overflow=ft.TextOverflow.ELLIPSIS,
+            width=165,
+        )
+        btn_hdr_media_pp = ft.IconButton(
+            icon=icon_val("PLAY_ARROW"),
+            icon_size=14,
+            icon_color="#E2E8F0",
+            tooltip="Play / Pause na mídia ativa",
+            width=24,
+            height=24,
+            padding=0,
+            on_click=lambda e: media_col.control("play_pause"),
+        )
+        pill_hdr_media = ft.Container(
+            content=ft.Row(
+                [
+                    ft.Container(
+                        content=ft.Row([dot_hdr_media, lbl_hdr_media], spacing=6, tight=True),
+                        on_click=lambda e: switch_tab(1),
+                    ),
+                    btn_hdr_media_pp,
+                ],
+                spacing=4,
+                tight=True,
+                vertical_alignment=ft.CrossAxisAlignment.CENTER,
+            ),
+            bgcolor="#111622",
+            border=border_all(1, "#1E293B"),
+            border_radius=16,
+            padding=pad_sym(horizontal=10, vertical=2),
+        )
+
+        # Micro-indicador global Brilho / Sleep no Header
+        lbl_hdr_power = ft.Text("☀️ 78%", size=11, weight=ft.FontWeight.W_600, color="#22C55E", font_family="Consolas")
+        pill_hdr_power = ft.Container(
+            content=lbl_hdr_power,
+            bgcolor="#111622",
+            border=border_all(1, "#1E293B"),
+            border_radius=16,
+            padding=pad_sym(horizontal=10, vertical=4),
+            ink=True,
+            tooltip="Brilho Dinâmico & Modo Sleep — Clique para abrir Estúdio & Energia",
+            on_click=lambda e: switch_tab(3),
+        )
+
         status_dot = ft.Container(
-            width=10,
-            height=10,
+            width=9,
+            height=9,
             border_radius=5,
             bgcolor="#F59E0B",
         )
         lbl_usb_status = ft.Text(
-            "Procurando porta USB...",
-            size=12,
+            "USB...",
+            size=11,
             weight=ft.FontWeight.W_600,
             color="#E2E8F0",
             font_family="Consolas",
         )
         status_badge = ft.Container(
-            content=ft.Row([status_dot, lbl_usb_status], spacing=8, tight=True),
+            content=ft.Row([status_dot, lbl_usb_status], spacing=6, tight=True),
             bgcolor="#111622",
             border=border_all(1, "#222B3D"),
             border_radius=20,
-            padding=pad_sym(horizontal=14, vertical=6),
+            padding=pad_sym(horizontal=11, vertical=5),
+            tooltip="Status da Conexão Serial USB (115200 bps)",
         )
 
+        btn_hdr_qr = ft.IconButton(
+            icon=icon_val("QR_CODE_2"),
+            icon_size=18,
+            icon_color="#94A3B8",
+            tooltip="Abrir QR Code Controle pelo Celular (Wi-Fi)",
+            on_click=lambda e: switch_tab(5),
+        )
         btn_minimize = ft.IconButton(
-            icon=ft.Icons.MINIMIZE,
+            icon=icon_val("MINIMIZE"),
+            icon_size=18,
             icon_color="#94A3B8",
             tooltip="Minimizar (continua em segundo plano)",
             on_click=lambda e: minimize_window(),
         )
         btn_quit = ft.IconButton(
-            icon=ft.Icons.POWER_SETTINGS_NEW,
+            icon=icon_val("POWER_SETTINGS_NEW"),
+            icon_size=18,
             icon_color="#EF4444",
             tooltip="Encerrar Agente",
             on_click=lambda e: quit_app(),
@@ -1182,10 +2318,24 @@ def launch_flet_gui(col: Collector, mkt_col: MarketCollector, cli_args):
 
         header_row = ft.Row(
             [
-                ft.Column([lbl_title, lbl_subtitle], spacing=2, expand=True),
-                ft.Row([status_badge, btn_minimize, btn_quit], spacing=6, tight=True),
+                ft.Row([lbl_title, chip_active_screen], spacing=10, vertical_alignment=ft.CrossAxisAlignment.CENTER),
+                ft.Row(
+                    [
+                        pill_hdr_pomo,
+                        pill_hdr_media,
+                        pill_hdr_power,
+                        status_badge,
+                        btn_hdr_qr,
+                        btn_minimize,
+                        btn_quit,
+                    ],
+                    spacing=6,
+                    tight=True,
+                    vertical_alignment=ft.CrossAxisAlignment.CENTER,
+                ),
             ],
             alignment=ft.MainAxisAlignment.SPACE_BETWEEN,
+            vertical_alignment=ft.CrossAxisAlignment.CENTER,
         )
 
         # ---------------- FAIXA DE TELEMETRIA AO VIVO NO PC ------------------
@@ -1224,7 +2374,11 @@ def launch_flet_gui(col: Collector, mkt_col: MarketCollector, cli_args):
         telemetry_row = ft.Row([card_cpu, card_ram, card_gpu, card_dsk], spacing=10)
 
         # ---------------- FAIXA DE MERCADO FINANCEIRO & CRIPTO AO VIVO -------
+        fin_sym_texts = []
+
         def make_fin_pill(symbol: str, init_price: str):
+            sym_t = ft.Text(symbol, size=11, weight=ft.FontWeight.BOLD, color=state["hex_color"])
+            fin_sym_texts.append(sym_t)
             p_txt = ft.Text(init_price, size=14, weight=ft.FontWeight.BOLD, color="#FFFFFF", font_family="Consolas")
             c_txt = ft.Text("0.00%", size=11, weight=ft.FontWeight.BOLD, color="#22C55E", font_family="Consolas")
             pill = ft.Container(
@@ -1232,7 +2386,7 @@ def launch_flet_gui(col: Collector, mkt_col: MarketCollector, cli_args):
                     [
                         ft.Row(
                             [
-                                ft.Text(symbol, size=11, weight=ft.FontWeight.BOLD, color=state["hex_color"]),
+                                sym_t,
                                 c_txt,
                             ],
                             alignment=ft.MainAxisAlignment.SPACE_BETWEEN,
@@ -1256,24 +2410,29 @@ def launch_flet_gui(col: Collector, mkt_col: MarketCollector, cli_args):
         pill_sol, lbl_sol_p, lbl_sol_c = make_fin_pill("◎ SOLANA", "$ --")
         pill_ibov, lbl_ibov_p, lbl_ibov_c = make_fin_pill("📈 IBOV (B3)", "---k pts")
 
+        # Espelho compacto de cotações na Aba 2 (Mercado & Carteira) para ter dados nas duas abas sem conflito de pai
+        m2_usd, lbl_m2_usd_p, lbl_m2_usd_c = make_fin_pill("💵 USD/BRL", "R$ --")
+        m2_eur, lbl_m2_eur_p, lbl_m2_eur_c = make_fin_pill("💶 EUR/BRL", "R$ --")
+        m2_btc, lbl_m2_btc_p, lbl_m2_btc_c = make_fin_pill("₿ BITCOIN", "$ --")
+        m2_eth, lbl_m2_eth_p, lbl_m2_eth_c = make_fin_pill("Ξ ETHEREUM", "$ --")
+        m2_sol, lbl_m2_sol_p, lbl_m2_sol_c = make_fin_pill("◎ SOLANA", "$ --")
+        m2_ibov, lbl_m2_ibov_p, lbl_m2_ibov_c = make_fin_pill("📈 IBOV (B3)", "---k pts")
+
         def on_toggle_ticker(_e):
             state["ticker"] = not state["ticker"]
             new_lbl = (
-                "📟 Letreiro da Bolsa no Rodapé: ATIVO"
+                "📟 Letreiro Rodapé: ATIVO"
                 if state["ticker"]
-                else "📟 Letreiro da Bolsa no Rodapé: OCULTO"
+                else "📟 Letreiro Rodapé: OCULTO"
             )
-            if hasattr(btn_ticker_toggle, "content"):
-                btn_ticker_toggle.content = new_lbl
-            if hasattr(btn_ticker_toggle, "text"):
-                btn_ticker_toggle.text = new_lbl
+            set_btn_text(btn_ticker_toggle, new_lbl)
+            set_btn_text(btn_ticker_quick, new_lbl)
             persist_and_queue_ui()
             append_log(f"Letreiro infinito (Ticker Tape) {'ativado' if state['ticker'] else 'ocultado'} nas telas.")
 
-        btn_ticker_toggle = ft.OutlinedButton(
-            "📟 Letreiro da Bolsa no Rodapé: ATIVO" if state["ticker"] else "📟 Letreiro da Bolsa no Rodapé: OCULTO",
-            on_click=on_toggle_ticker,
-        )
+        init_ticker_lbl = "📟 Letreiro Rodapé: ATIVO" if state["ticker"] else "📟 Letreiro Rodapé: OCULTO"
+        btn_ticker_toggle = ft.OutlinedButton(init_ticker_lbl, on_click=on_toggle_ticker)
+        btn_ticker_quick = ft.OutlinedButton(init_ticker_lbl, on_click=on_toggle_ticker)
 
         lbl_market_status = ft.Text(
             "🟢 Cripto: Ao Vivo (Coinbase / Binance • 3s) • 🟡 B3 & Câmbio: Fechado (Fim de semana)",
@@ -1285,7 +2444,7 @@ def launch_flet_gui(col: Collector, mkt_col: MarketCollector, cli_args):
 
         def on_manual_mkt_refresh(_e):
             def run_refresh():
-                btn_refresh_mkt.text = "⏳ Atualizando..."
+                set_btn_text(btn_refresh_mkt, "⏳ Atualizando...")
                 btn_refresh_mkt.disabled = True
                 try:
                     page.update()
@@ -1295,13 +2454,13 @@ def launch_flet_gui(col: Collector, mkt_col: MarketCollector, cli_args):
                 time.sleep(0.5)
                 m = mkt_col.get_market_dict()
                 append_log(f"Cotações atualizadas: BTC ${m.get('btc', 0):,.0f} | USD R$ {m.get('usd', 0):.2f}")
-                btn_refresh_mkt.text = "✅ Atualizado!"
+                set_btn_text(btn_refresh_mkt, "✅ Atualizado!")
                 try:
                     page.update()
                 except Exception:
                     pass
                 time.sleep(1.2)
-                btn_refresh_mkt.text = "🔄 Atualizar Cotações"
+                set_btn_text(btn_refresh_mkt, "🔄 Atualizar Cotações")
                 btn_refresh_mkt.disabled = False
                 try:
                     page.update()
@@ -1312,6 +2471,34 @@ def launch_flet_gui(col: Collector, mkt_col: MarketCollector, cli_args):
 
         btn_refresh_mkt = ft.OutlinedButton("🔄 Atualizar Cotações", on_click=on_manual_mkt_refresh)
 
+        # Faixa compacta de mercado p/ Aba 0 (Dashboard Home)
+        sec_market_quick = ft.Container(
+            content=ft.Column(
+                [
+                    ft.Row(
+                        [
+                            ft.Text("📊 RESUMO DE MERCADO & LETREIRO INFINITO", size=11, weight=ft.FontWeight.BOLD, color="#94A3B8"),
+                            ft.Row(
+                                [
+                                    btn_ticker_quick,
+                                    ft.OutlinedButton("💼 Abrir Carteira", on_click=lambda e: switch_tab(2)),
+                                ],
+                                spacing=8,
+                            ),
+                        ],
+                        alignment=ft.MainAxisAlignment.SPACE_BETWEEN,
+                    ),
+                    ft.Row([pill_usd, pill_eur, pill_btc, pill_eth, pill_sol, pill_ibov], spacing=8),
+                ],
+                spacing=6,
+            ),
+            bgcolor="#0B0F17",
+            border=border_all(1, "#1A2232"),
+            border_radius=12,
+            padding=10,
+        )
+
+        # Card completo de mercado p/ Aba 2 (Mercado & Carteira)
         sec_market_live = ft.Container(
             content=ft.Column(
                 [
@@ -1320,8 +2507,8 @@ def launch_flet_gui(col: Collector, mkt_col: MarketCollector, cli_args):
                             ft.Column(
                                 [
                                     ft.Text(
-                                        "📊 MERCADO FINANCEIRO & CRIPTO AO VIVO (EXIBIDO NA TELA 6 E NO LETREIRO INFINITO DA TELA PRINCIPAL)",
-                                        size=12,
+                                        "📊 MERCADO FINANCEIRO & CRIPTO AO VIVO (TELA 6)",
+                                        size=13,
                                         weight=ft.FontWeight.BOLD,
                                         color="#94A3B8",
                                     ),
@@ -1333,13 +2520,14 @@ def launch_flet_gui(col: Collector, mkt_col: MarketCollector, cli_args):
                                 [
                                     btn_ticker_toggle,
                                     btn_refresh_mkt,
+                                    ft.OutlinedButton("📺 Exibir Tela 6 na CYD", on_click=lambda e: on_select_screen(6)),
                                 ],
                                 spacing=8,
                             ),
                         ],
                         alignment=ft.MainAxisAlignment.SPACE_BETWEEN,
                     ),
-                    ft.Row([pill_usd, pill_eur, pill_btc, pill_eth, pill_sol, pill_ibov], spacing=8),
+                    ft.Row([m2_usd, m2_eur, m2_btc, m2_eth, m2_sol, m2_ibov], spacing=8),
                 ],
                 spacing=8,
             ),
@@ -1349,23 +2537,27 @@ def launch_flet_gui(col: Collector, mkt_col: MarketCollector, cli_args):
             padding=12,
         )
 
-        # ---------------- 1. GERENCIADOR DE TELAS (GRID INTERATIVO) ----------
+        # ---------------- 1. GERENCIADOR DE TELAS (10 MODOS 0..9) ------------
         screen_defs = [
-            (0, "Tela 0: Resumo Gauges", "Gauges circulares de CPU & RAM + Disco/Rede + Letreiro Bolsa", "SPEED"),
-            (1, "Tela 1: Painel CPU + RAM (Principal)", "Barras + Gráficos de CPU % e RAM % lado a lado + Letreiro Bolsa", "TERMINAL"),
-            (2, "Tela 2: Gráfico Duplo CPU vs RAM", "Curvas de Uso de CPU % + Uso de RAM % juntas + Letreiro Bolsa", "SHOW_CHART"),
-            (3, "Tela 3: GPU Focus", "Gauge Grande de GPU + VRAM + Watts/FPS + Letreiro Bolsa", "VIDEOGAME_ASSET"),
-            (4, "Tela 4: 4x Gráficos", "Grid em tempo real: CPU %, RAM %, GPU % e TEMP °C + Letreiro Bolsa", "GRID_VIEW"),
-            (5, "Tela 5: Wallpaper HUD", "Destaque para a imagem do Cartão SD + Dock CPU/RAM + Letreiro", "WALLPAPER"),
-            (6, "📈 Tela 6: Mercado Financeiro & Bolsa (Cripto + Dólar + Euro + B3)", "Terminal completo: Dólar (USD/BRL), Euro (EUR/BRL), IBOVESPA, Top 5 Cripto (BTC/ETH/SOL/BNB/XRP) + Gráfico Bitcoin 24h", "CURRENCY_BITCOIN"),
+            (0, "⚡ Tela 0: Resumo Gauges", "Gauges circulares de CPU & RAM + Disco/Rede", "SPEED"),
+            (1, "🖥️ Tela 1: CPU + RAM", "Barras duplas + Gráficos CPU % e RAM % lado a lado", "TERMINAL"),
+            (2, "📈 Tela 2: Gráfico Duplo", "Curvas sobrepostas de CPU % + RAM % em tela cheia", "SHOW_CHART"),
+            (3, "🎮 Tela 3: GPU Focus", "Gauge Grande de GPU + VRAM + Watts/FPS", "VIDEOGAME_ASSET"),
+            (4, "📊 Tela 4: 4x Gráficos", "Grid quádruplo: CPU %, RAM %, GPU % e TEMP °C", "GRID_VIEW"),
+            (5, "🖼️ Tela 5: Wallpaper HUD", "Destaque para foto/GIF do SD + Dock CPU/RAM", "WALLPAPER"),
+            (6, "📈 Tela 6: Mercado & Bolsa", "Dólar, Euro, IBOV, Top 5 Cripto + Curva Bitcoin 24h", "CURRENCY_BITCOIN"),
+            (7, "💼 Tela 7: Meu Portfólio", "Patrimônio (R$), Lucro/Prejuízo Dinâmico + Top 3 Ativos", "ACCOUNT_BALANCE_WALLET"),
+            (8, "🍅 Tela 8: Pomodoro Focus", "Cronômetro circular Foco 25m / Pausa 5m + Buzzer no fim", "TIMER"),
+            (9, "🎵 Tela 9: Spotify & YT Music", "Capa 320x240 no SD + Overlay Translúcido Título/Artista", "ALBUM"),
         ]
         screen_cards = []
 
         def on_select_screen(scr_idx: int):
-            state["screen"] = scr_idx
+            state["screen"] = int(scr_idx)
+            lbl_hdr_screen.value = f"📺 TELA {state['screen']} • {SCREEN_SHORT_NAMES.get(state['screen'], '')}"
             refresh_screen_cards()
             persist_and_queue_ui()
-            append_log(f"Tela alterada para {scr_idx}")
+            append_log(f"Tela da CYD alterada para Tela {scr_idx} ({SCREEN_SHORT_NAMES.get(scr_idx, '')})")
 
         def refresh_screen_cards():
             for idx, cont, title_t, badge_t in screen_cards:
@@ -1382,13 +2574,13 @@ def launch_flet_gui(col: Collector, mkt_col: MarketCollector, cli_args):
 
         for idx, title, desc, _ic in screen_defs:
             active = (idx == state["screen"])
-            title_t = ft.Text(title, size=13, weight=ft.FontWeight.BOLD, color=state["hex_color"] if active else "#E2E8F0")
-            desc_t = ft.Text(desc, size=11, color="#8B95A8")
+            title_t = ft.Text(title, size=12, weight=ft.FontWeight.BOLD, color=state["hex_color"] if active else "#E2E8F0")
+            desc_t = ft.Text(desc, size=10, color="#8B95A8", max_lines=2, overflow=ft.TextOverflow.ELLIPSIS)
             badge_t = ft.Container(
-                content=ft.Text(f"TELA {idx}", size=10, weight=ft.FontWeight.BOLD, color="#05070A" if active else "#94A3B8"),
+                content=ft.Text(f"T{idx}", size=10, weight=ft.FontWeight.BOLD, color="#05070A" if active else "#94A3B8"),
                 bgcolor=state["hex_color"] if active else "#1A2234",
                 border_radius=6,
-                padding=pad_sym(horizontal=8, vertical=2),
+                padding=pad_sym(horizontal=7, vertical=2),
             )
             card_cont = ft.Container(
                 content=ft.Column(
@@ -1396,12 +2588,12 @@ def launch_flet_gui(col: Collector, mkt_col: MarketCollector, cli_args):
                         ft.Row([title_t, badge_t], alignment=ft.MainAxisAlignment.SPACE_BETWEEN),
                         desc_t,
                     ],
-                    spacing=4,
+                    spacing=3,
                 ),
                 bgcolor="#162032" if active else "#0F141F",
                 border=border_all(2 if active else 1, state["hex_color"] if active else "#1E2738"),
                 border_radius=10,
-                padding=10,
+                padding=9,
                 ink=True,
                 on_click=lambda e, i=idx: on_select_screen(i),
                 expand=True,
@@ -1410,26 +2602,35 @@ def launch_flet_gui(col: Collector, mkt_col: MarketCollector, cli_args):
 
         screens_grid = ft.Column(
             [
-                ft.Row([screen_cards[0][1], screen_cards[1][1]], spacing=10),
-                ft.Row([screen_cards[2][1], screen_cards[3][1]], spacing=10),
-                ft.Row([screen_cards[4][1], screen_cards[5][1]], spacing=10),
-                ft.Row([screen_cards[6][1]], spacing=10),
+                ft.Text("TELEMETRIA DE HARDWARE (TELAS 0 A 5)", size=10, weight=ft.FontWeight.BOLD, color="#64748B"),
+                ft.Row([screen_cards[0][1], screen_cards[1][1], screen_cards[2][1]], spacing=8),
+                ft.Row([screen_cards[3][1], screen_cards[4][1], screen_cards[5][1]], spacing=8),
+                ft.Divider(height=4, color="#151C28"),
+                ft.Text("MÓDULOS INTELIGENTES v4.0 — FINANÇAS, PRODUTIVIDADE & MULTIMÍDIA (TELAS 6 A 9)", size=10, weight=ft.FontWeight.BOLD, color="#64748B"),
+                ft.Row([screen_cards[6][1], screen_cards[7][1]], spacing=8),
+                ft.Row([screen_cards[8][1], screen_cards[9][1]], spacing=8),
             ],
-            spacing=8,
+            spacing=7,
         )
 
         sec_screens = ft.Container(
             content=ft.Column(
                 [
-                    ft.Text("🖥️ 1. GERENCIADOR DE TELAS DA CYD (TROCA INSTANTÂNEA)", size=13, weight=ft.FontWeight.BOLD, color="#94A3B8"),
+                    ft.Row(
+                        [
+                            ft.Text("🖥️ SELECIONE A TELA ATIVA NA CYD (10 MODOS EM TEMPO REAL)", size=12, weight=ft.FontWeight.BOLD, color="#94A3B8"),
+                            ft.Text("Troca instantânea via USB (< 50ms)", size=11, color="#64748B"),
+                        ],
+                        alignment=ft.MainAxisAlignment.SPACE_BETWEEN,
+                    ),
                     screens_grid,
                 ],
-                spacing=10,
+                spacing=8,
             ),
             bgcolor="#0B0F17",
             border=border_all(1, "#1A2232"),
             border_radius=14,
-            padding=14,
+            padding=12,
         )
 
         # ---------------- 2. ESTÚDIO DE CORES RGB565 (COLOR PICKER) ----------
@@ -1482,9 +2683,22 @@ def launch_flet_gui(col: Collector, mkt_col: MarketCollector, cli_args):
             lbl_rgb565_badge.value = f"RGB565: {state['color']}"
             lbl_rgb565_badge.color = h
             lbl_title.color = h
+            lbl_hdr_screen.color = h
+            chip_active_screen.border = border_all(1, h)
+            for sym_t in fin_sym_texts:
+                sym_t.color = h
             try:
                 sec_mobile_remote.border = border_all(1, h)
                 lbl_mobile_title.color = h
+                prog_upload.color = h
+                prog_media_upload.color = h
+                test_bz_switch.active_color = h
+                sw_sleep.active_color = h
+                sw_night.active_color = h
+                sw_pomo_buzzer.active_color = h
+                sw_media_autosync.active_color = h
+                refresh_portfolio_ui()
+                refresh_tabs_ui()
             except Exception:
                 pass
             bar_cpu.color = h
@@ -1870,18 +3084,1249 @@ def launch_flet_gui(col: Collector, mkt_col: MarketCollector, cli_args):
             spacing=12,
         )
 
-        # ---------------- 4. CONSOLE SERIAL & LOG ----------------------------
+        # ---------------- 5. SISTEMA DE ALERTAS FÍSICOS (BUZZER E LED RGB) ---
+        test_bz_switch = ft.Switch(label="Buzzer", value=True, active_color=state["hex_color"])
+        test_p_dropdown = make_compat_dropdown(
+            label="Padrão",
+            value="3",
+            options=[
+                ft.dropdown.Option("1", "P1: Info (1 Bipe)"),
+                ft.dropdown.Option("2", "P2: Aviso (2 Bipes)"),
+                ft.dropdown.Option("3", "P3: Crítico (3 Bipes)"),
+            ],
+            width=185,
+        )
+
+        def on_click_test_alert(_e):
+            bz = bool(test_bz_switch.value)
+            p_val = int(test_p_dropdown.value or 3)
+            led_col = "0xF800" if p_val == 3 else ("0xFD20" if p_val == 2 else "0x07E0")
+            ui_event_queue.put({"alrt": {"bz": bz, "led": led_col, "p": p_val}})
+            append_log(f"🔔 Teste físico enviado à CYD: Buzzer={'ON' if bz else 'OFF'}, LED={led_col}, Padrão={p_val}")
+
+        btn_test_alert = _Button(
+            "🔔 Testar Alerta na CYD",
+            icon=icon_val("NOTIFICATIONS_ACTIVE"),
+            on_click=on_click_test_alert,
+        )
+
+        # Criador de novos gatilhos: [Ativo/Hardware] [Condição: > ou <] [Valor]
+        dd_new_rule_src = make_compat_dropdown(
+            label="Ativo / Hardware",
+            value="btc",
+            options=[
+                ft.dropdown.Option("cput", "CPU Temp (°C)"),
+                ft.dropdown.Option("gput", "GPU Temp (°C)"),
+                ft.dropdown.Option("cpu", "CPU Uso (%)"),
+                ft.dropdown.Option("ram", "RAM Uso (%)"),
+                ft.dropdown.Option("gpu", "GPU Uso (%)"),
+                ft.dropdown.Option("btc", "Bitcoin (USD)"),
+                ft.dropdown.Option("eth", "Ethereum (USD)"),
+                ft.dropdown.Option("sol", "Solana (USD)"),
+                ft.dropdown.Option("usd", "Dólar (BRL)"),
+                ft.dropdown.Option("ibov", "IBOVESPA (pts)"),
+            ],
+            width=165,
+        )
+        dd_new_rule_op = make_compat_dropdown(
+            label="Cond.",
+            value=">",
+            options=[
+                ft.dropdown.Option(">", "> Maior"),
+                ft.dropdown.Option("<", "< Menor"),
+            ],
+            width=105,
+        )
+        txt_new_rule_val = ft.TextField(
+            label="Valor Alvo",
+            value="100000",
+            width=115,
+            height=46,
+            text_size=12,
+            content_padding=pad_sym(horizontal=10, vertical=6),
+        )
+        sw_new_rule_bz = ft.Switch(label="Buzzer", value=True, active_color="#22C55E")
+        dd_new_rule_p = make_compat_dropdown(
+            label="Alerta",
+            value="2",
+            options=[
+                ft.dropdown.Option("1", "P1 Verde"),
+                ft.dropdown.Option("2", "P2 Laranja"),
+                ft.dropdown.Option("3", "P3 Vermelho"),
+            ],
+            width=125,
+        )
+
+        alert_list_col = ft.Column(spacing=6)
+
+        def rebuild_alert_rows():
+            alert_list_col.controls.clear()
+            for idx_r, r_item in enumerate(state["alert_rules"]):
+                def make_toggle_handler(rule_ref):
+                    def _handler(e):
+                        rule_ref["enabled"] = bool(e.control.value)
+                        persist_and_queue_ui()
+                        append_log(f"Gatilho '{rule_ref['name']}' {'ATIVADO' if rule_ref['enabled'] else 'DESATIVADO'}")
+                    return _handler
+
+                def make_del_handler(rule_idx):
+                    def _del(_e):
+                        if 0 <= rule_idx < len(state["alert_rules"]):
+                            removed = state["alert_rules"].pop(rule_idx)
+                            rebuild_alert_rows()
+                            persist_and_queue_ui()
+                            append_log(f"Gatilho '{removed.get('name', '')}' removido.")
+                            try:
+                                page.update()
+                            except Exception:
+                                pass
+                    return _del
+
+                sw = ft.Switch(
+                    value=r_item.get("enabled", True),
+                    active_color="#22C55E",
+                    on_change=make_toggle_handler(r_item),
+                )
+                src_k = str(r_item.get("source", "")).lower()
+                cond_badge = f"{src_k.upper()} {r_item.get('op', '>')} {r_item.get('val', 0)}"
+                if src_k in ("cput", "gput"):
+                    cond_badge += "°C"
+                elif src_k in ("cpu", "ram", "gpu"):
+                    cond_badge += "%"
+                elif src_k in ("btc", "eth", "sol"):
+                    cond_badge += " USD"
+                elif src_k in ("usd", "eur"):
+                    cond_badge += " BRL"
+
+                btn_del_r = ft.IconButton(
+                    icon=icon_val("DELETE_OUTLINE"),
+                    icon_size=16,
+                    icon_color="#EF4444",
+                    tooltip="Excluir gatilho",
+                    on_click=make_del_handler(idx_r),
+                )
+
+                row_item = ft.Container(
+                    content=ft.Row(
+                        [
+                            ft.Row(
+                                [
+                                    sw,
+                                    ft.Text(r_item.get("name", ""), size=12, weight=ft.FontWeight.W_600, color="#E2E8F0"),
+                                ],
+                                spacing=10,
+                            ),
+                            ft.Row(
+                                [
+                                    ft.Container(
+                                        content=ft.Text(cond_badge, size=11, weight=ft.FontWeight.BOLD, color="#94A3B8"),
+                                        bgcolor="#07090E",
+                                        padding=pad_sym(horizontal=8, vertical=4),
+                                        border_radius=6,
+                                    ),
+                                    ft.Text(
+                                        f"🔊 {'Buzzer' if r_item.get('bz') else 'Mudo'} • 💡 LED {r_item.get('led', '0xF800')} • P{r_item.get('p', 1)}",
+                                        size=11,
+                                        color="#64748B",
+                                    ),
+                                    btn_del_r,
+                                ],
+                                spacing=6,
+                                vertical_alignment=ft.CrossAxisAlignment.CENTER,
+                            ),
+                        ],
+                        alignment=ft.MainAxisAlignment.SPACE_BETWEEN,
+                    ),
+                    bgcolor="#07090E",
+                    border=border_all(1, "#151C28"),
+                    border_radius=8,
+                    padding=pad_sym(horizontal=8, vertical=4),
+                )
+                alert_list_col.controls.append(row_item)
+
+        def on_add_alert_rule(_e):
+            try:
+                src = str(dd_new_rule_src.value or "btc").strip().lower()
+                op = str(dd_new_rule_op.value or ">").strip()
+                val = float(str(txt_new_rule_val.value or "0").replace(",", "."))
+                p_val = int(dd_new_rule_p.value or 2)
+                led_map = {1: "0x07E0", 2: "0xFD20", 3: "0xF800"}
+                new_r = {
+                    "id": f"custom_{src}_{int(time.time())}",
+                    "name": f"Alerta {src.upper()} {op} {val:g}",
+                    "source": src,
+                    "op": op,
+                    "val": val,
+                    "bz": bool(sw_new_rule_bz.value),
+                    "led": led_map.get(p_val, "0xFD20"),
+                    "p": p_val,
+                    "enabled": True,
+                    "cooldown_s": 45.0,
+                }
+                state["alert_rules"].append(new_r)
+                rebuild_alert_rows()
+                persist_and_queue_ui()
+                append_log(f"🔔 Novo gatilho criado: {new_r['name']}")
+                page.update()
+            except Exception as ex:
+                append_log(f"⚠️ Valor inválido ao criar gatilho: {ex}")
+
+        rebuild_alert_rows()
+
+        sec_alerts = ft.Container(
+            content=ft.Column(
+                [
+                    ft.Row(
+                        [
+                            ft.Text("🔔 5. SISTEMA DE ALERTAS FÍSICOS (BUZZER & LED RGB)", size=13, weight=ft.FontWeight.BOLD, color="#94A3B8"),
+                            ft.Text("Módulo 1 • Feedback Físico Não-Bloqueante", size=11, color="#64748B"),
+                        ],
+                        alignment=ft.MainAxisAlignment.SPACE_BETWEEN,
+                    ),
+                    ft.Text("Configure gatilhos de Hardware ou Ativos para acionar o Buzzer e o LED RGB traseiro da CYD:", size=11, color="#8B95A8"),
+                    ft.Row(
+                        [
+                            dd_new_rule_src,
+                            dd_new_rule_op,
+                            txt_new_rule_val,
+                            sw_new_rule_bz,
+                            dd_new_rule_p,
+                            _Button("➕ Criar Gatilho", on_click=on_add_alert_rule),
+                        ],
+                        spacing=8,
+                        wrap=True,
+                        vertical_alignment=ft.CrossAxisAlignment.CENTER,
+                    ),
+                    alert_list_col,
+                    ft.Divider(height=4, color="#151C28"),
+                    ft.Row(
+                        [
+                            test_bz_switch,
+                            test_p_dropdown,
+                            btn_test_alert,
+                        ],
+                        spacing=12,
+                        alignment=ft.MainAxisAlignment.START,
+                        vertical_alignment=ft.CrossAxisAlignment.CENTER,
+                    ),
+                ],
+                spacing=10,
+            ),
+            bgcolor="#0B0F17",
+            border=border_all(1, "#1A2232"),
+            border_radius=14,
+            padding=14,
+        )
+
+        # ---------------- 6. CONTROLE DE BRILHO DINÂMICO & MODO SLEEP --------
+        lbl_power_status = ft.Text("Status: Ativo (Ocioso: 0s)", size=11, color="#22C55E", font_family="Consolas")
+
+        def on_toggle_sleep(e):
+            state["sleep_enabled"] = bool(e.control.value)
+            persist_and_queue_ui()
+            append_log(f"Modo Sleep por Inatividade {'ATIVADO' if state['sleep_enabled'] else 'DESATIVADO'}")
+
+        def on_change_sleep_timeout(_e):
+            state["sleep_timeout_min"] = int(dd_sleep_timeout.value or 15)
+            persist_and_queue_ui()
+            append_log(f"Tempo de inatividade para Sleep ajustado para {state['sleep_timeout_min']} minutos")
+
+        def on_toggle_night(e):
+            state["night_mode_enabled"] = bool(e.control.value)
+            persist_and_queue_ui()
+            append_log(f"Modo Noturno Inteligente {'ATIVADO' if state['night_mode_enabled'] else 'DESATIVADO'}")
+
+        def on_change_night_brt(e):
+            val = int(e.control.value)
+            state["night_brightness"] = val
+            lbl_night_brt_val.value = f"{val} ({int(val * 100 / 255)}%)"
+            persist_and_queue_ui()
+            try:
+                page.update()
+            except Exception:
+                pass
+
+        sw_sleep = ft.Switch(
+            label="Modo Sleep (Desliga display se PC ocioso)",
+            value=state.get("sleep_enabled", True),
+            active_color=state["hex_color"],
+            on_change=on_toggle_sleep,
+        )
+
+        dd_sleep_timeout = make_compat_dropdown(
+            label="Inatividade",
+            value=str(state.get("sleep_timeout_min", 15)),
+            options=[
+                ft.dropdown.Option("5", "5 minutos"),
+                ft.dropdown.Option("10", "10 minutos"),
+                ft.dropdown.Option("15", "15 minutos (Padrão)"),
+                ft.dropdown.Option("30", "30 minutos"),
+                ft.dropdown.Option("60", "1 hora"),
+            ],
+            width=185,
+            on_change=on_change_sleep_timeout,
+        )
+
+        sw_night = ft.Switch(
+            label="Modo Noturno (Atenua entre 22h e 06h)",
+            value=state.get("night_mode_enabled", True),
+            active_color=state["hex_color"],
+            on_change=on_toggle_night,
+        )
+
+        lbl_night_brt_val = ft.Text(
+            f"{state.get('night_brightness', 40)} ({int(state.get('night_brightness', 40) * 100 / 255)}%)",
+            size=11,
+            color="#E2E8F0",
+            font_family="Consolas",
+        )
+
+        slider_night_brt = ft.Slider(
+            min=10,
+            max=120,
+            divisions=11,
+            value=state.get("night_brightness", 40),
+            active_color="#818CF8",
+            on_change=on_change_night_brt,
+            expand=True,
+        )
+
+        sec_sleep = ft.Container(
+            content=ft.Column(
+                [
+                    ft.Row(
+                        [
+                            ft.Text("🌙 6. CONTROLE DE BRILHO DINÂMICO & MODO SLEEP", size=13, weight=ft.FontWeight.BOLD, color="#94A3B8"),
+                            lbl_power_status,
+                        ],
+                        alignment=ft.MainAxisAlignment.SPACE_BETWEEN,
+                    ),
+                    ft.Text("Economia de energia (PWM) com fade suave e conforto visual noturno automático:", size=11, color="#8B95A8"),
+                    ft.Row(
+                        [
+                            sw_sleep,
+                            dd_sleep_timeout,
+                        ],
+                        spacing=16,
+                        alignment=ft.MainAxisAlignment.SPACE_BETWEEN,
+                    ),
+                    ft.Divider(height=4, color="#151C28"),
+                    ft.Row(
+                        [
+                            sw_night,
+                            ft.Row(
+                                [
+                                    ft.Text("Brilho Noturno:", size=11, color="#94A3B8"),
+                                    slider_night_brt,
+                                    lbl_night_brt_val,
+                                ],
+                                spacing=8,
+                                expand=True,
+                            ),
+                        ],
+                        spacing=16,
+                    ),
+                ],
+                spacing=10,
+            ),
+            bgcolor="#0B0F17",
+            border=border_all(1, "#1A2232"),
+            border_radius=14,
+            padding=14,
+        )
+
+        # ---------------- 7. GESTÃO DE PORTFÓLIO DE INVESTIMENTOS (TELA 7) ---
+        lbl_portf_tot = ft.Text("R$ 0,00", size=20, weight=ft.FontWeight.BOLD, color="#F8FAFC", font_family="Consolas")
+        lbl_portf_pnl = ft.Text("+R$ 0,00 (+0.00%)", size=13, weight=ft.FontWeight.BOLD, color="#22C55E", font_family="Consolas")
+        lbl_portf_day = ft.Text("Hoje (24h): +0.00%", size=11, color="#94A3B8", font_family="Consolas")
+
+        txt_pf_ticker = ft.TextField(
+            label="Ticker (ex: BTC, PETR4)",
+            value="",
+            width=155,
+            height=46,
+            text_size=12,
+            content_padding=pad_sym(horizontal=10, vertical=6),
+        )
+        txt_pf_qty = ft.TextField(
+            label="Quantidade",
+            value="",
+            width=125,
+            height=46,
+            text_size=12,
+            content_padding=pad_sym(horizontal=10, vertical=6),
+        )
+        txt_pf_avg = ft.TextField(
+            label="Preço Médio",
+            value="",
+            width=135,
+            height=46,
+            text_size=12,
+            content_padding=pad_sym(horizontal=10, vertical=6),
+        )
+        dd_pf_cur = make_compat_dropdown(
+            label="Moeda PM",
+            value="BRL",
+            options=[
+                ft.dropdown.Option("BRL", "R$ (BRL)"),
+                ft.dropdown.Option("USD", "US$ (USD)"),
+            ],
+            width=120,
+        )
+
+        def on_change_pnl_mode(_e):
+            state["portfolio_pnl_mode"] = str(dd_pf_pnl_mode.value or "hist")
+            refresh_portfolio_ui()
+            persist_and_queue_ui()
+            append_log(f"Modo de PnL na Tela 7 alterado para: {'Diário (24h)' if state['portfolio_pnl_mode'] == 'day' else 'Histórico (vs Preço Médio)'}")
+
+        dd_pf_pnl_mode = make_compat_dropdown(
+            label="PnL na CYD",
+            value=state.get("portfolio_pnl_mode", "hist"),
+            options=[
+                ft.dropdown.Option("hist", "Histórico (PM)"),
+                ft.dropdown.Option("day", "Diário (24h)"),
+            ],
+            width=155,
+            on_change=on_change_pnl_mode,
+        )
+
+        portfolio_rows_col = ft.Column(spacing=6)
+
+        def refresh_portfolio_ui():
+            pf_summary, pf_rows = mkt_col.compute_portfolio(state["portfolio"], state["portfolio_pnl_mode"])
+            tot_v = pf_summary["tot"]
+            pnl_v = pf_summary["pnl_val"]
+            pnl_p = pf_summary["pnl_pct"]
+            day_p = pf_summary["day_pct"]
+
+            lbl_portf_tot.value = f"R$ {tot_v:,.2f}".replace(",", "X").replace(".", ",").replace("X", ".")
+            sign = "+" if pnl_v >= 0 else "-"
+            abs_pnl_str = f"R$ {abs(pnl_v):,.2f}".replace(",", "X").replace(".", ",").replace("X", ".")
+            lbl_portf_pnl.value = f"{sign}{abs_pnl_str} ({'+' if pnl_p >= 0 else ''}{pnl_p:.2f}%)"
+            lbl_portf_pnl.color = "#22C55E" if pnl_v >= 0 else "#EF4444"
+            lbl_portf_day.value = f"Variação 24h: {'+' if day_p >= 0 else ''}{day_p:.2f}%  •  Top 3: {', '.join(pf_summary['top3']) or 'Nenhum'}"
+            lbl_portf_day.color = "#22C55E" if day_p >= 0 else "#F59E0B"
+
+            portfolio_rows_col.controls.clear()
+            if not pf_rows:
+                portfolio_rows_col.controls.append(
+                    ft.Text("Nenhum ativo cadastrado. Adicione acima (ex: BTC, ETH, SOL, PETR4, VALE3, NVDA).", size=11, color="#64748B")
+                )
+                return
+
+            for row_d in pf_rows:
+                sym = row_d["ticker"]
+
+                def make_edit_pf(item_d):
+                    def _edit(_e):
+                        txt_pf_ticker.value = item_d["ticker"]
+                        txt_pf_qty.value = f"{item_d['qty']:g}"
+                        txt_pf_avg.value = f"{item_d['avg_price']:g}"
+                        dd_pf_cur.value = item_d["currency"]
+                        try:
+                            page.update()
+                        except Exception:
+                            pass
+                    return _edit
+
+                def make_del_pf(sym_del):
+                    def _del(_e):
+                        state["portfolio"] = [p for p in state["portfolio"] if str(p.get("ticker", "")).upper() != sym_del]
+                        refresh_portfolio_ui()
+                        persist_and_queue_ui()
+                        append_log(f"💼 Ativo '{sym_del}' removido do portfólio.")
+                        try:
+                            page.update()
+                        except Exception:
+                            pass
+                    return _del
+
+                p_up = row_d["pnl_val"] >= 0
+                pnl_col = "#22C55E" if p_up else "#EF4444"
+                cur_sym_txt = "US$" if row_d["currency"] == "USD" else "R$"
+                pos_str = f"R$ {row_d['pos_val_brl']:,.2f}".replace(",", "X").replace(".", ",").replace("X", ".")
+                pnl_row_str = f"{'+' if p_up else '-'}R$ {abs(row_d['pnl_val']):,.2f} ({'+' if row_d['pnl_pct'] >= 0 else ''}{row_d['pnl_pct']:.2f}%)"
+
+                portfolio_rows_col.controls.append(
+                    ft.Container(
+                        content=ft.Row(
+                            [
+                                ft.Row(
+                                    [
+                                        ft.Container(
+                                            content=ft.Text(sym, size=12, weight=ft.FontWeight.BOLD, color="#05070A"),
+                                            bgcolor=state["hex_color"],
+                                            padding=pad_sym(horizontal=8, vertical=3),
+                                            border_radius=6,
+                                        ),
+                                        ft.Text(
+                                            f"Qtd: {row_d['qty']:g}  •  PM: {cur_sym_txt} {row_d['avg_price']:,.2f}  •  Peso: {row_d['weight_pct']:.1f}%",
+                                            size=11,
+                                            color="#94A3B8",
+                                        ),
+                                    ],
+                                    spacing=10,
+                                ),
+                                ft.Row(
+                                    [
+                                        ft.Text(pos_str, size=12, weight=ft.FontWeight.BOLD, color="#F8FAFC", font_family="Consolas"),
+                                        ft.Container(
+                                            content=ft.Text(pnl_row_str, size=11, weight=ft.FontWeight.BOLD, color=pnl_col, font_family="Consolas"),
+                                            bgcolor="#0B1320",
+                                            padding=pad_sym(horizontal=8, vertical=4),
+                                            border_radius=6,
+                                        ),
+                                        ft.IconButton(
+                                            icon=icon_val("EDIT"),
+                                            icon_size=16,
+                                            icon_color="#38BDF8",
+                                            tooltip="Editar ativo",
+                                            on_click=make_edit_pf(row_d),
+                                        ),
+                                        ft.IconButton(
+                                            icon=icon_val("DELETE_OUTLINE"),
+                                            icon_size=16,
+                                            icon_color="#EF4444",
+                                            tooltip="Remover ativo",
+                                            on_click=make_del_pf(sym),
+                                        ),
+                                    ],
+                                    spacing=6,
+                                    vertical_alignment=ft.CrossAxisAlignment.CENTER,
+                                ),
+                            ],
+                            alignment=ft.MainAxisAlignment.SPACE_BETWEEN,
+                        ),
+                        bgcolor="#07090E",
+                        border=border_all(1, "#151C28"),
+                        border_radius=8,
+                        padding=pad_sym(horizontal=10, vertical=4),
+                    )
+                )
+
+        def on_save_portfolio_asset(_e):
+            sym = (txt_pf_ticker.value or "").strip().upper()
+            if not sym:
+                append_log("⚠️ Informe o Ticker do ativo (ex: BTC, PETR4, ETH, VALE3).")
+                return
+            try:
+                qty = float(str(txt_pf_qty.value or "0").replace(",", "."))
+                avg_p = float(str(txt_pf_avg.value or "0").replace(",", "."))
+            except ValueError:
+                append_log("⚠️ Quantidade ou Preço Médio inválido. Use números (ex: 0.05 ou 36.50).")
+                return
+            if qty <= 0 or avg_p < 0:
+                append_log("⚠️ A quantidade deve ser maior que zero.")
+                return
+
+            cur_v = str(dd_pf_cur.value or "BRL").upper()
+            updated_existing = False
+            for existing in state["portfolio"]:
+                if str(existing.get("ticker", "")).upper() == sym:
+                    existing["qty"] = qty
+                    existing["avg_price"] = avg_p
+                    existing["currency"] = cur_v
+                    updated_existing = True
+                    break
+            if not updated_existing:
+                state["portfolio"].append({
+                    "ticker": sym,
+                    "qty": qty,
+                    "avg_price": avg_p,
+                    "currency": cur_v,
+                })
+
+            txt_pf_ticker.value = ""
+            txt_pf_qty.value = ""
+            txt_pf_avg.value = ""
+            mkt_col.set_custom_tickers([p.get("ticker", "") for p in state["portfolio"]])
+            mkt_col.force_refresh()
+            refresh_portfolio_ui()
+            persist_and_queue_ui()
+            append_log(f"💼 Ativo '{sym}' {'atualizado' if updated_existing else 'adicionado'} no Portfólio (Qtd: {qty:g}, PM: {cur_v} {avg_p:g}).")
+            try:
+                page.update()
+            except Exception:
+                pass
+
+        refresh_portfolio_ui()
+
+        sec_portfolio = ft.Container(
+            content=ft.Column(
+                [
+                    ft.Row(
+                        [
+                            ft.Column(
+                                [
+                                    ft.Text("💼 7. GESTÃO DE PORTFÓLIO DE INVESTIMENTOS (TELA 7)", size=13, weight=ft.FontWeight.BOLD, color="#94A3B8"),
+                                    ft.Text("Patrimônio pessoal em tempo real com suporte a Cripto, Câmbio, B3 (PETR4, VALE3) e EUA:", size=11, color="#8B95A8"),
+                                ],
+                                spacing=2,
+                            ),
+                            ft.Row(
+                                [
+                                    dd_pf_pnl_mode,
+                                    ft.OutlinedButton("📺 Abrir Tela 7 na CYD", on_click=lambda e: on_select_screen(7)),
+                                ],
+                                spacing=8,
+                            ),
+                        ],
+                        alignment=ft.MainAxisAlignment.SPACE_BETWEEN,
+                    ),
+                    ft.Container(
+                        content=ft.Row(
+                            [
+                                ft.Column(
+                                    [
+                                        ft.Text("PATRIMÔNIO CONSOLIDADO", size=10, weight=ft.FontWeight.BOLD, color="#64748B"),
+                                        lbl_portf_tot,
+                                    ],
+                                    spacing=2,
+                                ),
+                                ft.Column(
+                                    [
+                                        ft.Text("RESULTADO (LUCRO / PREJUÍZO)", size=10, weight=ft.FontWeight.BOLD, color="#64748B"),
+                                        lbl_portf_pnl,
+                                        lbl_portf_day,
+                                    ],
+                                    spacing=2,
+                                    horizontal_alignment=ft.CrossAxisAlignment.END,
+                                ),
+                            ],
+                            alignment=ft.MainAxisAlignment.SPACE_BETWEEN,
+                        ),
+                        bgcolor="#07090E",
+                        border=border_all(1, "#1E293B"),
+                        border_radius=10,
+                        padding=12,
+                    ),
+                    ft.Row(
+                        [
+                            txt_pf_ticker,
+                            txt_pf_qty,
+                            txt_pf_avg,
+                            dd_pf_cur,
+                            _Button("💾 Salvar Ativo", icon=icon_val("SAVE"), on_click=on_save_portfolio_asset),
+                        ],
+                        spacing=8,
+                        wrap=True,
+                        vertical_alignment=ft.CrossAxisAlignment.CENTER,
+                    ),
+                    portfolio_rows_col,
+                ],
+                spacing=10,
+            ),
+            bgcolor="#0B0F17",
+            border=border_all(1, "#1A2232"),
+            border_radius=14,
+            padding=14,
+        )
+
+        # ---------------- 8. MÓDULO 3: PRODUTIVIDADE & MULTIMÍDIA (TELAS 8 E 9)
+        prog_media_upload = ft.ProgressBar(value=0.0, visible=False, color=state["hex_color"], bgcolor="#1A2130", height=6)
+        lbl_media_sync_status = ft.Text(
+            "Pronto para sincronizar capas 320x240 automaticamente no Cartão SD.",
+            size=11,
+            color="#94A3B8",
+        )
+
+        def start_media_cover_transfer(cid: str, cyd_bytes: bytes, manual: bool = False):
+            if not cyd_bytes or upload_state["active"]:
+                return
+            upload_state["active"] = True
+
+            def _cov_worker():
+                target_name = "_media_cov.jpg"
+                upload_state["pct"] = 0.0
+                upload_state["status"] = "Sincronizando capa do álbum no SD..."
+                upload_state["target"] = target_name
+                prog_media_upload.visible = True
+                prog_media_upload.value = 0.0
+                lbl_media_sync_status.value = f"⏳ Conectando ao SD p/ gravar capa ({len(cyd_bytes)/1024:.1f} KB)..."
+                lbl_media_sync_status.color = "#38BDF8"
+                try:
+                    page.update()
+                except Exception:
+                    pass
+
+                def _wait_ack(expected_prefix: str, timeout: float = 4.0):
+                    t0 = time.time()
+                    while time.time() - t0 < timeout:
+                        if ack_event.wait(timeout=0.06):
+                            ack_event.clear()
+                            val = last_ack.get("val") or ""
+                            if val.startswith("ERR_NO_SD"):
+                                return False, "ERR_NO_SD"
+                            if val.startswith("ERR_OPEN"):
+                                return False, "ERR_OPEN"
+                            if val.startswith(expected_prefix):
+                                return True, val
+                    return False, "TIMEOUT"
+
+                ack_event.clear()
+                transfer_queue.put({"file_name": f"/{target_name}", "file_mode": "w"})
+                ok, resp = _wait_ack("ACK_START", timeout=4.0)
+                if not ok:
+                    upload_state["active"] = False
+                    prog_media_upload.visible = False
+                    if resp == "ERR_NO_SD":
+                        lbl_media_sync_status.value = "⚠️ Cartão SD ausente na CYD — exibindo player vetorial sem capa."
+                        lbl_media_sync_status.color = "#F59E0B"
+                        if not state["sd_missing_warned"] or manual:
+                            state["sd_missing_warned"] = True
+                            append_log("🎵 Player de Mídia: Cartão SD não detectado na CYD (usando visualizador estúdio).")
+                        # Marca cid para não ficar tentando reenviar em loop sem SD inserido
+                        state["synced_cover_id"] = cid
+                    else:
+                        lbl_media_sync_status.value = f"⚠️ Aguardando conexão estável da CYD ({resp})."
+                        lbl_media_sync_status.color = "#F59E0B"
+                    try:
+                        page.update()
+                    except Exception:
+                        pass
+                    return
+
+                chunk_size = 512
+                total = len(cyd_bytes)
+                seq = 0
+                for i in range(0, total, chunk_size):
+                    chunk = cyd_bytes[i:i + chunk_size]
+                    b64 = base64.b64encode(chunk).decode("ascii")
+                    ack_event.clear()
+                    transfer_queue.put({
+                        "file_name": f"/{target_name}",
+                        "file_mode": "a",
+                        "seq": seq,
+                        "file_data": b64,
+                    })
+                    ok, resp = _wait_ack("ACK_CHUNK", timeout=3.2)
+                    if not ok:
+                        upload_state["active"] = False
+                        prog_media_upload.visible = False
+                        lbl_media_sync_status.value = f"❌ Falha ao transmitir bloco {seq} da capa ({resp})."
+                        lbl_media_sync_status.color = "#EF4444"
+                        try:
+                            page.update()
+                        except Exception:
+                            pass
+                        return
+                    seq += 1
+                    pct = min((i + len(chunk)) / float(total), 1.0)
+                    upload_state["pct"] = pct
+                    prog_media_upload.value = pct
+                    lbl_media_sync_status.value = f"⏳ Gravando capa no SD da CYD ({int(pct * 100)}%)..."
+
+                ack_event.clear()
+                transfer_queue.put({
+                    "file_name": f"/{target_name}",
+                    "file_mode": "eof",
+                    "is_cover": True,
+                    "cid": cid,
+                })
+                ok, resp = _wait_ack("ACK_EOF", timeout=4.5)
+                upload_state["active"] = False
+                prog_media_upload.visible = False
+
+                if ok:
+                    state["synced_cover_id"] = cid
+                    state["sd_missing_warned"] = False
+                    lbl_media_sync_status.value = f"✅ Capa 320x240 sincronizada no Cartão SD (ID #{cid})"
+                    lbl_media_sync_status.color = "#22C55E"
+                    ui_event_queue.put({"media": media_col.get_cyd_payload(cid)})
+                    append_log(f"🎵 Capa do álbum sincronizada no SD da CYD (_media_cov.jpg • {len(cyd_bytes)/1024:.1f} KB)")
+                else:
+                    lbl_media_sync_status.value = f"⚠️ Falha ao finalizar capa no SD ({resp})."
+                    lbl_media_sync_status.color = "#F59E0B"
+                try:
+                    page.update()
+                except Exception:
+                    pass
+
+            threading.Thread(target=_cov_worker, daemon=True).start()
+
+        # ---- Controles Pomodoro (Coluna Esquerda da Aba 1) ----
+        lbl_pomo_clock = ft.Text("25:00", size=46, weight=ft.FontWeight.BOLD, color="#FFFFFF", font_family="Consolas")
+        lbl_pomo_phase_badge = ft.Text("🔥 FOCO PROFUNDO (TRABALHO)", size=12, weight=ft.FontWeight.BOLD, color="#F97316")
+        bar_pomo_prog = ft.ProgressBar(value=0.0, color="#F97316", bgcolor="#1A2130", height=8, border_radius=4)
+        lbl_pomo_cycles = ft.Text("Ciclos hoje: #0  •  ⚪ ⚪ ⚪ ⚪  •  Total focado: 0 min", size=11, color="#94A3B8", font_family="Consolas")
+
+        def on_pomo_toggle(_e=None):
+            running = pomo_eng.toggle()
+            refresh_focus_media_ui()
+            ui_event_queue.put({"pomo": pomo_eng.get_payload()})
+            append_log(f"🍅 Pomodoro {'INICIADO' if running else 'PAUSADO'} ({pomo_eng.state})")
+            try:
+                page.update()
+            except Exception:
+                pass
+
+        def on_pomo_reset(_e=None):
+            pomo_eng.reset()
+            refresh_focus_media_ui()
+            ui_event_queue.put({"pomo": pomo_eng.get_payload()})
+            append_log("🍅 Timer Pomodoro resetado.")
+            try:
+                page.update()
+            except Exception:
+                pass
+
+        def on_pomo_skip(_e=None):
+            nxt = pomo_eng.skip()
+            refresh_focus_media_ui()
+            ui_event_queue.put({"pomo": pomo_eng.get_payload()})
+            append_log(f"🍅 Fase Pomodoro avançada manualmente para {nxt}.")
+            try:
+                page.update()
+            except Exception:
+                pass
+
+        def on_pomo_select_phase(ph: str):
+            pomo_eng.set_phase(ph)
+            refresh_focus_media_ui()
+            ui_event_queue.put({"pomo": pomo_eng.get_payload()})
+            append_log(f"🍅 Modo Pomodoro selecionado: {ph}")
+            try:
+                page.update()
+            except Exception:
+                pass
+
+        btn_pomo_start = _Button("▶ Iniciar Foco", icon=icon_val("PLAY_ARROW"), on_click=on_pomo_toggle)
+        btn_pomo_reset = ft.OutlinedButton("↺ Resetar", on_click=on_pomo_reset)
+        btn_pomo_skip = ft.OutlinedButton("⏭ Pular", on_click=on_pomo_skip)
+
+        txt_pomo_w = ft.TextField(label="Foco (m)", value=str(state["pomo_work_min"]), width=82, height=44, text_size=12, content_padding=pad_sym(8, 6))
+        txt_pomo_b = ft.TextField(label="Curta (m)", value=str(state["pomo_break_min"]), width=82, height=44, text_size=12, content_padding=pad_sym(8, 6))
+        txt_pomo_l = ft.TextField(label="Longa (m)", value=str(state["pomo_long_min"]), width=82, height=44, text_size=12, content_padding=pad_sym(8, 6))
+
+        def on_save_pomo_times(_e):
+            try:
+                wm = max(1, min(120, int(txt_pomo_w.value or 25)))
+                bm = max(1, min(60, int(txt_pomo_b.value or 5)))
+                lm = max(1, min(90, int(txt_pomo_l.value or 15)))
+                state["pomo_work_min"] = wm
+                state["pomo_break_min"] = bm
+                state["pomo_long_min"] = lm
+                pomo_eng.set_durations(wm, bm, lm)
+                refresh_focus_media_ui()
+                persist_and_queue_ui()
+                append_log(f"🍅 Tempos Pomodoro salvos: Foco {wm}m / Curta {bm}m / Longa {lm}m.")
+                page.update()
+            except Exception as ex:
+                append_log(f"⚠️ Valor inválido nos minutos do Pomodoro: {ex}")
+
+        def on_toggle_pomo_bz(e):
+            val = bool(e.control.value)
+            state["pomo_buzzer"] = val
+            pomo_eng.buzzer_enabled = val
+            persist_and_queue_ui()
+            append_log(f"🍅 Alerta sonoro (Buzzer) no fim do ciclo Pomodoro: {'ATIVADO' if val else 'DESATIVADO'}")
+
+        sw_pomo_buzzer = ft.Switch(
+            label="🔔 Acionar Buzzer & LED RGB da CYD ao concluir cada ciclo",
+            value=state["pomo_buzzer"],
+            active_color=state["hex_color"],
+            on_change=on_toggle_pomo_bz,
+        )
+
+        def make_phase_pill(code: str, label: str, col_hex: str):
+            return ft.Container(
+                content=ft.Text(label, size=11, weight=ft.FontWeight.BOLD, color=col_hex),
+                bgcolor="#111827",
+                border=border_all(1, col_hex),
+                border_radius=8,
+                padding=pad_sym(horizontal=10, vertical=5),
+                ink=True,
+                on_click=lambda e, c=code: on_pomo_select_phase(c),
+            )
+
+        sec_pomodoro = ft.Container(
+            content=ft.Column(
+                [
+                    ft.Row(
+                        [
+                            ft.Text("🍅 POMODORO FOCUS HUB (TELA 8)", size=13, weight=ft.FontWeight.BOLD, color="#94A3B8"),
+                            ft.OutlinedButton("📺 Exibir Tela 8 na CYD", on_click=lambda e: on_select_screen(8)),
+                        ],
+                        alignment=ft.MainAxisAlignment.SPACE_BETWEEN,
+                    ),
+                    ft.Row(
+                        [
+                            make_phase_pill("WORK", "🔥 Trabalho", "#F97316"),
+                            make_phase_pill("BREAK", "☕ Pausa Curta", "#22C55E"),
+                            make_phase_pill("LONG", "🌴 Pausa Longa", "#38BDF8"),
+                        ],
+                        spacing=8,
+                    ),
+                    ft.Container(
+                        content=ft.Column(
+                            [
+                                lbl_pomo_phase_badge,
+                                lbl_pomo_clock,
+                                bar_pomo_prog,
+                                lbl_pomo_cycles,
+                            ],
+                            horizontal_alignment=ft.CrossAxisAlignment.CENTER,
+                            spacing=6,
+                        ),
+                        bgcolor="#07090E",
+                        border=border_all(1, "#1E293B"),
+                        border_radius=12,
+                        padding=14,
+                        width=float("inf"),
+                    ),
+                    ft.Row(
+                        [btn_pomo_start, btn_pomo_reset, btn_pomo_skip],
+                        alignment=ft.MainAxisAlignment.CENTER,
+                        spacing=10,
+                    ),
+                    ft.Divider(height=4, color="#151C28"),
+                    ft.Row(
+                        [
+                            txt_pomo_w,
+                            txt_pomo_b,
+                            txt_pomo_l,
+                            ft.OutlinedButton("💾 Salvar Minutos", on_click=on_save_pomo_times),
+                        ],
+                        spacing=8,
+                        wrap=True,
+                        vertical_alignment=ft.CrossAxisAlignment.CENTER,
+                    ),
+                    sw_pomo_buzzer,
+                ],
+                spacing=10,
+            ),
+            bgcolor="#0B0F17",
+            border=border_all(1, "#1A2232"),
+            border_radius=14,
+            padding=14,
+            expand=5,
+        )
+
+        # ---- Controles Multimídia Spotify & YouTube Music (Coluna Direita da Aba 1) ----
+        lbl_media_src_pill = ft.Text("⚪ AGUARDANDO PLAYER", size=10, weight=ft.FontWeight.BOLD, color="#94A3B8")
+        cont_media_src_pill = ft.Container(
+            content=lbl_media_src_pill,
+            bgcolor="#141B29",
+            border=border_all(1, "#334155"),
+            border_radius=12,
+            padding=pad_sym(horizontal=10, vertical=4),
+        )
+
+        cover_placeholder_icon = ft.Icon(icon_val("ALBUM"), size=46, color="#475569")
+        cover_preview_box = ft.Container(
+            content=cover_placeholder_icon,
+            width=114,
+            height=114,
+            bgcolor="#07090E",
+            border=border_all(1, "#1E293B"),
+            border_radius=12,
+            alignment=ft.Alignment(0, 0) if hasattr(ft, "Alignment") else None,
+        )
+        last_rendered_ui_cov = {"cid": ""}
+
+        lbl_media_title = ft.Text(
+            "Abra o Spotify ou YouTube Music",
+            size=16,
+            weight=ft.FontWeight.BOLD,
+            color="#FFFFFF",
+            max_lines=1,
+            overflow=ft.TextOverflow.ELLIPSIS,
+        )
+        lbl_media_artist = ft.Text(
+            "Reproduza uma música no Desktop ou Navegador",
+            size=13,
+            color="#CBD5E1",
+            max_lines=1,
+            overflow=ft.TextOverflow.ELLIPSIS,
+        )
+        lbl_media_album = ft.Text(
+            "Integração Windows GSMTC (winrt) ativa",
+            size=11,
+            color="#64748B",
+            max_lines=1,
+            overflow=ft.TextOverflow.ELLIPSIS,
+        )
+        bar_media_pos = ft.ProgressBar(value=0.0, color="#1DB954", bgcolor="#1A2130", height=6, border_radius=3)
+        lbl_media_time = ft.Text("00:00 / 00:00", size=11, color="#94A3B8", font_family="Consolas")
+
+        btn_media_prev = ft.OutlinedButton("⏮ Anterior", on_click=lambda e: media_col.control("prev"))
+        btn_media_pp = _Button("⏯ Play / Pause", on_click=lambda e: media_col.control("play_pause"))
+        btn_media_next = ft.OutlinedButton("⏭ Próxima", on_click=lambda e: media_col.control("next"))
+
+        def on_change_media_pref(_e):
+            pref = str(dd_media_pref.value or "auto")
+            state["media_source_pref"] = pref
+            media_col.set_source_pref(pref)
+            persist_and_queue_ui()
+            append_log(f"🎵 Filtro de fonte multimídia alterado para: {pref.upper()}")
+
+        dd_media_pref = make_compat_dropdown(
+            label="Fonte Preferida (Spotify / YouTube Music)",
+            value=state["media_source_pref"],
+            options=[
+                ft.dropdown.Option("auto", "Automático (Priorizar Spotify & YouTube Music)"),
+                ft.dropdown.Option("spotify", "Apenas Spotify (App / Web)"),
+                ft.dropdown.Option("ytmusic", "Apenas YouTube Music (Web / PWA / App)"),
+                ft.dropdown.Option("all", "Qualquer Mídia do Windows"),
+            ],
+            expand=True,
+            on_change=on_change_media_pref,
+        )
+
+        def on_toggle_media_autosync(e):
+            state["media_auto_cover"] = bool(e.control.value)
+            persist_and_queue_ui()
+            append_log(f"🎵 Envio automático de capa 320x240 para o SD: {'ATIVADO' if state['media_auto_cover'] else 'DESATIVADO'}")
+
+        sw_media_autosync = ft.Switch(
+            label="🖼️ Sincronizar capa 320x240 no SD automaticamente ao trocar de faixa",
+            value=state["media_auto_cover"],
+            active_color=state["hex_color"],
+            on_change=on_toggle_media_autosync,
+        )
+
+        def on_manual_cover_sync(_e):
+            _tk, cid, c_bytes = media_col.get_cover_for_sd()
+            if not c_bytes:
+                append_log("⚠️ Nenhuma capa de álbum disponível na faixa atual para enviar.")
+                return
+            state["synced_cover_id"] = ""
+            start_media_cover_transfer(cid or "manual", c_bytes, manual=True)
+
+        sec_media = ft.Container(
+            content=ft.Column(
+                [
+                    ft.Row(
+                        [
+                            ft.Row(
+                                [
+                                    ft.Text("🎵 MULTIMÍDIA: SPOTIFY & YT MUSIC (TELA 9)", size=13, weight=ft.FontWeight.BOLD, color="#94A3B8"),
+                                    cont_media_src_pill,
+                                ],
+                                spacing=8,
+                                vertical_alignment=ft.CrossAxisAlignment.CENTER,
+                            ),
+                            ft.OutlinedButton("📺 Exibir Tela 9 na CYD", on_click=lambda e: on_select_screen(9)),
+                        ],
+                        alignment=ft.MainAxisAlignment.SPACE_BETWEEN,
+                    ),
+                    ft.Container(
+                        content=ft.Row(
+                            [
+                                cover_preview_box,
+                                ft.Column(
+                                    [
+                                        lbl_media_title,
+                                        lbl_media_artist,
+                                        lbl_media_album,
+                                        bar_media_pos,
+                                        ft.Row([lbl_media_time], alignment=ft.MainAxisAlignment.END),
+                                    ],
+                                    spacing=4,
+                                    expand=True,
+                                ),
+                            ],
+                            spacing=14,
+                            vertical_alignment=ft.CrossAxisAlignment.CENTER,
+                        ),
+                        bgcolor="#07090E",
+                        border=border_all(1, "#1E293B"),
+                        border_radius=12,
+                        padding=12,
+                    ),
+                    ft.Row(
+                        [btn_media_prev, btn_media_pp, btn_media_next],
+                        alignment=ft.MainAxisAlignment.CENTER,
+                        spacing=12,
+                    ),
+                    dd_media_pref,
+                    ft.Container(
+                        content=ft.Column(
+                            [
+                                sw_media_autosync,
+                                ft.Row(
+                                    [
+                                        ft.OutlinedButton(
+                                            "📤 Reenviar Capa 320x240 p/ SD Agora",
+                                            icon=icon_val("IMAGE"),
+                                            on_click=on_manual_cover_sync,
+                                        ),
+                                        ft.Container(content=lbl_media_sync_status, expand=True),
+                                    ],
+                                    spacing=10,
+                                    vertical_alignment=ft.CrossAxisAlignment.CENTER,
+                                ),
+                                prog_media_upload,
+                            ],
+                            spacing=6,
+                        ),
+                        bgcolor="#07090E",
+                        border=border_all(1, "#151C28"),
+                        border_radius=10,
+                        padding=10,
+                    ),
+                ],
+                spacing=10,
+            ),
+            bgcolor="#0B0F17",
+            border=border_all(1, "#1A2232"),
+            border_radius=14,
+            padding=14,
+            expand=6,
+        )
+
+        def refresh_focus_media_ui():
+            # 1) Atualiza UI Pomodoro + Chip no Header
+            ps = pomo_eng.get_ui_snapshot()
+            mm, ss = ps["rem"] // 60, ps["rem"] % 60
+            clock_str = f"{mm:02d}:{ss:02d}"
+            lbl_pomo_clock.value = clock_str
+            bar_pomo_prog.value = ps["pct"]
+
+            ph_col = "#F97316" if ps["state"] == "WORK" else ("#22C55E" if ps["state"] == "BREAK" else "#38BDF8")
+            ph_name = (
+                "🔥 FOCO PROFUNDO (TRABALHO)"
+                if ps["state"] == "WORK"
+                else ("☕ PAUSA CURTA (DESCANSO)" if ps["state"] == "BREAK" else "🌴 PAUSA LONGA (15 MIN)")
+            )
+            lbl_pomo_phase_badge.value = ph_name if ps["running"] else f"⏸ PAUSADO • {ph_name}"
+            lbl_pomo_phase_badge.color = ph_col
+            bar_pomo_prog.color = ph_col
+
+            mod_c = ps["cycles"] % 4
+            dots = " ".join("🍅" if i < mod_c else "⚪" for i in range(4))
+            lbl_pomo_cycles.value = f"Ciclos: #{ps['cycles']}  •  {dots}  •  Foco hoje: {ps['focus_min_today']} min"
+            set_btn_text(btn_pomo_start, "⏸ Pausar Timer" if ps["running"] else "▶ Iniciar Timer")
+
+            if ps["running"]:
+                short_ph = "FOCO" if ps["state"] == "WORK" else "PAUSA"
+                lbl_hdr_pomo.value = f"🍅 {short_ph} {clock_str} • #{ps['cycles']}"
+                lbl_hdr_pomo.color = ph_col
+                pill_hdr_pomo.border = border_all(1.2, ph_col)
+                pill_hdr_pomo.bgcolor = "#162032"
+            else:
+                lbl_hdr_pomo.value = f"🍅 {clock_str}"
+                lbl_hdr_pomo.color = "#94A3B8"
+                pill_hdr_pomo.border = border_all(1, "#1E293B")
+                pill_hdr_pomo.bgcolor = "#111622"
+
+            # 2) Atualiza UI Multimídia (Spotify / YouTube Music) + Chip no Header
+            ms = media_col.get_ui_snapshot()
+            src = ms["source"]
+            if src == "SPOTIFY":
+                src_col = "#1DB954"
+                lbl_media_src_pill.value = "🟢 SPOTIFY"
+                cont_media_src_pill.bgcolor = "#0F291A"
+                cont_media_src_pill.border = border_all(1, src_col)
+            elif src == "YT MUSIC":
+                src_col = "#FF0033"
+                lbl_media_src_pill.value = "🔴 YOUTUBE MUSIC"
+                cont_media_src_pill.bgcolor = "#2B1118"
+                cont_media_src_pill.border = border_all(1, src_col)
+            elif src == "MEDIA":
+                src_col = state["hex_color"]
+                lbl_media_src_pill.value = "🔵 WINDOWS MEDIA"
+                cont_media_src_pill.bgcolor = "#141E30"
+                cont_media_src_pill.border = border_all(1, src_col)
+            else:
+                src_col = "#64748B"
+                lbl_media_src_pill.value = "⚪ AGUARDANDO PLAYER"
+                cont_media_src_pill.bgcolor = "#141B29"
+                cont_media_src_pill.border = border_all(1, "#334155")
+
+            lbl_media_src_pill.color = src_col
+            bar_media_pos.color = src_col if src != "NONE" else "#475569"
+
+            if src != "NONE" and (ms["title"] or ms["artist"]):
+                lbl_media_title.value = ms["title"] or "Faixa Desconhecida"
+                lbl_media_artist.value = ms["artist"] or src
+                lbl_media_album.value = ms["album"] if ms["album"] else f"Reproduzindo via {src}"
+                dur_s = max(0, int(ms["dur"]))
+                pos_s = max(0, int(ms["pos"]))
+                bar_media_pos.value = min(1.0, pos_s / float(dur_s)) if dur_s > 0 else 0.0
+                if dur_s > 0:
+                    lbl_media_time.value = f"{pos_s // 60:02d}:{pos_s % 60:02d} / {dur_s // 60:02d}:{dur_s % 60:02d}"
+                else:
+                    lbl_media_time.value = f"{pos_s // 60:02d}:{pos_s % 60:02d} / AO VIVO"
+                set_btn_text(btn_media_pp, "⏸ Pausar" if ms["playing"] else "▶ Reproduzir")
+
+                # Header Mini-Player
+                dot_hdr_media.bgcolor = src_col
+                hdr_txt = f"{ms['artist']} — {ms['title']}" if ms["artist"] else ms["title"]
+                lbl_hdr_media.value = hdr_txt
+                lbl_hdr_media.color = "#F8FAFC" if ms["playing"] else "#94A3B8"
+                btn_hdr_media_pp.icon = icon_val("PAUSE" if ms["playing"] else "PLAY_ARROW")
+                pill_hdr_media.border = border_all(1, src_col if ms["playing"] else "#1E293B")
+            else:
+                lbl_media_title.value = "Abra o Spotify ou YouTube Music"
+                lbl_media_artist.value = "Nenhuma sessão de mídia ativa no momento"
+                lbl_media_album.value = "Suporte a Spotify Desktop/Web e YouTube Music"
+                bar_media_pos.value = 0.0
+                lbl_media_time.value = "00:00 / 00:00"
+                dot_hdr_media.bgcolor = "#475569"
+                lbl_hdr_media.value = "Sem mídia ativa"
+                lbl_hdr_media.color = "#64748B"
+                btn_hdr_media_pp.icon = icon_val("PLAY_ARROW")
+                pill_hdr_media.border = border_all(1, "#1E293B")
+
+            # Atualiza preview da capa no Flet somente quando o hash cid mudar
+            if ms["cover_b64"] and ms["cover_id"] != last_rendered_ui_cov["cid"]:
+                last_rendered_ui_cov["cid"] = ms["cover_id"]
+                cover_preview_box.content = ft.Image(
+                    src=f"data:image/jpeg;base64,{ms['cover_b64']}",
+                    width=114,
+                    height=114,
+                    fit=ft.BoxFit.COVER if hasattr(ft, "BoxFit") else "cover",
+                    border_radius=11,
+                    gapless_playback=True,
+                )
+            elif not ms["cover_b64"] and last_rendered_ui_cov["cid"] != "":
+                last_rendered_ui_cov["cid"] = ""
+                cover_preview_box.content = cover_placeholder_icon
+
+        refresh_focus_media_ui()
+
+        # ---------------- CONSOLE SERIAL & LOG (COM COPIAR E LIMPAR) ---------
         txt_console = ft.Text(
-            value="Inicializando agente de telemetria, mercado financeiro e comunicação USB Serial...",
+            value="Inicializando agente v4.0 (Telemetria, Mercado, Portfólio, Pomodoro & Spotify/YouTube Music)...",
             size=11,
             color="#94A3B8",
             font_family="Consolas",
             selectable=True,
         )
+
+        def on_copy_logs(_e):
+            try:
+                if IS_WINDOWS and txt_console.value:
+                    subprocess.run(["clip"], input=txt_console.value.encode("utf-16le"), check=False)
+            except Exception:
+                pass
+
+        def on_clear_logs(_e):
+            log_lines.clear()
+            txt_console.value = "Console limpo."
+            try:
+                page.update()
+            except Exception:
+                pass
+
         sec_console = ft.Container(
             content=ft.Column(
                 [
-                    ft.Text("📡 CONSOLE SERIAL & TELEMETRIA EM TEMPO REAL", size=12, weight=ft.FontWeight.BOLD, color="#94A3B8"),
+                    ft.Row(
+                        [
+                            ft.Text("📡 CONSOLE SERIAL & DIAGNÓSTICO EM TEMPO REAL", size=12, weight=ft.FontWeight.BOLD, color="#94A3B8"),
+                            ft.Row(
+                                [
+                                    ft.OutlinedButton("📋 Copiar Log", on_click=on_copy_logs),
+                                    ft.OutlinedButton("🗑️ Limpar", on_click=on_clear_logs),
+                                ],
+                                spacing=8,
+                            ),
+                        ],
+                        alignment=ft.MainAxisAlignment.SPACE_BETWEEN,
+                    ),
                     ft.Container(
                         content=txt_console,
                         bgcolor="#05070B",
@@ -1891,7 +4336,7 @@ def launch_flet_gui(col: Collector, mkt_col: MarketCollector, cli_args):
                         width=float("inf"),
                     ),
                 ],
-                spacing=6,
+                spacing=8,
             ),
             bgcolor="#0B0F17",
             border=border_all(1, "#1A2232"),
@@ -1899,7 +4344,7 @@ def launch_flet_gui(col: Collector, mkt_col: MarketCollector, cli_args):
             padding=12,
         )
 
-        # ---------------- 4. SERVIDOR WEB / REST API MOBILE (WI-FI) ----------
+        # ---------------- SERVIDOR WEB / REST API MOBILE (WI-FI) -------------
         class MobileRequestHandler(http.server.BaseHTTPRequestHandler):
             def log_message(self, format, *args):
                 pass  # Mantem o terminal limpo
@@ -1913,6 +4358,26 @@ def launch_flet_gui(col: Collector, mkt_col: MarketCollector, cli_args):
                 self.send_response(204)
                 self._send_cors()
                 self.end_headers()
+
+            def _build_mobile_status(self) -> dict:
+                return {
+                    "screen": state["screen"],
+                    "hex_color": state["hex_color"],
+                    "color": state["color"],
+                    "bg": state["bg"],
+                    "brt": state["brt"],
+                    "ticker": state["ticker"],
+                    "sleep_enabled": state["sleep_enabled"],
+                    "night_mode_enabled": state["night_mode_enabled"],
+                    "sd_files": state["sd_files"],
+                    "sys": col.sample_sys() if col else {},
+                    "mkt": mkt_col.get_market_dict() if mkt_col else {},
+                    "portf": mkt_col.compute_portfolio(state["portfolio"], state["portfolio_pnl_mode"])[0] if mkt_col else {},
+                    "pomodoro": pomo_eng.get_ui_snapshot() if pomo_eng else {},
+                    "media": media_col.get_ui_snapshot() if media_col else {},
+                    "upload": upload_state,
+                    "connected": True,
+                }
 
             def do_GET(self):
                 parsed = urllib.parse.urlparse(self.path)
@@ -1929,19 +4394,7 @@ def launch_flet_gui(col: Collector, mkt_col: MarketCollector, cli_args):
                     self.wfile.write(content)
 
                 elif p == "/api/status":
-                    payload = {
-                        "screen": state["screen"],
-                        "hex_color": state["hex_color"],
-                        "color": state["color"],
-                        "bg": state["bg"],
-                        "brt": state["brt"],
-                        "ticker": state["ticker"],
-                        "sd_files": state["sd_files"],
-                        "sys": col.sample_sys() if col else {},
-                        "mkt": mkt_col.get_market_dict() if mkt_col else {},
-                        "upload": upload_state,
-                        "connected": True,
-                    }
+                    payload = self._build_mobile_status()
                     content = json.dumps(payload, ensure_ascii=False).encode("utf-8")
                     self.send_response(200)
                     self.send_header("Content-Type", "application/json; charset=utf-8")
@@ -1958,18 +4411,7 @@ def launch_flet_gui(col: Collector, mkt_col: MarketCollector, cli_args):
                     self._send_cors()
                     self.end_headers()
                     while state["running"]:
-                        payload = {
-                            "screen": state["screen"],
-                            "hex_color": state["hex_color"],
-                            "color": state["color"],
-                            "bg": state["bg"],
-                            "brt": state["brt"],
-                            "ticker": state["ticker"],
-                            "sd_files": state["sd_files"],
-                            "sys": col.sample_sys() if col else {},
-                            "mkt": mkt_col.get_market_dict() if mkt_col else {},
-                            "upload": upload_state,
-                        }
+                        payload = self._build_mobile_status()
                         chunk = f"data: {json.dumps(payload, ensure_ascii=False)}\n\n".encode("utf-8")
                         try:
                             self.wfile.write(chunk)
@@ -1984,7 +4426,7 @@ def launch_flet_gui(col: Collector, mkt_col: MarketCollector, cli_args):
                     if val is not None:
                         try:
                             scr_idx = int(val)
-                            if 0 <= scr_idx <= 6:
+                            if 0 <= scr_idx <= 9:
                                 on_select_screen(scr_idx)
                                 append_log(f"📱 Smartphone selecionou Tela {scr_idx}")
                         except Exception:
@@ -2019,12 +4461,12 @@ def launch_flet_gui(col: Collector, mkt_col: MarketCollector, cli_args):
 
                 if p == "/api/screen":
                     scr = int(body.get("screen", state["screen"]))
-                    if 0 <= scr <= 6:
+                    if 0 <= scr <= 9:
                         on_select_screen(scr)
                         append_log(f"📱 Smartphone selecionou Tela {scr}")
                     else:
                         ok = False
-                        err_msg = "Tela inválida (0-6)"
+                        err_msg = "Tela inválida (0-9)"
 
                 elif p == "/api/color":
                     hex_c = body.get("hex", state["hex_color"])
@@ -2051,9 +4493,47 @@ def launch_flet_gui(col: Collector, mkt_col: MarketCollector, cli_args):
                         state["ticker"] = bool(body["ticker"])
                     else:
                         state["ticker"] = not state["ticker"]
-                    btn_ticker_toggle.text = f"Ticker Bolsa: {'LIGADO' if state['ticker'] else 'DESLIGADO'}"
+                    new_lbl = "📟 Letreiro Rodapé: ATIVO" if state["ticker"] else "📟 Letreiro Rodapé: OCULTO"
+                    set_btn_text(btn_ticker_toggle, new_lbl)
+                    set_btn_text(btn_ticker_quick, new_lbl)
                     persist_and_queue_ui()
-                    append_log(f"📱 Smartphone alterou letreiro para {'LIGADO' if state['ticker'] else 'DESLIGADO'}")
+                    append_log(f"📱 Smartphone alterou letreiro para {'ATIVO' if state['ticker'] else 'OCULTO'}")
+
+                elif p == "/api/pomodoro":
+                    act = str(body.get("action", "toggle")).lower()
+                    if act == "toggle":
+                        on_pomo_toggle()
+                    elif act == "reset":
+                        on_pomo_reset()
+                    elif act == "skip":
+                        on_pomo_skip()
+                    elif act == "phase":
+                        on_pomo_select_phase(str(body.get("phase", "WORK")))
+
+                elif p == "/api/media":
+                    act = str(body.get("action", "play_pause")).lower()
+                    if act in ("play_pause", "next", "prev"):
+                        media_col.control(act)
+                        append_log(f"📱 Smartphone enviou comando de mídia: {act}")
+                    elif act == "sync_cover":
+                        on_manual_cover_sync(None)
+
+                elif p == "/api/power":
+                    if "sleep_enabled" in body:
+                        state["sleep_enabled"] = bool(body["sleep_enabled"])
+                        sw_sleep.value = state["sleep_enabled"]
+                    if "night_mode_enabled" in body:
+                        state["night_mode_enabled"] = bool(body["night_mode_enabled"])
+                        sw_night.value = state["night_mode_enabled"]
+                    persist_and_queue_ui()
+                    try:
+                        page.update()
+                    except Exception:
+                        pass
+
+                elif p == "/api/test_alert":
+                    ui_event_queue.put({"alrt": {"bz": True, "led": state["color"], "p": 2}})
+                    append_log("📱 Smartphone disparou teste de Buzzer & LED RGB na CYD")
 
                 elif p == "/api/refresh_sd":
                     request_sd_files()
@@ -2091,11 +4571,22 @@ def launch_flet_gui(col: Collector, mkt_col: MarketCollector, cli_args):
                 self.end_headers()
                 self.wfile.write(content)
 
+        class _MobileHTTPServer(http.server.ThreadingHTTPServer):
+            allow_reuse_address = not IS_WINDOWS
+
+            def server_bind(self):
+                if IS_WINDOWS and hasattr(socket, "SO_EXCLUSIVEADDRUSE"):
+                    try:
+                        self.socket.setsockopt(socket.SOL_SOCKET, socket.SO_EXCLUSIVEADDRUSE, 1)
+                    except OSError:
+                        pass
+                super().server_bind()
+
         mobile_port = 8088
         mobile_server = None
         for test_port in (8088, 8089, 8550, 8551, 8552):
             try:
-                mobile_server = http.server.ThreadingHTTPServer(("0.0.0.0", test_port), MobileRequestHandler)
+                mobile_server = _MobileHTTPServer(("0.0.0.0", test_port), MobileRequestHandler)
                 mobile_port = test_port
                 break
             except OSError:
@@ -2150,7 +4641,7 @@ def launch_flet_gui(col: Collector, mkt_col: MarketCollector, cli_args):
                                 [
                                     lbl_mobile_title,
                                     ft.Container(
-                                        content=ft.Text(f"PORTA {mobile_port}", size=10, weight=ft.FontWeight.BOLD, color="#22C55E"),
+                                        content=ft.Text(f"PORTA {mobile_port} • SSE ATIVO", size=10, weight=ft.FontWeight.BOLD, color="#22C55E"),
                                         bgcolor="#142B1F",
                                         border=border_all(1, "#22C55E44"),
                                         border_radius=6,
@@ -2161,7 +4652,7 @@ def launch_flet_gui(col: Collector, mkt_col: MarketCollector, cli_args):
                             ),
                             ft.Text(
                                 "Aponte a câmera do seu celular para o QR Code ou acesse o link abaixo na mesma rede Wi-Fi.\n"
-                                "Alterne as 7 telas, mude cores RGB565, brilho PWM e envie fotos da galeria diretamente para a CYD!",
+                                "Alterne as 10 telas, controle Pomodoro e Spotify/YouTube Music, mude cores RGB565, brilho PWM e envie fotos!",
                                 size=11,
                                 color="#94A3B8",
                             ),
@@ -2207,16 +4698,122 @@ def launch_flet_gui(col: Collector, mkt_col: MarketCollector, cli_args):
             padding=14,
         )
 
+        # ---------------- NAVEGACAO POR ABAS (6 VIEWS LIMPAS E ORGANIZADAS) --
+        tab_defs = [
+            (0, "Painel & Telas", "DASHBOARD"),
+            (1, "Foco & Mídia", "ALBUM"),
+            (2, "Mercado & Carteira", "ACCOUNT_BALANCE_WALLET"),
+            (3, "Estúdio & Energia", "PALETTE"),
+            (4, "Alertas Físicos", "NOTIFICATIONS_ACTIVE"),
+            (5, "Remoto & Serial", "QR_CODE_2"),
+        ]
+
+        tab_views = [
+            # Aba 0: Painel Geral & Seletor de 10 Telas (Home limpa e rápida)
+            ft.Column(
+                [telemetry_row, sec_market_quick, sec_screens],
+                spacing=10,
+                scroll=ft.ScrollMode.AUTO,
+                expand=True,
+                visible=True,
+            ),
+            # Aba 1: Módulo 3 — Produtividade Pomodoro (Tela 8) + Spotify & YouTube Music (Tela 9)
+            ft.Column(
+                [ft.Row([sec_pomodoro, sec_media], spacing=12, vertical_alignment=ft.CrossAxisAlignment.START)],
+                spacing=10,
+                scroll=ft.ScrollMode.AUTO,
+                expand=True,
+                visible=False,
+            ),
+            # Aba 2: Finanças — Cotações ao Vivo (Tela 6) + Portfólio Pessoal (Tela 7)
+            ft.Column(
+                [sec_market_live, sec_portfolio],
+                spacing=10,
+                scroll=ft.ScrollMode.AUTO,
+                expand=True,
+                visible=False,
+            ),
+            # Aba 3: Aparência & Energia — Cores RGB565 + Wallpaper SD + Brilho PWM + Sleep/Noturno
+            ft.Column(
+                [sec_colors, sec_bg_and_brt, sec_sleep],
+                spacing=10,
+                scroll=ft.ScrollMode.AUTO,
+                expand=True,
+                visible=False,
+            ),
+            # Aba 4: Módulo 1 — Alertas Físicos Avançados (Buzzer & LED RGB)
+            ft.Column(
+                [sec_alerts],
+                spacing=10,
+                scroll=ft.ScrollMode.AUTO,
+                expand=True,
+                visible=False,
+            ),
+            # Aba 5: Controle Remoto Smartphone Wi-Fi + Console Serial
+            ft.Column(
+                [sec_mobile_remote, sec_console],
+                spacing=10,
+                scroll=ft.ScrollMode.AUTO,
+                expand=True,
+                visible=False,
+            ),
+        ]
+
+        tab_pill_refs = []
+        for t_idx, t_title, t_icon_name in tab_defs:
+            is_act = (t_idx == state["active_tab"])
+            ic_ctrl = ft.Icon(icon_val(t_icon_name), size=16, color=state["hex_color"] if is_act else "#64748B")
+            lbl_ctrl = ft.Text(
+                t_title,
+                size=12,
+                weight=ft.FontWeight.BOLD if is_act else ft.FontWeight.W_600,
+                color="#FFFFFF" if is_act else "#94A3B8",
+            )
+            pill_c = ft.Container(
+                content=ft.Row(
+                    [ic_ctrl, lbl_ctrl],
+                    spacing=7,
+                    alignment=ft.MainAxisAlignment.CENTER,
+                    vertical_alignment=ft.CrossAxisAlignment.CENTER,
+                ),
+                bgcolor="#162032" if is_act else "transparent",
+                border=border_all(1.5 if is_act else 1, state["hex_color"] if is_act else "transparent"),
+                border_radius=9,
+                padding=pad_sym(horizontal=10, vertical=8),
+                ink=True,
+                expand=True,
+                on_click=lambda e, idx_target=t_idx: switch_tab(idx_target),
+            )
+            tab_pill_refs.append((t_idx, pill_c, ic_ctrl, lbl_ctrl))
+
+        def refresh_tabs_ui():
+            h = state["hex_color"]
+            act = state["active_tab"]
+            for idx_t, pill_c, ic_ctrl, lbl_ctrl in tab_pill_refs:
+                on = (idx_t == act)
+                pill_c.bgcolor = "#162032" if on else "transparent"
+                pill_c.border = border_all(1.5 if on else 1, h if on else "transparent")
+                ic_ctrl.color = h if on else "#64748B"
+                lbl_ctrl.color = "#FFFFFF" if on else "#94A3B8"
+                tab_views[idx_t].visible = on
+
+        tab_bar_container = ft.Container(
+            content=ft.Row([p[1] for p in tab_pill_refs], spacing=6),
+            bgcolor="#0B0F17",
+            border=border_all(1, "#1A2232"),
+            border_radius=12,
+            padding=4,
+        )
+
+        tabs_viewport = ft.Container(
+            content=ft.Stack(tab_views, expand=True),
+            expand=True,
+        )
+
         page.add(
             header_row,
-            ft.Divider(height=8, color="#151C28"),
-            telemetry_row,
-            sec_market_live,
-            sec_mobile_remote,
-            sec_screens,
-            sec_colors,
-            sec_bg_and_brt,
-            sec_console,
+            tab_bar_container,
+            tabs_viewport,
         )
 
         # ---------------- THREAD DE COMUNICACAO SERIAL -----------------------
@@ -2233,13 +4830,14 @@ def launch_flet_gui(col: Collector, mkt_col: MarketCollector, cli_args):
                     ack_event.set()
                 elif raw == "MONITOR_READY":
                     state["ui_dirty"] = True
+                    state["synced_cover_id"] = ""  # Reenvia capa atual após reboot da CYD
                     request_sd_files()
                 elif raw.startswith("SD_FILES:"):
                     try:
                         files = json.loads(raw.split("SD_FILES:", 1)[1])
                         if isinstance(files, list):
                             base_opts = ["none", "terminal", "z1p0"]
-                            merged = base_opts + [f for f in files if f not in base_opts]
+                            merged = base_opts + [f for f in files if f not in base_opts and not str(f).startswith("_media")]
                             state["sd_files"] = merged
                             cfg["sd_files"] = merged
                             save_ui_config(cfg)
@@ -2251,6 +4849,7 @@ def launch_flet_gui(col: Collector, mkt_col: MarketCollector, cli_args):
                     except Exception:
                         pass
                 elif raw.startswith("SD_INIT:OK"):
+                    state["sd_missing_warned"] = False
                     append_log(f"Cartão MicroSD detectado e montado com sucesso ({raw}).")
                 elif raw.startswith("SD_INIT:FAIL"):
                     append_log("⚠️ Cartão MicroSD não detectado pela placa CYD. Verifique se está inserido e formatado em FAT32.")
@@ -2284,25 +4883,60 @@ def launch_flet_gui(col: Collector, mkt_col: MarketCollector, cli_args):
             lbl_dsk_sub.value = f"↓{sys_m.get('rx', 0):.1f} ↑{sys_m.get('tx', 0):.1f} MB/s"
             bar_dsk.value = min(max(dsk_v / 100.0, 0.0), 1.0)
 
-            # Atualiza faixa de mercado financeiro no PC
+            # Atualiza pílulas de mercado (Aba 0 e Aba 2)
             if mkt_m.get("usd", 0) > 0:
-                lbl_usd_p.value = f"R$ {mkt_m['usd']:.2f}"
+                lbl_usd_p.value = lbl_m2_usd_p.value = f"R$ {mkt_m['usd']:.2f}"
                 _fmt_chg(lbl_usd_c, mkt_m.get("usdc", 0.0))
+                _fmt_chg(lbl_m2_usd_c, mkt_m.get("usdc", 0.0))
             if mkt_m.get("eur", 0) > 0:
-                lbl_eur_p.value = f"R$ {mkt_m['eur']:.2f}"
+                lbl_eur_p.value = lbl_m2_eur_p.value = f"R$ {mkt_m['eur']:.2f}"
                 _fmt_chg(lbl_eur_c, mkt_m.get("eurc", 0.0))
+                _fmt_chg(lbl_m2_eur_c, mkt_m.get("eurc", 0.0))
             if mkt_m.get("btc", 0) > 0:
-                lbl_btc_p.value = f"$ {mkt_m['btc']:,.0f}"
+                lbl_btc_p.value = lbl_m2_btc_p.value = f"$ {mkt_m['btc']:,.0f}"
                 _fmt_chg(lbl_btc_c, mkt_m.get("btcc", 0.0))
+                _fmt_chg(lbl_m2_btc_c, mkt_m.get("btcc", 0.0))
             if mkt_m.get("eth", 0) > 0:
-                lbl_eth_p.value = f"$ {mkt_m['eth']:,.0f}"
+                lbl_eth_p.value = lbl_m2_eth_p.value = f"$ {mkt_m['eth']:,.0f}"
                 _fmt_chg(lbl_eth_c, mkt_m.get("ethc", 0.0))
+                _fmt_chg(lbl_m2_eth_c, mkt_m.get("ethc", 0.0))
             if mkt_m.get("sol", 0) > 0:
-                lbl_sol_p.value = f"$ {mkt_m['sol']:.2f}"
+                lbl_sol_p.value = lbl_m2_sol_p.value = f"$ {mkt_m['sol']:.2f}"
                 _fmt_chg(lbl_sol_c, mkt_m.get("solc", 0.0))
+                _fmt_chg(lbl_m2_sol_c, mkt_m.get("solc", 0.0))
             if mkt_m.get("ibov", 0) > 0:
-                lbl_ibov_p.value = f"{mkt_m['ibov']/1000.0:.1f}k pts"
+                lbl_ibov_p.value = lbl_m2_ibov_p.value = f"{mkt_m['ibov']/1000.0:.1f}k pts"
                 _fmt_chg(lbl_ibov_c, mkt_m.get("ibovc", 0.0))
+                _fmt_chg(lbl_m2_ibov_c, mkt_m.get("ibovc", 0.0))
+
+            try:
+                refresh_portfolio_ui()
+                refresh_focus_media_ui()
+            except Exception:
+                pass
+
+            # Atualiza status de energia (Sleep / Modo Noturno) + Chip no Header
+            try:
+                idle_s = get_system_idle_seconds()
+                eff_brt, reason = calculate_dynamic_brightness(state["brt"], state)
+                pct_b = int(round(eff_brt * 100 / 255.0))
+                if eff_brt == 0:
+                    lbl_power_status.value = f"🌙 Sleep Mode (Ocioso: {int(idle_s)}s)"
+                    lbl_power_status.color = "#818CF8"
+                    lbl_hdr_power.value = "🌙 Sleep"
+                    lbl_hdr_power.color = "#818CF8"
+                elif "Noturno" in reason:
+                    lbl_power_status.value = f"🌃 Modo Noturno (Brilho: {eff_brt} • Ocioso: {int(idle_s)}s)"
+                    lbl_power_status.color = "#38BDF8"
+                    lbl_hdr_power.value = f"🌃 {pct_b}%"
+                    lbl_hdr_power.color = "#38BDF8"
+                else:
+                    lbl_power_status.value = f"🟢 Ativo (Brilho: {eff_brt} • Ocioso: {int(idle_s)}s)"
+                    lbl_power_status.color = "#22C55E"
+                    lbl_hdr_power.value = f"☀️ {pct_b}%"
+                    lbl_hdr_power.color = "#22C55E"
+            except Exception:
+                pass
 
             if mkt_m.get("last_str") and mkt_m["last_str"] != "--:--:--":
                 lbl_market_time.value = f"Última cotação: {mkt_m['last_str']}"
@@ -2324,22 +4958,54 @@ def launch_flet_gui(col: Collector, mkt_col: MarketCollector, cli_args):
             import serial
             ser = None
             last_telemetry_t = 0.0
+            last_fired_alerts = {}
+            last_dispatched_brt = -1
+            pending_cov_id = ""
+            pending_cov_t0 = 0.0
 
             while state["running"]:
                 try:
                     now = time.time()
                     sys_metrics = None
                     mkt_metrics = mkt_col.get_market_dict()
+
+                    # Tick contínuo do Pomodoro mesmo se a CYD estiver desconectada
+                    pomo_done_ev = pomo_eng.tick()
+                    if pomo_done_ev:
+                        fin_p = pomo_done_ev["finished_phase"]
+                        nxt_p = pomo_done_ev["next_phase"]
+                        append_log(f"🍅 CICLO POMODORO CONCLUÍDO ({fin_p} -> {nxt_p})! Ciclos hoje: #{pomo_done_ev['cycles']}")
+                        if pomo_done_ev.get("buzzer", True):
+                            led_c = "0x07FF" if fin_p == "WORK" else "0x07E0"
+                            ui_event_queue.put({
+                                "pomo": pomo_eng.get_payload(done_flag=True),
+                                "alrt": {"bz": True, "led": led_c, "p": 3},
+                            })
+
                     if now - last_telemetry_t >= cli_args.interval:
                         last_telemetry_t = now
                         sys_metrics = col.sample_sys()
                         update_pc_telemetry_cards(sys_metrics, mkt_metrics)
 
+                    # Avaliação do Brilho Dinâmico (Modo Sleep & Modo Noturno)
+                    eff_brt, brt_reason = calculate_dynamic_brightness(state["brt"], state)
+                    state["current_effective_brt"] = eff_brt
+                    if eff_brt != last_dispatched_brt:
+                        prev_b = last_dispatched_brt
+                        last_dispatched_brt = eff_brt
+                        ui_event_queue.put({"ui": {"brt": eff_brt}})
+                        if eff_brt == 0:
+                            append_log("🌙 CYD em Modo Sleep (Inatividade de teclado/mouse detectada - Backlight = 0)")
+                        elif prev_b == 0:
+                            append_log(f"☀️ CYD acordando do Modo Sleep (Backlight restaurado para {eff_brt})")
+                        elif "Noturno" in brt_reason:
+                            append_log(f"🌃 CYD em Modo Noturno (Backlight atenuado para {eff_brt})")
+
                     if ser is None:
                         port = cli_args.port or find_port()
                         if not port:
                             status_dot.bgcolor = "#F59E0B"
-                            lbl_usb_status.value = "Aguardando CYD na USB..."
+                            lbl_usb_status.value = "USB..."
                             try:
                                 page.update()
                             except Exception:
@@ -2352,13 +5018,24 @@ def launch_flet_gui(col: Collector, mkt_col: MarketCollector, cli_args):
                         ser.reset_input_buffer()
                         state["ui_dirty"] = True
                         status_dot.bgcolor = "#22C55E"
-                        lbl_usb_status.value = f"Conectado em {port} ({BAUD} bps)"
-                        append_log(f"Conectado com sucesso na porta {port}")
+                        lbl_usb_status.value = f"{port}"
+                        append_log(f"Conectado com sucesso na porta {port} ({BAUD} bps)")
                         request_sd_files()
 
                     read_serial_responses(ser)
 
-                    # 1) Prioridade maxima: Transferencia de imagem em andamento
+                    # Sincronização automática da capa de álbum 320x240 p/ Cartão SD (com debounce de 1.3s)
+                    if state["media_auto_cover"] and not upload_state["active"] and transfer_queue.empty():
+                        _tk, cov_id, cov_bytes = media_col.get_cover_for_sd()
+                        if cov_id and cov_bytes and cov_id != state["synced_cover_id"]:
+                            if cov_id != pending_cov_id:
+                                pending_cov_id = cov_id
+                                pending_cov_t0 = now
+                            elif now - pending_cov_t0 >= 1.3:
+                                pending_cov_t0 = now + 8.0
+                                start_media_cover_transfer(cov_id, cov_bytes, manual=False)
+
+                    # 1) Prioridade maxima: Transferencia de imagem / capa em andamento
                     if not transfer_queue.empty():
                         pkt = transfer_queue.get_nowait()
                         line = json.dumps(pkt, separators=(",", ":")) + "\n"
@@ -2375,9 +5052,20 @@ def launch_flet_gui(col: Collector, mkt_col: MarketCollector, cli_args):
                         state["ui_dirty"] = False
                         state["last_ui_sync"] = time.time()
 
-                    # 3) Envio de telemetria periodica + dados do Mercado Financeiro
+                    # 3) Envio periodico de telemetria + Mercado + Portfólio + Pomodoro + Mídia + Alertas
                     if sys_metrics is not None:
-                        payload = {"sys": sys_metrics}
+                        payload = {
+                            "sys": sys_metrics,
+                            "pomo": pomo_eng.get_payload(),
+                            "media": media_col.get_cyd_payload(state["synced_cover_id"]),
+                        }
+
+                        # Avaliação de Alertas Físicos (Buzzer & LED RGB)
+                        trig = evaluate_alert_rules(state.get("alert_rules", []), sys_metrics, mkt_metrics, last_fired_alerts, now)
+                        if trig:
+                            payload["alrt"] = trig["alrt"]
+                            append_log(f"🚨 ALERTA ATIVADO: {trig['rule_name']} ({trig['curr_val']:.1f} {trig['op']} {trig['target_val']:.1f}) -> Disparando Buzzer/LED na CYD!")
+
                         if state["ui_dirty"] or (now - state["last_ui_sync"] >= 10.0):
                             payload["ui"] = get_ui_dict()
                             state["ui_dirty"] = False
@@ -2387,6 +5075,10 @@ def launch_flet_gui(col: Collector, mkt_col: MarketCollector, cli_args):
                             if mkt_metrics.get("usd", 0) > 0 or mkt_metrics.get("btc", 0) > 0:
                                 payload["mkt"] = mkt_metrics
                                 state["last_mkt_sync"] = now
+                            payload["portf"] = mkt_col.compute_portfolio(
+                                state["portfolio"],
+                                state["portfolio_pnl_mode"],
+                            )[0]
 
                         line = json.dumps(payload, separators=(",", ":")) + "\n"
                         ser.write(line.encode("utf-8"))
@@ -2394,7 +5086,7 @@ def launch_flet_gui(col: Collector, mkt_col: MarketCollector, cli_args):
 
                 except Exception as ex:
                     status_dot.bgcolor = "#EF4444"
-                    lbl_usb_status.value = "Reconectando USB..."
+                    lbl_usb_status.value = "Reconec..."
                     append_log(f"Conexão USB interrompida ({ex})")
                     if ser:
                         try:
@@ -2420,7 +5112,7 @@ def launch_flet_gui(col: Collector, mkt_col: MarketCollector, cli_args):
 
 
 def main():
-    ap = argparse.ArgumentParser(description="Agente CYD Hardware & Financial Market Monitor (Flet / Flutter Edition)")
+    ap = argparse.ArgumentParser(description="Agente CYD Hardware & Financial Market Monitor v4.0 (Flet / Flutter Edition)")
     ap.add_argument("-p", "--port", help="Porta serial, ex: COM5 ou /dev/ttyUSB0")
     ap.add_argument("-i", "--interval", type=float, default=INTERVAL)
     ap.add_argument("--stdout", action="store_true", help="Imprime o JSON no terminal e nao abre GUI")
@@ -2428,22 +5120,41 @@ def main():
     ap.add_argument("--game-proc", action="append", default=[], help="Processo extra de jogo")
     args = ap.parse_args()
 
+    cfg = load_ui_config()
     col = Collector(game_processes=args.game_proc)
     mkt_col = MarketCollector(crypto_interval=3.0, stock_interval=12.0)
-    time.sleep(0.35)
+    media_col = MediaCollector(source_pref=cfg.get("media_source_pref", "auto"))
+    pomo_eng = PomodoroEngine(
+        work_min=cfg.get("pomo_work_min", 25),
+        break_min=cfg.get("pomo_break_min", 5),
+        long_min=cfg.get("pomo_long_min", 15),
+        buzzer_enabled=cfg.get("pomo_buzzer", True),
+    )
+    time.sleep(0.55)
 
     if args.stdout or args.once:
-        cfg = load_ui_config()
+        mkt_col.set_custom_tickers([p.get("ticker", "") for p in cfg.get("portfolio", [])])
         mkt_col.fetch_once()
         while True:
+            pomo_eng.tick()
+            sys_s = col.sample_sys()
+            mkt_s = mkt_col.get_market_dict()
+            portf_s, _ = mkt_col.compute_portfolio(
+                cfg.get("portfolio", []),
+                cfg.get("portfolio_pnl_mode", "hist"),
+            )
+            eff_brt, _ = calculate_dynamic_brightness(cfg["brt"], cfg)
             payload = {
-                "sys": col.sample_sys(),
-                "mkt": mkt_col.get_market_dict(),
+                "sys": sys_s,
+                "mkt": mkt_s,
+                "portf": portf_s,
+                "pomo": pomo_eng.get_payload(),
+                "media": media_col.get_cyd_payload(),
                 "ui": {
                     "screen": cfg["screen"],
                     "color": cfg["color"],
                     "bg": cfg["bg"],
-                    "brt": cfg["brt"],
+                    "brt": eff_brt,
                     "ticker": cfg.get("ticker", True),
                 },
             }
@@ -2453,7 +5164,7 @@ def main():
                 return
             time.sleep(args.interval)
 
-    launch_flet_gui(col, mkt_col, args)
+    launch_flet_gui(col, mkt_col, media_col, pomo_eng, args)
 
 
 if __name__ == "__main__":

@@ -179,13 +179,29 @@ void initBacklight(int brt) {
 #endif
 }
 
-void setBacklight(int brt) {
-  currentBrightness = constrain(brt, 5, 255);
+void setBacklight(int targetBrt, bool smooth = true) {
+  targetBrt = constrain(targetBrt, 0, 255);
+  if (!smooth || targetBrt == currentBrightness) {
+    currentBrightness = targetBrt;
 #if ESP_ARDUINO_VERSION_MAJOR >= 3
-  ledcWrite(PIN_BL, currentBrightness);
+    ledcWrite(PIN_BL, currentBrightness);
 #else
-  ledcWrite(BL_PWM_CH, currentBrightness);
+    ledcWrite(BL_PWM_CH, currentBrightness);
 #endif
+    return;
+  }
+
+  // Transição suave de brilho (fade-in / fade-out) usando delay(2)
+  int step = (targetBrt > currentBrightness) ? 1 : -1;
+  while (currentBrightness != targetBrt) {
+    currentBrightness += step;
+#if ESP_ARDUINO_VERSION_MAJOR >= 3
+    ledcWrite(PIN_BL, currentBrightness);
+#else
+    ledcWrite(BL_PWM_CH, currentBrightness);
+#endif
+    delay(2);
+  }
 }
 
 // ========================================== Carregamento de Imagens do SD ==
@@ -221,12 +237,52 @@ bool initOrVerifySD() {
   return false;
 }
 
+// Ativa efeito de vidro translucido (alpha-blend RGB565 em tempo real) sobre a capa de album na SCR_MEDIA
+bool gMediaOverlayMode = false;
+
 // Callback chamado pela biblioteca TJpg_Decoder para desenhar blocos no TFT
 bool tft_output(int16_t x, int16_t y, uint16_t w, uint16_t h, uint16_t* bitmap) {
   if (y >= tft.height() || x >= tft.width()) return 1; // clip, mas retorna 1 para nao abortar a decodificacao!
-  if (x + w > tft.width())  w = tft.width() - x;
-  if (y + h > tft.height()) h = tft.height() - y;
-  tft.pushImage(x, y, w, h, bitmap);
+  uint16_t origStride = w;
+  uint16_t drawW = (x + w > tft.width())  ? (tft.width()  - x) : w;
+  uint16_t drawH = (y + h > tft.height()) ? (tft.height() - y) : h;
+
+  if (gMediaOverlayMode) {
+    // Como TJpgDec.setSwapBytes(true) esta ativo, desfazemos o swap, aplicamos translucidez e refazemos o swap
+    for (uint16_t row = 0; row < drawH; row++) {
+      int16_t py = y + row;
+      for (uint16_t col = 0; col < drawW; col++) {
+        int16_t px = x + col;
+        bool inHdr = (py < HDR_H);
+        bool inHud = (py >= 136 && py < TICKER_Y && px >= 8 && px < (SCR_W - 8));
+        if (inHdr || inHud) {
+          uint16_t idx = row * origStride + col;
+          uint16_t raw = bitmap[idx];
+          uint16_t c565 = (raw >> 8) | (raw << 8);
+          uint16_t r = (c565 >> 11) & 0x1F;
+          uint16_t g = (c565 >> 5)  & 0x3F;
+          uint16_t b =  c565        & 0x1F;
+          // Mistura 22% da arte do album + vidro fumê escuro para nitidez absoluta do texto
+          r = (r * 7) >> 5;
+          g = ((g * 7) >> 5) + 2;
+          b = ((b * 7) >> 5) + 1;
+          if (r > 31) r = 31;
+          if (g > 63) g = 63;
+          if (b > 31) b = 31;
+          uint16_t out565 = (r << 11) | (g << 5) | b;
+          bitmap[idx] = (out565 >> 8) | (out565 << 8);
+        }
+      }
+    }
+  }
+
+  if (drawW == origStride) {
+    tft.pushImage(x, y, drawW, drawH, bitmap);
+  } else {
+    for (uint16_t row = 0; row < drawH; row++) {
+      tft.pushImage(x, y + row, drawW, 1, bitmap + row * origStride);
+    }
+  }
   return 1;
 }
 
@@ -405,6 +461,10 @@ void listSdFilesToSerial() {
         if (slash >= 0) fname = fname.substring(slash + 1);
         String low = fname;
         low.toLowerCase();
+        if (low.startsWith("_media")) {
+          file = root.openNextFile();
+          continue; // Oculta o cache interno de capa de album da lista de wallpapers
+        }
         if (low.endsWith(".jpg") || low.endsWith(".jpeg") ||
             low.endsWith(".bmp") || low.endsWith(".gif")) {
           bool exists = false;
@@ -463,6 +523,101 @@ struct MarketStats {
   uint8_t hBtcCount = 0;
 } mkt;
 
+// ======================================= Portfolio de Investimentos ========
+struct PortfolioStats {
+  bool    valid      = false;
+  float   tot        = 0.0f;  // Saldo Total / Patrimonio consolidado (R$)
+  float   pnl_pct    = 0.0f;  // Lucro/Prejuizo percentual (%)
+  float   pnl_val    = 0.0f;  // Lucro/Prejuizo financeiro (R$)
+  float   day_pct    = 0.0f;  // Variacao diaria 24h da carteira (%)
+  uint8_t count      = 0;     // Quantidade total de ativos na carteira
+  char    top3[3][10] = {"---", "---", "---"};
+  float   top3c[3]    = {0.0f, 0.0f, 0.0f};
+  float   top3w[3]    = {0.0f, 0.0f, 0.0f};
+  bool    hasTop3c    = false;
+  uint8_t topCount    = 0;
+} portf;
+
+static float lookupPortfolioAssetChange(int idx) {
+  if (idx < 0 || idx >= 3) return 0.0f;
+  if (portf.hasTop3c) return portf.top3c[idx];
+  const char* s = portf.top3[idx];
+  if (strcasecmp(s, "BTC") == 0)   return mkt.btcc;
+  if (strcasecmp(s, "ETH") == 0)   return mkt.ethc;
+  if (strcasecmp(s, "SOL") == 0)   return mkt.solc;
+  if (strcasecmp(s, "BNB") == 0)   return mkt.bnbc;
+  if (strcasecmp(s, "XRP") == 0)   return mkt.xrpc;
+  if (strcasecmp(s, "USD") == 0)   return mkt.usdc;
+  if (strcasecmp(s, "EUR") == 0)   return mkt.eurc;
+  if (strcasecmp(s, "IBOV") == 0)  return mkt.ibovc;
+  if (strcasecmp(s, "SP500") == 0) return mkt.sp500c;
+  return 0.0f;
+}
+
+// ======================================= Pomodoro & Multimidia (Mod. 3) ====
+struct PomodoroStats {
+  bool     valid      = false;
+  char     state[10]  = "WORK";   // "WORK", "BREAK", "LONG"
+  bool     running    = false;
+  int32_t  rem        = 1500;     // Segundos restantes sincronizados pelo PC
+  int32_t  tot        = 1500;     // Duracao total do ciclo atual (s)
+  uint16_t cycles     = 0;        // Quantidade de ciclos concluidos
+  uint32_t syncMs     = 0;        // millis() do ultimo pacote recebido
+  bool     chimeGuard = false;    // Evita tocar bipe duplicado no mesmo fim de ciclo
+} pomo;
+
+struct MediaStats {
+  bool     valid         = false;
+  bool     playing       = false;
+  char     source[14]    = "NONE";  // "SPOTIFY", "YT MUSIC", "MEDIA", "NONE"
+  char     title[48]     = "Nenhuma midia em reproducao";
+  char     artist[40]    = "Abra o Spotify ou YouTube Music";
+  char     album[36]     = "";
+  int32_t  pos           = 0;       // Segundos decorridos
+  int32_t  dur           = 0;       // Duracao total em segundos
+  char     coverFile[32] = "_media_cov.jpg";
+  char     coverId[16]   = "";
+  bool     hasCover      = false;
+  uint32_t syncMs        = 0;
+} mediaSt;
+
+// Sanitiza strings UTF-8 caso algum caractere acentuado escape para o TFT_eSPI
+static void sanitizeAscii(char* dst, const char* src, size_t maxLen) {
+  if (!dst || maxLen == 0) return;
+  if (!src) { dst[0] = '\0'; return; }
+  size_t j = 0;
+  for (size_t i = 0; src[i] != '\0' && j < maxLen - 1; i++) {
+    uint8_t c = (uint8_t)src[i];
+    if (c >= 0x20 && c <= 0x7E) {
+      dst[j++] = (char)c;
+    } else if (c == 0xC3 && src[i + 1] != '\0') {
+      // Mapeamento rapido Latin-1 comum em PT-BR (UTF-8 0xC3 xx)
+      uint8_t n = (uint8_t)src[++i];
+      char rep = 0;
+      if      (n >= 0x80 && n <= 0x85) rep = 'A';
+      else if (n == 0x87)              rep = 'C';
+      else if (n >= 0x88 && n <= 0x8B) rep = 'E';
+      else if (n >= 0x8C && n <= 0x8F) rep = 'I';
+      else if (n >= 0x92 && n <= 0x96) rep = 'O';
+      else if (n >= 0x99 && n <= 0x9C) rep = 'U';
+      else if (n >= 0xA0 && n <= 0xA5) rep = 'a';
+      else if (n == 0xA7)              rep = 'c';
+      else if (n >= 0xA8 && n <= 0xAB) rep = 'e';
+      else if (n >= 0xAC && n <= 0xAF) rep = 'i';
+      else if (n >= 0xB2 && n <= 0xB6) rep = 'o';
+      else if (n >= 0xB9 && n <= 0xBC) rep = 'u';
+      if (rep) dst[j++] = rep;
+    }
+  }
+  dst[j] = '\0';
+}
+
+static uint16_t getMediaAccentColor() {
+  if (strcasecmp(mediaSt.source, "SPOTIFY") == 0)  return 0x1EE9; // Verde Oficial Spotify (#1DB954)
+  if (strcasecmp(mediaSt.source, "YT MUSIC") == 0) return 0xF806; // Vermelho Oficial YouTube Music (#FF0033)
+  return C_ACCENT;
+}
+
 bool        showTickerBar = true; // Exibe o letreiro infinito da bolsa no rodape das telas
 TFT_eSprite tickerSpr     = TFT_eSprite(&tft);
 bool        tickerSprReady = false;
@@ -478,22 +633,133 @@ uint8_t  hCpu[HIST], hGpu[HIST], hRam[HIST], hTmp[HIST];
 uint16_t hPos    = 0;
 bool     hFilled = false;
 
-char     lineBuf[2560];
+char     lineBuf[3072];
 uint16_t lineLen = 0;
 
-// Caches de desenho dos gauges circulares (evita flicker)
-int32_t  gGaugeEnd[2] = {-999, -999};
-uint16_t gGaugeCol[2] = {0, 0};
+// Caches de desenho dos gauges circulares e boxes dinamicos (evita flicker)
+int32_t  gGaugeEnd[2]   = {-999, -999};
+uint16_t gGaugeCol[2]   = {0, 0};
+int8_t   gLastPortfSign = -99;
+int8_t   gLastPomoPhase = -99;
+char     gLastMediaSig[128] = "";
+bool     gLastMediaPlay = false;
+int32_t  gLastMediaFillW = -1;
 
 void resetDrawCache() {
   gGaugeEnd[0] = gGaugeEnd[1] = -999;
   gGaugeCol[0] = gGaugeCol[1] = 0;
+  gLastPortfSign = -99;
+  gLastPomoPhase = -99;
+  gLastMediaSig[0] = '\0';
+  gLastMediaFillW = -1;
 }
 
 static void setLed(uint8_t r, uint8_t g, uint8_t b) {
   digitalWrite(LED_R, r ? LOW : HIGH);
   digitalWrite(LED_G, g ? LOW : HIGH);
   digitalWrite(LED_B, b ? LOW : HIGH);
+}
+
+// --------------------------------- Alertas Fisicos (Buzzer e LED RGB) -------
+static bool spkInitialized = false;
+
+static void buzzerOff() {
+#if SOUND_ENABLED
+#if ESP_ARDUINO_VERSION_MAJOR >= 3
+  if (spkInitialized) ledcWrite(PIN_SPK, 0);
+#else
+  if (spkInitialized) ledcWrite(SPK_PWM_CH, 0);
+#endif
+#endif
+}
+
+static void buzzerTone(uint32_t freq) {
+#if SOUND_ENABLED
+  if (freq == 0) {
+    buzzerOff();
+    return;
+  }
+#if ESP_ARDUINO_VERSION_MAJOR >= 3
+  ledcAttach(PIN_SPK, freq, 8);
+  ledcWrite(PIN_SPK, 128);
+#else
+  ledcSetup(SPK_PWM_CH, freq, 8);
+  ledcAttachPin(PIN_SPK, SPK_PWM_CH);
+  ledcWrite(SPK_PWM_CH, 128);
+#endif
+  spkInitialized = true;
+#endif
+}
+
+static void setLedFrom565(uint16_t c565) {
+  uint8_t r = ((c565 >> 11) & 0x1F) > 8 ? 1 : 0;
+  uint8_t g = ((c565 >> 5)  & 0x3F) > 16 ? 1 : 0;
+  uint8_t b = (c565         & 0x1F) > 8 ? 1 : 0;
+  setLed(r, g, b);
+}
+
+struct AlertEngineState {
+  bool active = false;
+  bool useBuzzer = false;
+  uint16_t ledColor = 0xF800;
+  uint8_t pattern = 1;       // 1=Info (1 bipe), 2=Aviso (2 bipes), 3=Critico (3 bipes)
+  uint8_t currentStep = 0;
+  uint32_t stepEndTime = 0;
+};
+
+static AlertEngineState alertEngine;
+
+void triggerAlert(bool buzzer, uint16_t ledCol, uint8_t pat) {
+  alertEngine.active = true;
+  alertEngine.useBuzzer = buzzer;
+  alertEngine.ledColor = ledCol;
+  alertEngine.pattern = (pat < 1) ? 1 : (pat > 3 ? 3 : pat);
+  alertEngine.currentStep = 0;
+  alertEngine.stepEndTime = 0;
+}
+
+void pumpAlerts() {
+  if (!alertEngine.active) return;
+
+  uint32_t now = millis();
+  if (now < alertEngine.stepEndTime) return;
+
+  uint8_t maxSteps = 2; // p=1 -> 2 passos (ON, OFF)
+  if (alertEngine.pattern == 2) maxSteps = 4; // ON, OFF, ON, OFF
+  else if (alertEngine.pattern == 3) maxSteps = 6; // ON, OFF, ON, OFF, ON, OFF
+
+  if (alertEngine.currentStep >= maxSteps) {
+    buzzerOff();
+    setLed(0, 0, 0);
+    alertEngine.active = false;
+    return;
+  }
+
+  bool isOn = (alertEngine.currentStep % 2 == 0);
+  uint32_t dur = 100;
+  uint32_t freq = 2400;
+
+  if (alertEngine.pattern == 1) {
+    dur = isOn ? 90 : 100;
+    freq = 2400;
+  } else if (alertEngine.pattern == 2) {
+    dur = isOn ? 100 : 80;
+    freq = 2200;
+  } else {
+    dur = isOn ? 120 : 70;
+    freq = (alertEngine.currentStep == 4) ? 3000 : 2800;
+  }
+
+  if (isOn) {
+    if (alertEngine.useBuzzer) buzzerTone(freq);
+    setLedFrom565(alertEngine.ledColor);
+  } else {
+    buzzerOff();
+    setLed(0, 0, 0);
+  }
+
+  alertEngine.stepEndTime = now + dur;
+  alertEngine.currentStep++;
 }
 
 static float maxTemp() {
@@ -652,6 +918,9 @@ void drawHeader() {
   else if (currentScreen == SCR_GRAPH)        scrTitle = "4x GRAFICOS";
   else if (currentScreen == SCR_WALLPAPER)    scrTitle = "WALLPAPER";
   else if (currentScreen == SCR_MARKET)       scrTitle = "BOLSA & CRIPTO";
+  else if (currentScreen == SCR_PORTFOLIO)    scrTitle = "MEU PORTFOLIO";
+  else if (currentScreen == SCR_POMODORO)     scrTitle = "POMODORO FOCUS";
+  else if (currentScreen == SCR_MEDIA)        scrTitle = "NOW PLAYING";
 
   tft.setTextDatum(ML_DATUM);
   tft.setTextColor(C_ACCENT, C_ACCENT_DK);
@@ -664,6 +933,19 @@ void drawHeader() {
   if (currentScreen == SCR_MARKET && mkt.valid) {
     tft.setTextColor(0x07E0, C_ACCENT_DK);
     tft.drawString("LIVE MARKET", SCR_W - 6, (HDR_H - 2) / 2, 2);
+  } else if (currentScreen == SCR_PORTFOLIO && portf.valid) {
+    tft.setTextColor(portf.pnl_val >= 0.0f ? 0x07E0 : 0xF800, C_ACCENT_DK);
+    tft.drawString("PATRIMONIO", SCR_W - 6, (HDR_H - 2) / 2, 2);
+  } else if (currentScreen == SCR_POMODORO) {
+    bool isBrk = (strcasecmp(pomo.state, "WORK") != 0);
+    uint16_t pCol = !pomo.running ? 0xFD20 : (isBrk ? 0x07FF : 0x07E0);
+    tft.setTextColor(pCol, C_ACCENT_DK);
+    tft.drawString(!pomo.running ? "PAUSADO" : (isBrk ? "PAUSA" : "EM FOCO"), SCR_W - 6, (HDR_H - 2) / 2, 2);
+  } else if (currentScreen == SCR_MEDIA) {
+    uint16_t mCol = getMediaAccentColor();
+    tft.setTextColor(mCol, C_ACCENT_DK);
+    const char* sLbl = (strcasecmp(mediaSt.source, "NONE") == 0) ? "PLAYER" : mediaSt.source;
+    tft.drawString(sLbl, SCR_W - 6, (HDR_H - 2) / 2, 2);
   } else {
     tft.drawString(linked ? st.host : "AGUARDANDO PC", SCR_W - 6, (HDR_H - 2) / 2, 2);
   }
@@ -768,10 +1050,13 @@ int drawFullTickerCycle(int baseX) {
     x += drawTickerSegment(x, "S&P500", pBuf, mkt.sp500c);
   }
 
-  // Se estiver na tela dedicada do Mercado, tambem mostra CPU/RAM/GPU no ticker!
-  if (currentScreen == SCR_MARKET && linked) {
+  // Se estiver nas telas financeiras (Mercado ou Portfolio), tambem mostra CPU/RAM no ticker!
+  if ((currentScreen == SCR_MARKET || currentScreen == SCR_PORTFOLIO) && linked) {
     snprintf(pBuf, sizeof(pBuf), "CPU %.0f%% | RAM %.0f%%", st.cpu, st.ram);
     x += drawTickerSegment(x, "PC", pBuf, 0.0f);
+  } else if (portf.valid && portf.tot > 0.0f) {
+    snprintf(pBuf, sizeof(pBuf), "R$%.1fk", portf.tot / 1000.0f);
+    x += drawTickerSegment(x, "CART", pBuf, portf.pnl_pct);
   }
 
   return x - baseX;
@@ -1497,6 +1782,448 @@ void screenMarketDynamic() {
   plotBtcSparkline(178, HDR_H + 118, 128, 70);
 }
 
+// ======================================= TELA 7: PORTFOLIO PESSOAL =========
+// Painel dedicado ao Patrimonio Pessoal & Carteira de Investimentos:
+//   - Esquerda/Centro (186px): Saldo Total em destaque, Box PnL dinamico
+//     (Verde lucro / Vermelho prejuizo), barra de alocacao e resumo da carteira.
+//   - Direita (118px): Lista lateral com a variacao (%) e peso dos Top 3 ativos.
+void screenPortfolioStatic() {
+  renderBackground();
+  drawHeader();
+
+  // Painel Principal: Patrimonio & PnL Consolidado
+  drawModernCard(6,   HDR_H + 2, 186, 194, "PATRIMONIO PESSOAL");
+
+  // Painel Lateral: Top 3 Ativos da Carteira
+  drawModernCard(196, HDR_H + 2, 118, 194, "TOP 3 ATIVOS");
+  tft.drawFastHLine(204, HDR_H + 73,  102, C_TRACK);
+  tft.drawFastHLine(204, HDR_H + 129, 102, C_TRACK);
+}
+
+void screenPortfolioDynamic() {
+  char buf[48];
+
+  // ---- 1) Saldo Total em Destaque (Font 4) ----
+  tft.setTextDatum(TL_DATUM);
+  tft.setTextColor(C_DIM, C_CARD);
+  tft.drawString("SALDO TOTAL CONSOLIDADO", 14, HDR_H + 16, 1);
+
+  tft.setTextPadding(170);
+  tft.setTextColor(0xFFFF, C_CARD);
+  if (!portf.valid) {
+    snprintf(buf, sizeof(buf), "R$ 0.00");
+  } else if (portf.tot >= 1000000.0f) {
+    snprintf(buf, sizeof(buf), "R$ %.2fM", portf.tot / 1000000.0f);
+  } else if (portf.tot >= 100000.0f) {
+    snprintf(buf, sizeof(buf), "R$ %.0f", portf.tot);
+  } else {
+    snprintf(buf, sizeof(buf), "R$ %.2f", portf.tot);
+  }
+  tft.drawString(buf, 14, HDR_H + 28, 4);
+  tft.setTextPadding(0);
+
+  // ---- 2) Box Dinamico de PnL (Verde Lucro / Vermelho Prejuizo) ----
+  int8_t curSign = (portf.pnl_val >= 0.0f) ? 1 : -1;
+  uint16_t pnlFg = (curSign >= 0) ? 0x07E0 : 0xF800;
+  uint16_t pnlBg = (curSign >= 0) ? 0x0120 : 0x2800;
+  int boxX = 14, boxY = HDR_H + 60, boxW = 170, boxH = 60;
+
+  if (curSign != gLastPortfSign) {
+    tft.fillRoundRect(boxX, boxY, boxW, boxH, 5, pnlBg);
+    tft.drawRoundRect(boxX, boxY, boxW, boxH, 5, pnlFg);
+    gLastPortfSign = curSign;
+  }
+
+  tft.setTextDatum(TL_DATUM);
+  tft.setTextPadding(150);
+  tft.setTextColor(pnlFg, pnlBg);
+  tft.drawString(curSign >= 0 ? "RESULTADO: LUCRO (PnL)" : "RESULTADO: PREJUIZO (PnL)", boxX + 8, boxY + 6, 1);
+
+  tft.setTextPadding(94);
+  float absPnl = fabsf(portf.pnl_val);
+  if (absPnl >= 100000.0f) {
+    snprintf(buf, sizeof(buf), "%sR$ %.1fk", curSign >= 0 ? "+" : "-", absPnl / 1000.0f);
+  } else {
+    snprintf(buf, sizeof(buf), "%sR$ %.2f", curSign >= 0 ? "+" : "-", absPnl);
+  }
+  tft.drawString(buf, boxX + 8, boxY + 20, 2);
+  tft.setTextPadding(0);
+
+  // Badge percentual ao lado do valor financeiro
+  drawChangeBadge(boxX + 106, boxY + 20, 56, 16, portf.pnl_pct);
+
+  // Linha interna de variacao 24h da carteira
+  tft.setTextDatum(TL_DATUM);
+  tft.setTextPadding(152);
+  tft.setTextColor(0xDEFB, pnlBg);
+  snprintf(buf, sizeof(buf), "Hoje (24h): %s%.2f%%", portf.day_pct >= 0.0f ? "+" : "", portf.day_pct);
+  tft.drawString(buf, boxX + 8, boxY + 43, 1);
+  tft.setTextPadding(0);
+
+  // ---- 3) Barra de Distribuicao / Alocacao dos Top 3 ----
+  tft.setTextDatum(TL_DATUM);
+  tft.setTextColor(C_DIM, C_CARD);
+  tft.drawString("COMPOSICAO DA CARTEIRA", 14, HDR_H + 130, 1);
+
+  int barX = 14, barY = HDR_H + 142, barW = 170, barH = 10;
+  tft.fillRoundRect(barX, barY, barW, barH, 3, C_TRACK);
+  if (portf.valid && portf.topCount > 0) {
+    const uint16_t segCols[3] = {0x07E0, 0x07FF, 0xFD20};
+    int curX = barX;
+    for (int i = 0; i < portf.topCount && i < 3; i++) {
+      float wPct = portf.top3w[i];
+      if (wPct <= 0.0f) wPct = 100.0f / (float)portf.topCount;
+      int segW = (int)((barW * constrain(wPct, 0.0f, 100.0f)) / 100.0f);
+      if (curX + segW > barX + barW) segW = (barX + barW) - curX;
+      if (segW > 2) {
+        tft.fillRect(curX, barY + 1, segW - 1, barH - 2, segCols[i]);
+        curX += segW;
+      }
+    }
+  }
+  tft.drawRoundRect(barX, barY, barW, barH, 3, C_CARD_HI);
+
+  // Rodape informativo do card principal
+  tft.setTextDatum(TL_DATUM);
+  tft.setTextPadding(170);
+  tft.setTextColor(C_TEXT, C_CARD);
+  uint8_t nAssets = portf.count > 0 ? portf.count : portf.topCount;
+  if (mkt.usd > 0) snprintf(buf, sizeof(buf), "Ativos: %u  |  USD: R$ %.2f", nAssets, mkt.usd);
+  else             snprintf(buf, sizeof(buf), "Ativos na carteira: %u", nAssets);
+  tft.drawString(buf, 14, HDR_H + 162, 1);
+
+  tft.setTextColor(C_DIM, C_CARD);
+  tft.drawString(portf.valid ? "Sincronizado via USB Serial" : "Cadastre ativos no Agente PC", 14, HDR_H + 176, 1);
+  tft.setTextPadding(0);
+
+  // ---- 4) Lista Lateral: Variacao dos Top 3 Ativos ----
+  const uint16_t rankCols[3] = {0x07E0, 0x07FF, 0xFD20};
+  for (int i = 0; i < 3; i++) {
+    int ry = HDR_H + 22 + i * 56;
+    bool hasItem = (portf.valid && i < portf.topCount && strcmp(portf.top3[i], "---") != 0);
+
+    float chg = hasItem ? lookupPortfolioAssetChange(i) : 0.0f;
+    uint16_t pillCol = !hasItem ? C_TRACK : ((chg >= 0.0f) ? 0x07E0 : 0xF800);
+
+    // Barra vertical lateral indicando alta/baixa
+    tft.fillRoundRect(203, ry + 3, 3, 40, 1, pillCol);
+
+    // Ticker do ativo
+    tft.setTextDatum(TL_DATUM);
+    tft.setTextPadding(68);
+    tft.setTextColor(hasItem ? 0xFFFF : C_DIM, C_CARD);
+    if (hasItem) snprintf(buf, sizeof(buf), "%d.%s", i + 1, portf.top3[i]);
+    else         snprintf(buf, sizeof(buf), "%d. ---", i + 1);
+    tft.drawString(buf, 211, ry + 3, 2);
+    tft.setTextPadding(0);
+
+    // Peso % no canto superior direito do slot
+    tft.setTextDatum(TR_DATUM);
+    tft.setTextPadding(30);
+    tft.setTextColor(hasItem ? rankCols[i] : C_DIM, C_CARD);
+    if (hasItem && portf.top3w[i] > 0.0f) snprintf(buf, sizeof(buf), "%.0f%%", portf.top3w[i]);
+    else                                  snprintf(buf, sizeof(buf), "");
+    tft.drawString(buf, 306, ry + 6, 1);
+    tft.setTextPadding(0);
+
+    // Badge de variacao (%) verde/vermelha
+    if (hasItem) {
+      drawChangeBadge(211, ry + 24, 95, 16, chg);
+    } else {
+      tft.fillRoundRect(211, ry + 24, 95, 16, 3, C_TRACK);
+      tft.setTextDatum(MC_DATUM);
+      tft.setTextColor(C_DIM, C_TRACK);
+      tft.drawString("Sem ativo", 211 + 47, ry + 32, 1);
+    }
+  }
+}
+
+// ======================================= TELA 8: POMODORO FOCUS HUB ========
+// Esquerda: Anel circular suave (flicker-free) com cronometro MM:SS e progresso
+// Direita:  Status do ciclo (Trabalho 25m / Pausa 5m / Longa 15m), contador de
+//           tomates concluidos, faixa musical ativa e saude termica do PC
+void screenPomodoroStatic() {
+  renderBackground();
+  drawHeader();
+
+  drawModernCard(6,   HDR_H + 2, 152, 194, "CRONOMETRO FOCO");
+  drawModernCard(164, HDR_H + 2, 150, 194, "CICLOS & SESSAO");
+  tft.drawFastHLine(172, HDR_H + 88,  134, C_TRACK);
+  tft.drawFastHLine(172, HDR_H + 140, 134, C_TRACK);
+}
+
+void screenPomodoroDynamic() {
+  char buf[52];
+
+  // Interpola localmente 1s caso o timer esteja rodando entre pacotes USB
+  int32_t effRem = pomo.rem;
+  if (pomo.running && pomo.syncMs > 0) {
+    uint32_t elap = (millis() - pomo.syncMs) / 1000;
+    effRem = (int32_t)pomo.rem - (int32_t)elap;
+    if (effRem < 0) effRem = 0;
+  }
+
+  // Aciona Buzzer fisico automaticamente na virada local para 00:00
+  if (pomo.running && effRem == 0 && pomo.rem > 0 && !pomo.chimeGuard) {
+    pomo.chimeGuard = true;
+    bool wasBreak = (strcasecmp(pomo.state, "WORK") != 0);
+    triggerAlert(true, wasBreak ? 0x07E0 : 0x07FF, 3);
+  }
+
+  int32_t totSec = (pomo.tot > 0) ? pomo.tot : 1500;
+  float pctDone = constrain(100.0f * (float)(totSec - effRem) / (float)totSec, 0.0f, 100.0f);
+
+  bool isLong  = (strcasecmp(pomo.state, "LONG") == 0);
+  bool isBreak = isLong || (strcasecmp(pomo.state, "BREAK") == 0);
+  int8_t phaseCode = !pomo.running ? 0 : (isLong ? 3 : (isBreak ? 2 : 1));
+
+  uint16_t ringCol = C_ACCENT;
+  if (!pomo.running) ringCol = 0xFD20;      // Ambar pausado
+  else if (isLong)   ringCol = 0x7BFF;      // Azul celeste pausa longa
+  else if (isBreak)  ringCol = 0x07FF;      // Ciano pausa curta
+
+  // ---- Anel Circular Suave (slot 0 do cache anti-flicker) ----
+  const int cx = 82, cy = HDR_H + 92, r = 54, ir = 45;
+  const int A0 = 30, A1 = 330;
+  int aEnd = A0 + (int)((A1 - A0) * pctDone / 100.0f);
+
+  if (gGaugeEnd[0] != aEnd || gGaugeCol[0] != ringCol) {
+    if (aEnd > A0 + 1) tft.drawSmoothArc(cx, cy, r, ir, A0, aEnd, ringCol, C_CARD, true);
+    if (aEnd < A1 - 1) tft.drawSmoothArc(cx, cy, r, ir, aEnd, A1, C_TRACK, C_CARD, true);
+    gGaugeEnd[0] = aEnd;
+    gGaugeCol[0] = ringCol;
+  }
+
+  // Tempo MM:SS grande no centro do anel
+  int mm = effRem / 60;
+  int ss = effRem % 60;
+  snprintf(buf, sizeof(buf), "%02d:%02d", mm, ss);
+  tft.setTextDatum(MC_DATUM);
+  tft.setTextPadding(76);
+  tft.setTextColor(0xFFFF, C_CARD);
+  tft.drawString(buf, cx, cy - 4, 4);
+
+  tft.setTextPadding(72);
+  tft.setTextColor(ringCol, C_CARD);
+  const char* subSt = !pomo.running ? "PAUSADO" : (isBreak ? "DESCANSO" : "FOCO ATIVO");
+  tft.drawString(subSt, cx, cy + 18, 1);
+
+  // Rodape percentual do card esquerdo
+  snprintf(buf, sizeof(buf), "Progresso: %.0f%% concluido", pctDone);
+  tft.setTextPadding(136);
+  tft.setTextColor(C_DIM, C_CARD);
+  tft.drawString(buf, cx, HDR_H + 174, 1);
+  tft.setTextPadding(0);
+
+  // ---- Card Direito: Badge de Estado + Ciclos + Midia + PC ----
+  int bx = 172, by = HDR_H + 18, bw = 134, bh = 24;
+  if (phaseCode != gLastPomoPhase) {
+    uint16_t badgeBg = scale565(ringCol, 1, 6);
+    tft.fillRoundRect(bx, by, bw, bh, 4, badgeBg);
+    tft.drawRoundRect(bx, by, bw, bh, 4, ringCol);
+    tft.setTextDatum(MC_DATUM);
+    tft.setTextColor(ringCol, badgeBg);
+    const char* pName = isLong ? "PAUSA LONGA (15m)" : (isBreak ? "PAUSA CURTA (5m)" : "TRABALHO (25m)");
+    if (!pomo.running) pName = "TIMER EM PAUSA";
+    tft.drawString(pName, bx + bw / 2, by + bh / 2, 1);
+    gLastPomoPhase = phaseCode;
+    drawHeader();
+  }
+
+  // Contador de ciclos + bolinhas indicadoras (meta de 4 ciclos)
+  tft.setTextDatum(TL_DATUM);
+  tft.setTextPadding(90);
+  tft.setTextColor(0xFFFF, C_CARD);
+  snprintf(buf, sizeof(buf), "Ciclos: #%u", (unsigned)pomo.cycles);
+  tft.drawString(buf, 172, HDR_H + 50, 2);
+  tft.setTextPadding(0);
+
+  uint8_t modCyc = pomo.cycles % 4;
+  if (pomo.cycles > 0 && modCyc == 0 && isLong) modCyc = 4;
+  for (int i = 0; i < 4; i++) {
+    int dx = 180 + i * 22;
+    int dy = HDR_H + 74;
+    if (i < modCyc) {
+      tft.fillCircle(dx, dy, 5, 0x07E0);
+    } else if (i == modCyc && !isBreak && pomo.running) {
+      tft.fillCircle(dx, dy, 5, ringCol);
+      tft.fillCircle(dx, dy, 2, C_CARD);
+    } else {
+      tft.fillCircle(dx, dy, 5, C_TRACK);
+      tft.drawCircle(dx, dy, 5, C_DIM);
+    }
+  }
+
+  // Bloco intermediario: Musica tocando (Spotify / YT Music) durante o foco
+  tft.setTextDatum(TL_DATUM);
+  tft.setTextPadding(134);
+  if (mediaSt.valid && strcasecmp(mediaSt.source, "NONE") != 0) {
+    tft.setTextColor(getMediaAccentColor(), C_CARD);
+    snprintf(buf, sizeof(buf), "%s %s", mediaSt.playing ? "|>" : "||", mediaSt.source);
+    tft.drawString(buf, 172, HDR_H + 96, 1);
+
+    tft.setTextColor(0xFFFF, C_CARD);
+    snprintf(buf, sizeof(buf), "%.20s", mediaSt.title);
+    tft.drawString(buf, 172, HDR_H + 109, 1);
+
+    tft.setTextColor(C_DIM, C_CARD);
+    snprintf(buf, sizeof(buf), "%.20s", mediaSt.artist);
+    tft.drawString(buf, 172, HDR_H + 122, 1);
+  } else {
+    tft.setTextColor(C_ACCENT, C_CARD);
+    tft.drawString("MODO DEEP WORK", 172, HDR_H + 98, 1);
+    tft.setTextColor(C_DIM, C_CARD);
+    tft.drawString("Buzzer ativo ao fim", 172, HDR_H + 112, 1);
+    tft.drawString("de cada ciclo!", 172, HDR_H + 124, 1);
+  }
+  tft.setTextPadding(0);
+
+  // Rodape compacto de telemetria PC
+  snprintf(buf, sizeof(buf), "%.0f%%", st.cpu);
+  drawModernBar(172, HDR_H + 147, 134, 17, "CPU", st.cpu, buf, 70, 88);
+  snprintf(buf, sizeof(buf), "%.0f%%", st.ram);
+  drawModernBar(172, HDR_H + 169, 134, 17, "RAM", st.ram, buf, 75, 90);
+}
+
+// ======================================= TELA 9: HUB MULTIMIDIA (SD COVER) ==
+// Renderiza a capa 320x240 do Spotify / YouTube Music gravada no Cartao SD com
+// overlay de vidro translucido (pixel alpha-blend em tft_output) contendo:
+// Badge da Fonte (Spotify Verde / YT Music Vermelho), Titulo, Artista e Barra!
+void drawMediaBackdropAndOverlay() {
+  bool coverDrawn = false;
+  if (initOrVerifySD() && mediaSt.coverFile[0]) {
+    String cPath = resolveSdPath(mediaSt.coverFile);
+    if (cPath.length() > 0) {
+      gMediaOverlayMode = true;
+      uint16_t res = TJpgDec.drawSdJpg(0, 0, cPath.c_str());
+      gMediaOverlayMode = false;
+      if (res == 0) {
+        coverDrawn = true;
+      }
+    }
+  }
+
+  if (!coverDrawn) {
+    // Visualizador estudio elegante caso esteja sem Cartao SD ou aguardando capa
+    tft.fillRect(0, HDR_H, SCR_W, TICKER_Y - HDR_H, 0x0841);
+    uint16_t ac = getMediaAccentColor();
+    uint16_t acDk = scale565(ac, 1, 6);
+    for (int r = 56; r >= 16; r -= 10) {
+      tft.drawCircle(SCR_W / 2, 82, r, acDk);
+    }
+    tft.fillCircle(SCR_W / 2, 82, 14, ac);
+    tft.fillCircle(SCR_W / 2, 82, 4, 0x0841);
+    // Card escuro simulando o overlay na parte inferior
+    tft.fillRoundRect(8, 136, SCR_W - 16, 82, 7, 0x0021);
+  }
+
+  drawHeader();
+  drawClock();
+
+  uint16_t mCol = getMediaAccentColor();
+  // Moldura luminosa de vidro sobre o overlay translucido (y=136..218)
+  tft.drawRoundRect(8, 136, SCR_W - 16, 82, 7, scale565(mCol, 3, 4));
+  tft.drawFastHLine(18, 136, SCR_W - 36, mCol);
+
+  // Badge da Plataforma (SPOTIFY / YT MUSIC / MEDIA)
+  const char* srcTxt = (strcasecmp(mediaSt.source, "NONE") == 0) ? "WINDOWS MEDIA" : mediaSt.source;
+  int pillW = max(62, (int)strlen(srcTxt) * 6 + 16);
+  tft.fillRoundRect(16, 143, pillW, 14, 3, mCol);
+  tft.setTextDatum(MC_DATUM);
+  tft.setTextColor(0x0000, mCol);
+  tft.drawString(srcTxt, 16 + pillW / 2, 150, 1);
+
+  // Titulo e Artista desenhados com fundo TRANSPARENTE sobre o vidro translucido!
+  tft.setTextDatum(TL_DATUM);
+  tft.setTextColor(0xFFFF); // 1 argumento = fundo 100% transparente sobre a arte!
+  char line1[42];
+  snprintf(line1, sizeof(line1), "%.34s", mediaSt.title);
+  tft.drawString(line1, 16, 161, 2);
+
+  tft.setTextColor(0xCE79); // Prata claro legivel sobre o vidro escuro
+  char line2[48];
+  if (mediaSt.album[0]) {
+    snprintf(line2, sizeof(line2), "%.22s  -  %.18s", mediaSt.artist, mediaSt.album);
+  } else {
+    snprintf(line2, sizeof(line2), "%.38s", mediaSt.artist);
+  }
+  tft.drawString(line2, 16, 181, 2);
+
+  gLastMediaFillW = -1;
+}
+
+void screenMediaStatic() {
+  if (isGifPlaying) {
+    gif.close();
+    isGifPlaying = false;
+  }
+  snprintf(gLastMediaSig, sizeof(gLastMediaSig), "%s|%s|%s|%s",
+           mediaSt.source, mediaSt.coverId, mediaSt.title, mediaSt.artist);
+  gLastMediaPlay = !mediaSt.playing; // Forca desenho inicial do badge Play/Pause
+  drawMediaBackdropAndOverlay();
+}
+
+void screenMediaDynamic() {
+  char curSig[128];
+  snprintf(curSig, sizeof(curSig), "%s|%s|%s|%s",
+           mediaSt.source, mediaSt.coverId, mediaSt.title, mediaSt.artist);
+
+  // So recarrega o JPG + vidro translucido quando muda a musica ou chega nova capa!
+  if (strcmp(curSig, gLastMediaSig) != 0) {
+    strlcpy(gLastMediaSig, curSig, sizeof(gLastMediaSig));
+    drawMediaBackdropAndOverlay();
+    gLastMediaPlay = !mediaSt.playing;
+  }
+
+  uint16_t mCol = getMediaAccentColor();
+
+  // Pill Play / Pause no canto superior direito do vidro
+  if (mediaSt.playing != gLastMediaPlay || gLastMediaFillW < 0) {
+    gLastMediaPlay = mediaSt.playing;
+    uint16_t stBg = mediaSt.playing ? scale565(mCol, 1, 5) : 0x1082;
+    uint16_t stFg = mediaSt.playing ? mCol : 0xFD20;
+    tft.fillRoundRect(236, 143, 68, 14, 3, stBg);
+    tft.drawRoundRect(236, 143, 68, 14, 3, stFg);
+    tft.setTextDatum(MC_DATUM);
+    tft.setTextColor(stFg, stBg);
+    tft.drawString(mediaSt.playing ? "|> TOCANDO" : "|| PAUSADO", 270, 150, 1);
+  }
+
+  // Interpola segundos da musica suavemente quando em reproducao
+  int32_t effPos = mediaSt.pos;
+  if (mediaSt.playing && mediaSt.syncMs > 0) {
+    effPos += (int32_t)((millis() - mediaSt.syncMs) / 1000);
+  }
+  if (mediaSt.dur > 0 && effPos > mediaSt.dur) effPos = mediaSt.dur;
+  if (effPos < 0) effPos = 0;
+
+  // Barra de progresso da faixa (sem flicker)
+  const int barX = 16, barY = 204, barW = 204, barH = 6;
+  float pct = (mediaSt.dur > 0) ? constrain((float)effPos / (float)mediaSt.dur, 0.0f, 1.0f) : 0.0f;
+  int fillW = (int)((barW - 2) * pct);
+  if (fillW != gLastMediaFillW) {
+    tft.fillRoundRect(barX, barY, barW, barH, 3, 0x1082);
+    if (fillW > 2) {
+      tft.fillRoundRect(barX + 1, barY + 1, fillW, barH - 2, 2, mCol);
+    }
+    gLastMediaFillW = fillW;
+  }
+
+  // Micro-pill de tempo MM:SS / MM:SS
+  char tBuf[20];
+  if (mediaSt.dur > 0) {
+    snprintf(tBuf, sizeof(tBuf), "%02d:%02d/%02d:%02d",
+             (int)(effPos / 60), (int)(effPos % 60),
+             (int)(mediaSt.dur / 60), (int)(mediaSt.dur % 60));
+  } else {
+    snprintf(tBuf, sizeof(tBuf), "%02d:%02d / LIVE", (int)(effPos / 60), (int)(effPos % 60));
+  }
+  tft.fillRoundRect(226, 200, 78, 13, 3, 0x0841);
+  tft.setTextDatum(MC_DATUM);
+  tft.setTextColor(0xFFFF, 0x0841);
+  tft.drawString(tBuf, 265, 206, 1);
+}
+
 // ================================================= Serial / Protocolo JSON =
 void applyJson(const char *json) {
   JsonDocument doc;
@@ -1568,6 +2295,21 @@ void applyJson(const char *json) {
         uploadFile.close();
       }
       String cleanName = fName.startsWith("/") ? fName.substring(1) : fName;
+      String cleanLow = cleanName;
+      cleanLow.toLowerCase();
+      bool isMediaCover = (doc["is_cover"] | false) || cleanLow.startsWith("_media");
+      if (isMediaCover) {
+        strlcpy(mediaSt.coverFile, cleanName.c_str(), sizeof(mediaSt.coverFile));
+        if (!doc["cid"].isNull()) {
+          strlcpy(mediaSt.coverId, doc["cid"] | "cov", sizeof(mediaSt.coverId));
+        } else {
+          snprintf(mediaSt.coverId, sizeof(mediaSt.coverId), "%lu", (unsigned long)(millis() & 0xFFFF));
+        }
+        mediaSt.hasCover = true;
+        gLastMediaSig[0] = '\0'; // Forca redesenho imediato da nova capa na SCR_MEDIA
+        Serial.println("ACK_EOF");
+        return;
+      }
       strlcpy(bgImage, cleanName.c_str(), sizeof(bgImage));
       prefs.putString("bg", bgImage);
       needFullDraw = true;
@@ -1592,7 +2334,10 @@ void applyJson(const char *json) {
     } else if (vScr.is<const char*>()) {
       String s = String(vScr.as<const char*>());
       s.toLowerCase();
-      if (s.indexOf("mkt") >= 0 || s.indexOf("merc") >= 0 || s.indexOf("bolsa") >= 0) newScr = SCR_MARKET;
+      if (s.indexOf("pomo") >= 0 || s.indexOf("foco") >= 0) newScr = SCR_POMODORO;
+      else if (s.indexOf("med") >= 0 || s.indexOf("spot") >= 0 || s.indexOf("yt") >= 0 || s.indexOf("mus") >= 0) newScr = SCR_MEDIA;
+      else if (s.indexOf("port") >= 0 || s.indexOf("cart") >= 0 || s.indexOf("patr") >= 0) newScr = SCR_PORTFOLIO;
+      else if (s.indexOf("mkt") >= 0 || s.indexOf("merc") >= 0 || s.indexOf("bolsa") >= 0) newScr = SCR_MARKET;
       else if (s.indexOf("dual") >= 0) newScr = SCR_CPU_RAM_DUAL;
       else if (s.indexOf("cpu") >= 0)  newScr = SCR_CPU_RAM;
       else if (s.indexOf("gpu") >= 0)  newScr = SCR_GPU_FOCUS;
@@ -1641,10 +2386,12 @@ void applyJson(const char *json) {
   if (vBrt.isNull()) vBrt = root["brightness"];
   if (vBrt.isNull()) vBrt = root["cmd_bright"];
   if (!vBrt.isNull()) {
-    int newBrt = constrain(vBrt.as<int>(), 5, 255);
+    int newBrt = constrain(vBrt.as<int>(), 0, 255);
     if (newBrt != currentBrightness) {
-      setBacklight(newBrt);
-      prefs.putInt("bright", currentBrightness);
+      setBacklight(newBrt, true);
+      if (newBrt > 0) {
+        prefs.putInt("bright", currentBrightness);
+      }
     }
   }
 
@@ -1692,6 +2439,60 @@ void applyJson(const char *json) {
     if (mkt.usd > 0 || mkt.btc > 0) {
       mkt.valid = true;
     }
+  }
+
+  // 4.5) Processa Gestao de Portfolio de Investimentos ("portf")
+  JsonVariant jp = root["portf"];
+  if (!jp.isNull()) {
+    portf.tot     = jp["tot"]     | portf.tot;
+    portf.pnl_pct = jp["pnl_pct"] | portf.pnl_pct;
+    portf.pnl_val = jp["pnl_val"] | portf.pnl_val;
+    portf.day_pct = jp["day_pct"] | portf.day_pct;
+    portf.count   = jp["cnt"]     | portf.count;
+
+    if (jp["top3"].is<JsonArray>()) {
+      JsonArray arr = jp["top3"].as<JsonArray>();
+      for (int k = 0; k < 3; k++) {
+        strlcpy(portf.top3[k], "---", sizeof(portf.top3[k]));
+        portf.top3c[k] = 0.0f;
+        portf.top3w[k] = 0.0f;
+      }
+      uint8_t idx = 0;
+      for (JsonVariant v : arr) {
+        if (idx >= 3) break;
+        const char* sym = v.as<const char*>();
+        if (sym && sym[0]) {
+          strlcpy(portf.top3[idx], sym, sizeof(portf.top3[idx]));
+          idx++;
+        }
+      }
+      portf.topCount = idx;
+    }
+
+    if (jp["top3c"].is<JsonArray>()) {
+      JsonArray arrC = jp["top3c"].as<JsonArray>();
+      uint8_t idx = 0;
+      for (JsonVariant v : arrC) {
+        if (idx >= 3) break;
+        portf.top3c[idx++] = v.as<float>();
+      }
+      portf.hasTop3c = (idx > 0);
+    } else {
+      portf.hasTop3c = false;
+    }
+
+    if (jp["top3w"].is<JsonArray>()) {
+      JsonArray arrW = jp["top3w"].as<JsonArray>();
+      uint8_t idx = 0;
+      for (JsonVariant v : arrW) {
+        if (idx >= 3) break;
+        portf.top3w[idx++] = v.as<float>();
+      }
+    }
+
+    portf.valid = (portf.topCount > 0 || portf.tot > 0.0f);
+    linked = true;
+    lastPacket = millis();
   }
 
   // 5) Processa Telemetria de Hardware em "sys" (ou na raiz do JSON)
@@ -1745,6 +2546,54 @@ void applyJson(const char *json) {
       linked = true;
       needFullDraw = true;
     }
+  }
+
+  // 6) Processa Bloco Pomodoro ("pomo") - Modulo 3
+  JsonVariant pm = root["pomo"];
+  if (!pm.isNull()) {
+    if (!pm["st"].isNull()) sanitizeAscii(pomo.state, pm["st"] | "WORK", sizeof(pomo.state));
+    pomo.running = pm["run"] | pomo.running;
+    int32_t newRem = pm["rem"] | pomo.rem;
+    if (newRem > 2) pomo.chimeGuard = false;
+    pomo.rem     = newRem;
+    pomo.tot     = pm["tot"] | pomo.tot;
+    pomo.cycles  = pm["cyc"] | pomo.cycles;
+    pomo.syncMs  = millis();
+    pomo.valid   = true;
+
+    if (pm["done"] | false) {
+      bool isBrk = (strcasecmp(pomo.state, "WORK") != 0);
+      triggerAlert(true, isBrk ? 0x07FF : 0x07E0, 3);
+      pomo.chimeGuard = true;
+    }
+  }
+
+  // 7) Processa Bloco Multimidia Spotify / YouTube Music ("media") - Modulo 3
+  JsonVariant md = root["media"];
+  if (!md.isNull()) {
+    if (!md["src"].isNull()) sanitizeAscii(mediaSt.source, md["src"] | "MEDIA", sizeof(mediaSt.source));
+    mediaSt.playing = md["play"] | false;
+    if (!md["tit"].isNull()) sanitizeAscii(mediaSt.title,  md["tit"] | "", sizeof(mediaSt.title));
+    if (!md["art"].isNull()) sanitizeAscii(mediaSt.artist, md["art"] | "", sizeof(mediaSt.artist));
+    if (!md["alb"].isNull()) sanitizeAscii(mediaSt.album,  md["alb"] | "", sizeof(mediaSt.album));
+    mediaSt.pos = md["pos"] | 0;
+    mediaSt.dur = md["dur"] | 0;
+    if (!md["cov"].isNull()) sanitizeAscii(mediaSt.coverFile, md["cov"] | "_media_cov.jpg", sizeof(mediaSt.coverFile));
+    if (!md["cid"].isNull()) sanitizeAscii(mediaSt.coverId,   md["cid"] | "", sizeof(mediaSt.coverId));
+    mediaSt.syncMs = millis();
+    mediaSt.valid  = true;
+  }
+
+  // 8) Processa Bloco de Alertas Fisicos ("alrt") - Buzzer e LED RGB
+  JsonVariant alrt = root["alrt"];
+  if (!alrt.isNull()) {
+    bool bz = alrt["bz"] | false;
+    uint16_t ledCol = C_WARN;
+    if (!alrt["led"].isNull()) {
+      ledCol = parseColorVariant(alrt["led"]);
+    }
+    uint8_t pat = alrt["p"] | 1;
+    triggerAlert(bz, ledCol, pat);
   }
 }
 
@@ -1833,7 +2682,7 @@ void setup() {
   tft.setTextDatum(MC_DATUM);
   tft.setTextColor(C_ACCENT, C_CARD);
   tft.drawString("CYD HARDWARE", SCR_W / 2, 78, 4);
-  tft.drawString("& MARKET v3.0", SCR_W / 2, 108, 4);
+  tft.drawString("& MARKET v4.0", SCR_W / 2, 108, 4);
   tft.setTextColor(C_TEXT, C_CARD);
   tft.drawString("Hardware + Bolsa & Cripto em Tempo Real", SCR_W / 2, 142, 2);
   tft.setTextColor(hasSD ? C_OK : C_WARN, C_CARD);
@@ -1848,6 +2697,7 @@ void setup() {
 void loop() {
   pumpSerial();
   pumpBootButton();
+  pumpAlerts(); // Execucao de bipes e flashes do alerta sem bloquear a CPU
 
   // Perdeu sinal do PC apos 5 segundos?
   if (linked && millis() - lastPacket > 5000) {
@@ -1855,12 +2705,14 @@ void loop() {
     needFullDraw = true;
   }
 
-  // LED RGB traseiro acompanha o status termico
-  float t = maxTemp();
-  if (!linked)              setLed(0, 0, 1); // Azul aguardando conexao
-  else if (t >= T_TEMP_MAX) setLed(1, 0, 0); // Vermelho critico
-  else if (t >= T_TEMP_HOT) setLed(1, 1, 0); // Amarelo atencao
-  else                      setLed(0, 1, 0); // Verde normal
+  // LED RGB traseiro: so aplica status termico se nao houver alerta ativo!
+  if (!alertEngine.active) {
+    float t = maxTemp();
+    if (!linked)              setLed(0, 0, 1); // Azul aguardando conexao
+    else if (t >= T_TEMP_MAX) setLed(1, 0, 0); // Vermelho critico
+    else if (t >= T_TEMP_HOT) setLed(1, 1, 0); // Amarelo atencao
+    else                      setLed(0, 1, 0); // Verde normal
+  }
 
   // Redesenho completo da estrutura estatica apenas quando muda tela, cor ou imagem de fundo
   if (needFullDraw) {
@@ -1872,6 +2724,9 @@ void loop() {
     else if (currentScreen == SCR_GRAPH)        screenGraphStatic();
     else if (currentScreen == SCR_WALLPAPER)    screenWallpaperStatic();
     else if (currentScreen == SCR_MARKET)       screenMarketStatic();
+    else if (currentScreen == SCR_PORTFOLIO)    screenPortfolioStatic();
+    else if (currentScreen == SCR_POMODORO)     screenPomodoroStatic();
+    else if (currentScreen == SCR_MEDIA)        screenMediaStatic();
     needFullDraw = false;
   }
 
@@ -1900,6 +2755,9 @@ void loop() {
     else if (currentScreen == SCR_GRAPH)        screenGraphDynamic();
     else if (currentScreen == SCR_WALLPAPER)    screenWallpaperDynamic();
     else if (currentScreen == SCR_MARKET)       screenMarketDynamic();
+    else if (currentScreen == SCR_PORTFOLIO)    screenPortfolioDynamic();
+    else if (currentScreen == SCR_POMODORO)     screenPomodoroDynamic();
+    else if (currentScreen == SCR_MEDIA)        screenMediaDynamic();
 
     drawClock();
   }
