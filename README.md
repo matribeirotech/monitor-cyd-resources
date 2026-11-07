@@ -11,50 +11,87 @@ Um **monitor de hardware, estação meteorológica regional, hub de automações
 
 ---
 
-## 📸 Galeria do Projeto (v4.0 em Funcionamento Real)
+## 📸 Galeria do Projeto (v4.1 em Hardware Real na Placa CYD)
 
-### 💻 1. Painel de Controle Desktop v4.0 — Navegação em 6 Abas Organizadas
-
-#### 📊 Aba 0: Painel Geral, Telemetria & Grade das 10 Telas
+### 💻 1. Novo Painel de Controle Desktop v4.1 — Navegação em 7 Abas & Gestão de 11 Telas
 <p align="center">
-  <img src="preview/v4-aba0-painel-telas.png" alt="Aba 0: Painel Geral e Seletor das 10 Telas da CYD" width="95%" />
-</p>
-
-#### 🍅🎵 Aba 1: Foco & Mídia — Pomodoro Focus Hub (Tela 8) + Player Spotify & YouTube Music (Tela 9)
-<p align="center">
-  <img src="preview/v4-aba1-foco-midia.png" alt="Aba 1: Pomodoro Timer e Player de Mídia com Capa ao Vivo" width="95%" />
-</p>
-
-#### 💼 Aba 2: Mercado Financeiro (Tela 6) & Portfólio Pessoal de Investimentos (Tela 7)
-<p align="center">
-  <img src="preview/v4-aba2-mercado-carteira.png" alt="Aba 2: Cotações ao Vivo e Gestão de Carteira Pessoal" width="95%" />
-</p>
-
-#### 🎨☀️ Aba 3: Estúdio de Cores RGB565, Fundo SD, Brilho PWM & Modo Sleep/Noturno
-<p align="center">
-  <img src="preview/v4-aba3-estudio-energia.png" alt="Aba 3: Seletor de Cores em Tempo Real, Wallpapers e Gestão de Energia" width="95%" />
-</p>
-
-#### 🔔 Aba 4: Sistema de Alertas Físicos Avançados (Buzzer & LED RGB)
-<p align="center">
-  <img src="preview/v4-aba4-alertas-fisicos.png" alt="Aba 4: Configuração de Gatilhos de Alerta Físico na CYD" width="95%" />
+  <img src="preview/5.0/agent-novo.jpg" alt="Novo Painel de Controle Desktop v4.1 - 7 Abas, Header com Clima Regional de Votuporanga e Seletor das 11 Telas da CYD" width="98%" />
 </p>
 
 ---
 
-### 🖥️ Telas em Execução na Placa CYD (Hardware Real)
+### 🖥️ 2. Fotos em Execução Real na Placa CYD (ESP32-2432S028R)
+
+Todas as fotos abaixo foram capturadas diretamente da placa física em funcionamento, exibindo o **menu superior com Data e Temperatura de Votuporanga em tempo real** e as novas telas:
+
+#### 🌦️🤖 Tela 10: Clima Regional (Votuporanga), Previsão & Gemini Gems IA
 <p align="center">
-  <img src="preview/preview-tela-4.jpg" alt="Tela Bolsa e Cripto - Dólar, Euro, IBOVESPA e Bitcoin 24h" width="49%" />
-  <img src="preview/preview-tela-5.jpg" alt="Tela Bolsa e Cripto com Ticker Tape mostrando S&P500 e CPU" width="49%" />
+  <img src="preview/5.0/IMG_20261107_150219_002.jpg" alt="Tela 10: Clima Regional de Votuporanga (35.1°C), Sensação, Vento, Chuva e Gemini Gems IA (Radar Embarcados)" width="85%" />
 </p>
+
+#### ⚡ Tela 0: Resumo Gauges & 🖥️ Tela 1: CPU + RAM Principal (`sys.mon_`)
 <p align="center">
-  <img src="preview/preview-tela-1.jpg" alt="Tela Resumo - Tema Verde Matrix com Ticker Tape" width="49%" />
-  <img src="preview/preview-tela-2.jpg" alt="Tela Resumo - Tema Azul Neon com Cotação Dólar e Euro" width="49%" />
+  <img src="preview/5.0/IMG_20261107_150101_946.jpg" alt="Tela 0: Resumo Gauges circulares com cabeçalho [35C] VOTUPORANGA" width="49%" />
+  <img src="preview/5.0/IMG_20261107_150110_792.jpg" alt="Tela 1: CPU + RAM Principal sys.mon_ com barras e gráficos duplos" width="49%" />
 </p>
+
+#### 📈 Tela 2: Gráfico Duplo CPU vs RAM & 🎮 Tela 3: GPU Focus
 <p align="center">
-  <img src="preview/preview-tela-3.jpg" alt="Tela Resumo - Tema Vermelho Crimson com Criptomoedas" width="49%" />
-  <img src="preview/preview-tela-6.jpg" alt="Tela 4x Gráficos em Tempo Real (CPU, RAM, GPU, Temp) + Ticker Tape" width="49%" />
+  <img src="preview/5.0/IMG_20261107_150122_079.jpg" alt="Tela 2: Gráfico Duplo CPU vs RAM sobrepostos" width="49%" />
+  <img src="preview/5.0/IMG_20261107_150136_050.jpg" alt="Tela 3: GPU Focus - Medidor de carga, Watts e VRAM + Ticker Votuporanga" width="49%" />
 </p>
+
+#### 📊 Tela 4: 4x Gráficos em Tempo Real & 💰 Tela 6: Mercado Financeiro & Cripto
+<p align="center">
+  <img src="preview/5.0/IMG_20261107_150142_150.jpg" alt="Tela 4: 4x Gráficos em Tempo Real (CPU, RAM, GPU, Temp)" width="49%" />
+  <img src="preview/5.0/IMG_20261107_150151_460.jpg" alt="Tela 6: Mercado Financeiro - Dólar, Euro, IBOVESPA e Curva Bitcoin 24h" width="49%" />
+</p>
+
+#### 💼 Tela 7: Meu Portfólio & 🍅 Tela 8: Pomodoro Focus Hub
+<p align="center">
+  <img src="preview/5.0/IMG_20261107_150158_685.jpg" alt="Tela 7: Portfólio de Investimentos Pessoal com PnL dinâmico" width="49%" />
+  <img src="preview/5.0/IMG_20261107_150204_804.jpg" alt="Tela 8: Pomodoro Focus Hub - Cronômetro circular 25:00 e contador de ciclos" width="49%" />
+</p>
+
+#### 🎵 Tela 9: Player Spotify & YouTube Music
+<p align="center">
+  <img src="preview/5.0/IMG_20261107_150210_945.jpg" alt="Tela 9: Player Multimídia com disco holográfico e card translúcido de mídia" width="85%" />
+</p>
+
+---
+
+### 💻 3. Abas do Painel de Controle Desktop v4.1 (Flet / Flutter)
+
+<details>
+<summary><b>Clique para ver as capturas individuais de cada aba do Desktop</b></summary>
+<br/>
+
+#### 📊 Aba 0: Painel Geral, Telemetria & Grade das Telas
+<p align="center">
+  <img src="preview/v4-aba0-painel-telas.png" alt="Aba 0: Painel Geral e Seletor de Telas" width="90%" />
+</p>
+
+#### 🍅🎵 Aba 1: Foco & Mídia — Pomodoro Focus Hub + Player Spotify / YouTube Music
+<p align="center">
+  <img src="preview/v4-aba1-foco-midia.png" alt="Aba 1: Pomodoro Timer e Player de Mídia" width="90%" />
+</p>
+
+#### 💼 Aba 2: Mercado Financeiro & Portfólio Pessoal de Investimentos
+<p align="center">
+  <img src="preview/v4-aba2-mercado-carteira.png" alt="Aba 2: Cotações ao Vivo e Gestão de Carteira" width="90%" />
+</p>
+
+#### 🎨☀️ Aba 3: Estúdio de Cores RGB565, Fundo SD, Brilho PWM & Modo Sleep/Noturno
+<p align="center">
+  <img src="preview/v4-aba3-estudio-energia.png" alt="Aba 3: Seletor de Cores e Energia" width="90%" />
+</p>
+
+#### 🔔 Aba 4: Sistema de Alertas Físicos Avançados (Buzzer & LED RGB)
+<p align="center">
+  <img src="preview/v4-aba4-alertas-fisicos.png" alt="Aba 4: Configuração de Gatilhos de Alerta Físico" width="90%" />
+</p>
+
+</details>
 
 ---
 
