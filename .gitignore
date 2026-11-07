@@ -47,10 +47,7 @@ agent/build/
 *.spec.bak
 
 # =============================================================================
-# Sistema Operacional & Arquivos Temporários
+# Configuracoes Locais / Runtime do Usuario (Chaves de API & Estado)
 # =============================================================================
-.DS_Store
-Thumbs.db
-Desktop.ini
-*.log
-.venv/
+agent/ui_config.json
+ui_config.json
