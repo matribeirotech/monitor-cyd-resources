@@ -1,0 +1,135 @@
+name: CI/CD — Build Agent & Firmware Release
+
+on:
+  push:
+    branches:
+      - main
+    tags:
+      - 'v*'
+  pull_request:
+    branches:
+      - main
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  # ---------------------------------------------------------------------------
+  # Job 1: Build Executável Windows do Agente (PyInstaller)
+  # ---------------------------------------------------------------------------
+  build-agent:
+    name: Build Windows Agent (.exe)
+    runs-on: windows-latest
+
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+          cache: 'pip'
+          cache-dependency-path: 'agent/requirements.txt'
+
+      - name: Install Dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r agent/requirements.txt
+
+      - name: Build Agent Executable with PyInstaller
+        working-directory: agent
+        run: |
+          pyinstaller --noconfirm CYD-Hardware-Monitor.spec
+
+      - name: Verify Built Executable
+        run: |
+          Get-Item agent/dist/CYD-Hardware-Monitor.exe
+          $sizeMb = (Get-Item agent/dist/CYD-Hardware-Monitor.exe).Length / 1MB
+          Write-Host ("Executable size: {0:N2} MB" -f $sizeMb)
+
+      - name: Upload Agent Executable Artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: CYD-Hardware-Monitor-Windows-x64
+          path: agent/dist/CYD-Hardware-Monitor.exe
+          if-no-files-found: error
+
+  # ---------------------------------------------------------------------------
+  # Job 2: Build Firmware ESP32 CYD (PlatformIO)
+  # ---------------------------------------------------------------------------
+  build-firmware:
+    name: Build ESP32 CYD Firmware (.bin)
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install PlatformIO
+        run: |
+          pip install --upgrade platformio
+
+      - name: Compile ESP32 CYD Firmware
+        run: |
+          pio run -e cyd
+
+      - name: Prepare Firmware Release File
+        run: |
+          mkdir -p dist-firmware
+          cp .pio/build/cyd/firmware.bin dist-firmware/cyd_firmware.bin
+
+      - name: Upload Firmware Artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: CYD-Firmware-ESP32
+          path: dist-firmware/cyd_firmware.bin
+          if-no-files-found: error
+
+  # ---------------------------------------------------------------------------
+  # Job 3: Publicar Release no GitHub (Apenas em tags v*)
+  # ---------------------------------------------------------------------------
+  release:
+    name: Publish GitHub Release
+    needs: [build-agent, build-firmware]
+    if: startsWith(github.ref, 'refs/tags/v')
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@v4
+
+      - name: Download Agent Artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: CYD-Hardware-Monitor-Windows-x64
+          path: release-assets
+
+      - name: Download Firmware Artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: CYD-Firmware-ESP32
+          path: release-assets
+
+      - name: Publish GitHub Release with Binaries
+        uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            release-assets/CYD-Hardware-Monitor.exe
+            release-assets/cyd_firmware.bin
+          name: Release ${{ github.ref_name }} — CYD Hardware, Clima Regional, Gemini Gems & Market Monitor
+          generate_release_notes: true
+          draft: false
+          prerelease: false
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}

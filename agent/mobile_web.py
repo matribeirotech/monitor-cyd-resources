@@ -679,8 +679,8 @@ HTML_MOBILE_APP = r"""<!DOCTYPE html>
     <div class="topbar-left">
       <div class="topbar-icon">⚡</div>
       <div>
-        <div class="topbar-title" id="txtTitle">CYD CONTROLLER</div>
-        <div class="topbar-sub">ESP32-2432S028R &bull; Wi-Fi Remote</div>
+        <div class="topbar-title" id="txtTitle">CYD CONTROLLER v4.1</div>
+        <div class="topbar-sub" id="topWthSub">📍 Votuporanga &bull; 🌡️ --°C &bull; 📅 --/--</div>
       </div>
     </div>
     <div class="status-badge">
@@ -769,7 +769,7 @@ HTML_MOBILE_APP = r"""<!DOCTYPE html>
     </div>
 
     <div class="sec-header" style="margin-top:14px;">
-      <div class="sec-title">FINANÇAS, FOCO & MÍDIA v4.0 (TELAS 6 A 9)</div>
+      <div class="sec-title">FINANÇAS, FOCO, MÍDIA, CLIMA & GEMINI IA v4.1 (TELAS 6 A 10)</div>
     </div>
     <div class="screen-grid">
       <div class="screen-card" data-screen="6" onclick="selectScreen(6)">
@@ -813,6 +813,17 @@ HTML_MOBILE_APP = r"""<!DOCTYPE html>
         <div>
           <div class="sc-title">Tela 9: Mídia</div>
           <div class="sc-desc">Spotify & YouTube Music + Capa 320x240</div>
+        </div>
+      </div>
+
+      <div class="screen-card" data-screen="10" onclick="selectScreen(10)" style="grid-column: span 2;">
+        <div class="sc-top">
+          <div class="sc-icon">🌦️🤖</div>
+          <div class="sc-badge" id="badge-10">T10</div>
+        </div>
+        <div>
+          <div class="sc-title">Tela 10: Clima Regional & Gemini Gems</div>
+          <div class="sc-desc" id="sc10Desc">Votuporanga • Data, Temp °C, Alertas de Tempestade & IA Gems</div>
         </div>
       </div>
     </div>
@@ -1566,6 +1577,22 @@ HTML_MOBILE_APP = r"""<!DOCTYPE html>
         } else if (!md.cover_b64 && appState.cover_id !== "") {
           appState.cover_id = "";
           document.getElementById("mCoverBox").innerHTML = "💿";
+        }
+      }
+
+      // Clima Regional (Votuporanga) & Gemini Gems (Tela 10)
+      if (data.weather) {
+        const w = data.weather;
+        const subEl = document.getElementById("topWthSub");
+        if (subEl) {
+          const alrtPref = w.alert ? "⛈️ ALERTA • " : "📍 ";
+          subEl.innerText = `${alrtPref}${w.city || "Votuporanga"} • 🌡️ ${Number(w.temp || 0).toFixed(1)}°C • 📅 ${w.date_short || ""}`;
+          subEl.style.color = w.alert ? "#FEF08A" : "";
+        }
+        const sc10 = document.getElementById("sc10Desc");
+        if (sc10) {
+          const gTitle = (data.gems && data.gems.last_title) ? data.gems.last_title : "Gemini Gems";
+          sc10.innerText = `${w.city || "Votuporanga"}: ${Number(w.temp || 0).toFixed(1)}°C (${w.cond || ""}) • 🤖 ${gTitle}`;
         }
       }
 

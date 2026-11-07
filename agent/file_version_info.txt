@@ -4,8 +4,8 @@
 # http://msdn.microsoft.com/en-us/library/ms646997.aspx
 VSVersionInfo(
   ffi=FixedFileInfo(
-    filevers=(4, 0, 0, 0),
-    prodvers=(4, 0, 0, 0),
+    filevers=(4, 1, 0, 0),
+    prodvers=(4, 1, 0, 0),
     mask=0x3f,
     flags=0x0,
     OS=0x4,
@@ -20,13 +20,13 @@ VSVersionInfo(
           '040904e4',
           [
             StringStruct('CompanyName', 'z1po'),
-            StringStruct('FileDescription', 'CYD Hardware & Financial Market Monitor Desktop Agent v4.0'),
-            StringStruct('FileVersion', '4.0.0.0'),
+            StringStruct('FileDescription', 'CYD Hardware, Regional Weather, Gemini Gems & Financial Market Monitor Desktop Agent v4.1'),
+            StringStruct('FileVersion', '4.1.0.0'),
             StringStruct('InternalName', 'CYD-Hardware-Monitor'),
             StringStruct('LegalCopyright', 'Matheus Ribeiro (z1po) - Licença MIT'),
             StringStruct('OriginalFilename', 'CYD-Hardware-Monitor.exe'),
             StringStruct('ProductName', 'CYD Hardware & Financial Market Monitor'),
-            StringStruct('ProductVersion', '4.0.0.0')
+            StringStruct('ProductVersion', '4.1.0.0')
           ]
         )
       ]
@@ -34,3 +34,4 @@ VSVersionInfo(
     VarFileInfo([VarStruct('Translation', [1033, 1252])])
   ]
 )
+

@@ -908,6 +908,55 @@ DEFAULT_PORTFOLIO = [
     {"ticker": "PETR4", "qty": 100.0, "avg_price": 35.80, "currency": "BRL"},
 ]
 
+DEFAULT_GEMS = [
+    {
+        "id": "gem_embedded",
+        "name": "🔧 Radar Embarcados & IoT",
+        "topic": "Sistemas Embarcados ESP32 IoT Microcontroladores",
+        "prompt": (
+            "Traga as 3 notícias ou novidades técnicas mais recentes sobre Sistemas Embarcados, "
+            "ESP32, Microcontroladores, RTOS e IoT em 3 tópicos curtos (máx 340 caracteres no total), "
+            "diretos e sem formatação markdown complexa."
+        ),
+        "interval_min": 60,
+        "enabled": True,
+    },
+    {
+        "id": "gem_weather_vot",
+        "name": "🌦️ Clima & Alertas Regionais",
+        "topic": "Previsao do Tempo Votuporanga Interior SP Chuva",
+        "prompt": (
+            "Analise o clima atual de {city} ({temp}°C, sensação {feels}°C, condição {cond}, "
+            "chuva {rain}%, vento {wind} km/h, mín {tmin}°C / máx {tmax}°C) e gere um boletim "
+            "prático de 3 linhas curtas avisando sobre calor, chuva ou tempestade."
+        ),
+        "interval_min": 60,
+        "enabled": True,
+    },
+    {
+        "id": "gem_market_flash",
+        "name": "📈 Flash de Mercado & Cripto",
+        "topic": "Bitcoin Dolar Ibovespa Mercado Financeiro",
+        "prompt": (
+            "Com base nas cotações atuais (Dólar R$ {usd}, Bitcoin US$ {btc}, Ethereum US$ {eth}, "
+            "IBOV {ibov} pts) e no cenário econômico do dia, resuma em 3 frases curtas os destaques financeiros."
+        ),
+        "interval_min": 120,
+        "enabled": True,
+    },
+    {
+        "id": "gem_cpp_python",
+        "name": "💡 Dica Dev: ESP32 C++ & Python",
+        "topic": "Programacao ESP32 C++ FreeRTOS Python Automacao",
+        "prompt": (
+            "Gere 3 dicas práticas rápidas de arquitetura e performance para projetos com ESP32 "
+            "(C++/TFT_eSPI/FreeRTOS) e Python (Flet/Serial) em frases curtas."
+        ),
+        "interval_min": 180,
+        "enabled": True,
+    },
+]
+
 
 def load_ui_config():
     defaults = {
@@ -932,6 +981,12 @@ def load_ui_config():
         "pomo_buzzer": True,
         "media_source_pref": "auto",
         "media_auto_cover": True,
+        "weather_city": "Votuporanga",
+        "gemini_api_key": os.environ.get("GEMINI_API_KEY", ""),
+        "gemini_model": "gemini-3.8-flash",
+        "gems": [dict(g) for g in DEFAULT_GEMS],
+        "active_gem_id": "gem_embedded",
+        "gem_auto_rotate": True,
         "sd_files": [
             "none",
             "terminal",
@@ -955,6 +1010,10 @@ def load_ui_config():
                     defaults["alert_rules"] = [dict(r) for r in DEFAULT_ALERT_RULES]
                 if "portfolio" not in saved or not isinstance(saved["portfolio"], list):
                     defaults["portfolio"] = [dict(p) for p in DEFAULT_PORTFOLIO]
+                if "gems" not in saved or not isinstance(saved["gems"], list) or not saved["gems"]:
+                    defaults["gems"] = [dict(g) for g in DEFAULT_GEMS]
+                if not defaults.get("gemini_api_key") and os.environ.get("GEMINI_API_KEY"):
+                    defaults["gemini_api_key"] = os.environ.get("GEMINI_API_KEY", "")
         except Exception:
             pass
     return defaults
@@ -1890,12 +1949,678 @@ class MediaCollector:
             time.sleep(0.85)
 
 
+# ========================================== CLIMA REGIONAL & TEMPESTADES =====
+def to_ascii_safe(text: str) -> str:
+    """Converte acentos e emojis do português para ASCII puro compatível com a fonte bitmap TFT_eSPI da CYD."""
+    import unicodedata
+
+    if not text:
+        return ""
+    s = str(text)
+    replacements = {
+        "🔧": "[EMB] ",
+        "🌦️": "[CLIMA] ",
+        "⛈️": "[ALERTA] ",
+        "📈": "[MKT] ",
+        "💻": "[DEV] ",
+        "🤖": "[IA] ",
+        "☀️": "",
+        "🌤️": "",
+        "☁️": "",
+        "🌧️": "",
+        "•": "|",
+        "—": "-",
+        "–": "-",
+        "“": '"',
+        "”": '"',
+        "’": "'",
+        "°": "o",
+    }
+    for k, v in replacements.items():
+        s = s.replace(k, v)
+    nfkd = unicodedata.normalize("NFKD", s)
+    ascii_str = "".join(ch for ch in nfkd if not unicodedata.combining(ch) and (ord(ch) < 128 or ch == "\n"))
+    return ascii_str.strip()
+
+
+class WeatherCollector:
+    """
+    Coletor Meteorológico Regional + Detector de Tempestade/Clima Severo (Open-Meteo API).
+    - Configurado por padrão para 'Votuporanga' (SP, Brasil), editável para qualquer cidade.
+    - Fornece Data Atual (DD/MM e DD/MM/AAAA), Dia da Semana, Temperatura (°C), Sensação,
+      Umidade, Vento, Probabilidade de Chuva e Alerta de Tempestade/Clima Severo para a CYD.
+    """
+
+    PRESET_COORDS = {
+        "votuporanga": ("Votuporanga", "SP", -20.4228, -49.9728),
+        "sao jose do rio preto": ("S. J. Rio Preto", "SP", -20.8197, -49.3794),
+        "rio preto": ("S. J. Rio Preto", "SP", -20.8197, -49.3794),
+        "fernandopolis": ("Fernandopolis", "SP", -20.2839, -50.2464),
+        "jales": ("Jales", "SP", -20.2689, -50.5458),
+        "aracatuba": ("Aracatuba", "SP", -21.2089, -50.4328),
+        "sao paulo": ("Sao Paulo", "SP", -23.5505, -46.6333),
+        "campinas": ("Campinas", "SP", -22.9056, -47.0608),
+        "ribeirao preto": ("Ribeirao Preto", "SP", -21.1775, -47.8103),
+        "curitiba": ("Curitiba", "PR", -25.4284, -49.2733),
+        "rio de janeiro": ("Rio de Janeiro", "RJ", -22.9068, -43.1729),
+        "belo horizonte": ("Belo Horizonte", "MG", -19.9167, -43.9345),
+        "brasilia": ("Brasilia", "DF", -15.7939, -47.8828),
+    }
+
+    DOW_PT = ["SEG", "TER", "QUA", "QUI", "SEX", "SAB", "DOM"]
+
+    def __init__(self, initial_city: str = "Votuporanga", poll_interval: float = 240.0, city: str = None, interval: float = None):
+        self._lock = threading.Lock()
+        self.poll_interval = float(interval if interval is not None else poll_interval)
+        self._city_query = (city or initial_city or "Votuporanga").strip()
+        self._resolved_city = "Votuporanga"
+        self._resolved_state = "SP"
+        self._lat = -20.4228
+        self._lon = -49.9728
+        self._simulated_storm = False
+        self._simulated_msg = "TEMPESTADE / RAIOS NA REGIAO!"
+        self._data = {
+            "valid": False,
+            "temp": 28.0,
+            "feels": 29.5,
+            "tmin": 20.0,
+            "tmax": 32.0,
+            "hum": 55,
+            "wind": 12.0,
+            "rain": 10,
+            "wmo_code": 0,
+            "icon": 0,
+            "cond": "Ceu Limpo",
+            "emoji": "☀️",
+            "real_storm": False,
+            "alert_msg": "TEMPESTADE / CHUVA FORTE EM VOTUPORANGA!",
+            "last_str": "--:--:--",
+        }
+        self._trigger = threading.Event()
+        self._running = True
+        self._resolve_city_coords(self._city_query)
+        threading.Thread(target=self._worker, daemon=True).start()
+
+    def _http_json(self, url: str, timeout: float = 4.5):
+        req = urllib.request.Request(
+            url,
+            headers={
+                "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) CYDMonitor/4.1",
+                "Accept": "application/json",
+            },
+        )
+        with urllib.request.urlopen(req, timeout=timeout) as resp:
+            return json.loads(resp.read().decode("utf-8", errors="ignore"))
+
+    def _resolve_city_coords(self, city_name: str) -> bool:
+        clean = (city_name or "Votuporanga").strip()
+        norm = clean.lower()
+        for k, v in [("á", "a"), ("ã", "a"), ("â", "a"), ("é", "e"), ("ê", "e"), ("í", "i"), ("ó", "o"), ("ô", "o"), ("ú", "u"), ("ç", "c")]:
+            norm = norm.replace(k, v)
+
+        if norm in self.PRESET_COORDS:
+            c_name, st_code, lat, lon = self.PRESET_COORDS[norm]
+            with self._lock:
+                self._resolved_city = c_name
+                self._resolved_state = st_code
+                self._lat = lat
+                self._lon = lon
+            return True
+
+        try:
+            q = urllib.parse.quote(clean)
+            url = f"https://geocoding-api.open-meteo.com/v1/search?name={q}&count=1&language=pt&format=json"
+            res = self._http_json(url, timeout=4.0)
+            results = res.get("results") or []
+            if results:
+                r0 = results[0]
+                c_name = str(r0.get("name") or clean)[:22]
+                admin1 = str(r0.get("admin1") or "")[:16]
+                lat = float(r0.get("latitude", -20.4228))
+                lon = float(r0.get("longitude", -49.9728))
+                with self._lock:
+                    self._resolved_city = c_name
+                    self._resolved_state = admin1
+                    self._lat = lat
+                    self._lon = lon
+                return True
+        except Exception:
+            pass
+        return False
+
+    @staticmethod
+    def _decode_wmo(wmo_code: int, wind_kmh: float, precip_mm: float) -> tuple[str, int, str, bool]:
+        if wmo_code in (95, 96, 99):
+            return "Tempestade Raios", 3, "⛈️", True
+        if wmo_code in (65, 67, 82) or precip_mm >= 15.0:
+            return "Chuva Severa", 3, "⛈️", True
+        if wind_kmh >= 52.0:
+            return "Vendaval Forte", 3, "🌬️", True
+        if wmo_code in (51, 53, 55, 61, 63, 80, 81):
+            return "Chuva", 2, "🌧️", False
+        if wmo_code in (71, 73, 75, 77, 85, 86):
+            return "Granizo/Frio", 2, "🌨️", (wmo_code == 75)
+        if wmo_code in (45, 48):
+            return "Neblina", 1, "🌫️", False
+        if wmo_code in (2, 3):
+            return "Nublado", 1, "☁️", False
+        if wmo_code == 1:
+            return "Poucas Nuvens", 1, "🌤️", False
+        return "Ceu Limpo", 0, "☀️", False
+
+    def set_city(self, new_city: str) -> bool:
+        c = (new_city or "Votuporanga").strip()
+        if not c:
+            c = "Votuporanga"
+        with self._lock:
+            self._city_query = c
+        ok = self._resolve_city_coords(c)
+        self.fetch_now()
+        return ok
+
+    def set_simulated_storm(self, active: bool, custom_msg: str = ""):
+        with self._lock:
+            self._simulated_storm = bool(active)
+            if custom_msg:
+                self._simulated_msg = custom_msg.strip()
+            else:
+                self._simulated_msg = f"TEMPESTADE / RAIOS EM {self._resolved_city.upper()}!"
+
+    def trigger_storm_simulation(self, active: bool, custom_msg: str = ""):
+        self.set_simulated_storm(active, custom_msg)
+
+    def force_refresh(self):
+        self._trigger.set()
+
+    def toggle_simulated_storm(self) -> bool:
+        with self._lock:
+            self._simulated_storm = not self._simulated_storm
+            self._simulated_msg = f"TEMPESTADE / RAIOS EM {self._resolved_city.upper()}!"
+            return self._simulated_storm
+
+    def fetch_now(self) -> bool:
+        with self._lock:
+            lat = self._lat
+            lon = self._lon
+            city_lbl = self._resolved_city
+
+        try:
+            url = (
+                f"https://api.open-meteo.com/v1/forecast?latitude={lat:.4f}&longitude={lon:.4f}"
+                "&current=temperature_2m,relative_humidity_2m,apparent_temperature,weather_code,wind_speed_10m,precipitation"
+                "&daily=temperature_2m_max,temperature_2m_min,precipitation_probability_max"
+                "&timezone=America%2FSao_Paulo"
+            )
+            raw = self._http_json(url, timeout=4.5)
+            cur = raw.get("current") or {}
+            daily = raw.get("daily") or {}
+
+            temp = float(cur.get("temperature_2m", 28.0))
+            feels = float(cur.get("apparent_temperature", temp))
+            hum = int(round(float(cur.get("relative_humidity_2m", 55))))
+            wind = float(cur.get("wind_speed_10m", 10.0))
+            precip = float(cur.get("precipitation", 0.0))
+            wmo = int(cur.get("weather_code", 0))
+
+            tmax_arr = daily.get("temperature_2m_max") or [temp + 3.0]
+            tmin_arr = daily.get("temperature_2m_min") or [temp - 4.0]
+            rain_arr = daily.get("precipitation_probability_max") or [0]
+
+            tmax = float(tmax_arr[0]) if tmax_arr else temp
+            tmin = float(tmin_arr[0]) if tmin_arr else temp
+            rain_prob = int(round(float(rain_arr[0] or 0))) if rain_arr else 0
+
+            cond_str, icon_code, emoji, is_storm = self._decode_wmo(wmo, wind, precip)
+            alert_txt = f"TEMPESTADE / {cond_str.upper()} EM {city_lbl.upper()}!" if is_storm else f"CLIMA ESTAVEL EM {city_lbl.upper()}"
+
+            with self._lock:
+                self._data.update({
+                    "valid": True,
+                    "temp": round(temp, 1),
+                    "feels": round(feels, 1),
+                    "tmin": round(tmin, 1),
+                    "tmax": round(tmax, 1),
+                    "hum": max(0, min(100, hum)),
+                    "wind": round(wind, 1),
+                    "rain": max(0, min(100, rain_prob)),
+                    "wmo_code": wmo,
+                    "icon": icon_code,
+                    "cond": cond_str,
+                    "emoji": emoji,
+                    "real_storm": is_storm,
+                    "alert_msg": alert_txt,
+                    "last_str": brasilia_now().strftime("%H:%M:%S"),
+                })
+            return True
+        except Exception:
+            return False
+
+    def _worker(self):
+        self.fetch_now()
+        while self._running:
+            self._trigger.wait(timeout=self.poll_interval)
+            self._trigger.clear()
+            if not self._running:
+                break
+            self.fetch_now()
+
+    def get_cyd_payload(self) -> dict:
+        now_br = brasilia_now()
+        dt_short = now_br.strftime("%d/%m")
+        dt_full = now_br.strftime("%d/%m/%Y")
+        dow_str = self.DOW_PT[now_br.weekday()]
+        with self._lock:
+            d = dict(self._data)
+            city = self._resolved_city
+            sim_storm = self._simulated_storm
+            sim_msg = self._simulated_msg
+
+        is_alert = bool(sim_storm or d.get("real_storm", False))
+        icon_val = 3 if is_alert else int(d.get("icon", 0))
+        cond_val = "Tempestade!" if sim_storm else str(d.get("cond", "Ceu Limpo"))
+        rain_val = max(85, int(d.get("rain", 0))) if sim_storm else int(d.get("rain", 0))
+        amsg = sim_msg if sim_storm else str(d.get("alert_msg", "TEMPESTADE NA REGIAO!"))
+
+        return {
+            "city": to_ascii_safe(city)[:22],
+            "dt": dt_short,
+            "dtf": dt_full,
+            "dow": dow_str,
+            "temp": round(float(d.get("temp", 28.0)), 1),
+            "feels": round(float(d.get("feels", 29.0)), 1),
+            "tmin": round(float(d.get("tmin", 20.0)), 1),
+            "tmax": round(float(d.get("tmax", 32.0)), 1),
+            "hum": int(d.get("hum", 55)),
+            "wind": round(float(d.get("wind", 10.0)), 1),
+            "rain": rain_val,
+            "icon": icon_val,
+            "cond": to_ascii_safe(cond_val)[:20],
+            "alert": is_alert,
+            "alrt": is_alert,
+            "amsg": to_ascii_safe(amsg)[:52],
+        }
+
+    def get_ui_snapshot(self) -> dict:
+        now_br = brasilia_now()
+        with self._lock:
+            d = dict(self._data)
+            city = self._resolved_city
+            state_uf = self._resolved_state
+            lat = self._lat
+            lon = self._lon
+            sim_storm = self._simulated_storm
+            sim_msg = self._simulated_msg
+
+        is_alert = bool(sim_storm or d.get("real_storm", False))
+        rain_v = max(85, d.get("rain", 0)) if sim_storm else d.get("rain", 0)
+        return {
+            "valid": d.get("valid", False),
+            "city": city,
+            "state": state_uf,
+            "region": state_uf,
+            "lat": lat,
+            "lon": lon,
+            "date_short": now_br.strftime("%d/%m"),
+            "date_full": f"{self.DOW_PT[now_br.weekday()]} {now_br.strftime('%d/%m/%Y')}",
+            "dow": self.DOW_PT[now_br.weekday()],
+            "temp": d.get("temp", 28.0),
+            "feels": d.get("feels", 29.0),
+            "tmin": d.get("tmin", 20.0),
+            "tmax": d.get("tmax", 32.0),
+            "hum": d.get("hum", 55),
+            "wind": d.get("wind", 10.0),
+            "rain": rain_v,
+            "rain_prob": rain_v,
+            "cond": "Tempestade Severa (Simulada)" if sim_storm else d.get("cond", "Céu Limpo"),
+            "emoji": "⛈️" if is_alert else d.get("emoji", "☀️"),
+            "alert": is_alert,
+            "simulated_storm": sim_storm,
+            "sim_storm": sim_storm,
+            "alert_msg": sim_msg if sim_storm else d.get("alert_msg", ""),
+            "last_str": d.get("last_str", "--:--:--"),
+            "updated": d.get("last_str", "--:--:--"),
+        }
+
+
+# ========================================== MOTOR GEMINI GEMS (AUTOMAÇÕES IA) =
+class GeminiGemsEngine:
+    """
+    Motor de Automações Diárias Inteligentes ("Gems") integrado ao Google Gemini:
+      - Conecta via API oficial Google Gemini Interactions (`/v1beta/interactions`) usando
+        `gemini-3.8-flash` (padrão), `gemini-4-argon` ou `gemini-3.5-flash-lite` com Grounding
+        (`google_search`) para buscar notícias recentes (ex: Sistemas Embarcados, ESP32, IoT).
+      - Possui Fallback Inteligente Automático via Google News RSS PT-BR + Telemetria Local,
+        garantindo que as Gems tragam notícias reais de Embarcados, Clima e Mercado mesmo antes
+        de o usuário configurar uma chave de API!
+    """
+
+    def __init__(
+        self,
+        api_key: str = "",
+        model: str = "gemini-3.8-flash",
+        gems: list[dict] = None,
+        active_gem_id: str = "gem_embedded",
+        auto_rotate: bool = True,
+    ):
+        self._lock = threading.Lock()
+        self.api_key = (api_key or os.environ.get("GEMINI_API_KEY", "")).strip()
+        self.model = (model or "gemini-3.8-flash").strip()
+        self.gems = [dict(g) for g in (gems or DEFAULT_GEMS)]
+        self.active_gem_id = active_gem_id or (self.gems[0]["id"] if self.gems else "gem_embedded")
+        self.auto_rotate = bool(auto_rotate)
+        self._outputs: dict[str, dict] = {}
+        self._last_run_ts: dict[str, float] = {}
+        self._last_rotate_ts = time.time()
+        self._running = True
+        self._busy = False
+        self._status_msg = "Pronto para executar Gems"
+
+    def configure(self, api_key: str = None, model: str = None, gems: list[dict] = None, active_gem_id: str = None, auto_rotate: bool = None):
+        with self._lock:
+            if api_key is not None:
+                self.api_key = api_key.strip()
+            if model is not None and model.strip():
+                self.model = model.strip()
+            if gems is not None:
+                self.gems = [dict(g) for g in gems]
+            if active_gem_id is not None:
+                self.active_gem_id = active_gem_id
+            if auto_rotate is not None:
+                self.auto_rotate = bool(auto_rotate)
+
+    def update_config(self, api_key: str = None, model: str = None, gems: list[dict] = None, active_gem_id: str = None, auto_rotate: bool = None):
+        self.configure(api_key=api_key, model=model, gems=gems, active_gem_id=active_gem_id, auto_rotate=auto_rotate)
+
+    def set_active_gem(self, gem_id: str):
+        with self._lock:
+            if gem_id:
+                self.active_gem_id = gem_id
+
+    def _call_gemini_interactions_api(self, prompt_text: str, topic_hint: str) -> tuple[str | None, str]:
+        with self._lock:
+            key = self.api_key or os.environ.get("GEMINI_API_KEY", "").strip()
+            mdl = self.model or "gemini-3.8-flash"
+
+        if not key:
+            return None, "Sem API Key (Usando Feed Inteligente Google News RSS + Contexto)"
+
+        sys_inst = (
+            "Você é uma Gem (Agente de Automação Diária) do painel embarcado CYD Hardware & Market Monitor. "
+            "Responda SEMPRE em português do Brasil, de forma ultra-concisa, dividida em 3 tópicos curtos "
+            "separados por quebra de linha (máximo de 340 caracteres no total), sem blocos de código e sem asteriscos duplos."
+        )
+
+        try:
+            url = "https://generativelanguage.googleapis.com/v1beta/interactions"
+            payload = {
+                "model": mdl,
+                "input": f"{prompt_text}\nContexto de busca: {topic_hint} (data atual: {brasilia_now().strftime('%d/%m/%Y')})",
+                "system_instruction": sys_inst,
+                "tools": [{"type": "google_search"}],
+            }
+            req = urllib.request.Request(
+                url,
+                data=json.dumps(payload).encode("utf-8"),
+                headers={
+                    "Content-Type": "application/json",
+                    "x-goog-api-key": key,
+                    "Api-Revision": "2026-05-20",
+                },
+                method="POST",
+            )
+            with urllib.request.urlopen(req, timeout=12.0) as resp:
+                data = json.loads(resp.read().decode("utf-8", errors="ignore"))
+                outputs = data.get("outputs") or []
+                texts = [o.get("text", "") for o in outputs if o.get("type") == "text" and o.get("text")]
+                if texts:
+                    clean = self._clean_gem_text("\n".join(texts))
+                    return clean, f"Gemini IA ({mdl} • Interactions API)"
+                if data.get("text"):
+                    return self._clean_gem_text(str(data["text"])), f"Gemini IA ({mdl})"
+        except urllib.error.HTTPError as he:
+            err_code = he.code
+            if err_code in (401, 403):
+                return None, f"API Key inválida/sem permissão (HTTP {err_code}) — usando Feed RSS"
+        except Exception:
+            pass
+
+        return None, "Feed Inteligente Google News RSS + Telemetria (Fallback Ativo)"
+
+    def _fetch_google_news_rss(self, query_topic: str, max_items: int = 3) -> list[str]:
+        import html
+        import xml.etree.ElementTree as ET
+
+        q = urllib.parse.quote((query_topic or "Sistemas Embarcados ESP32 IoT").strip())
+        url = f"https://news.google.com/rss/search?q={q}&hl=pt-BR&gl=BR&ceid=BR:pt-419"
+        req = urllib.request.Request(
+            url,
+            headers={"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) CYDMonitor/4.1"},
+        )
+        headlines = []
+        try:
+            with urllib.request.urlopen(req, timeout=5.0) as resp:
+                xml_bytes = resp.read()
+            root = ET.fromstring(xml_bytes)
+            for item in root.findall(".//item"):
+                title_el = item.find("title")
+                if title_el is not None and title_el.text:
+                    raw_t = html.unescape(title_el.text).strip()
+                    if " - " in raw_t:
+                        parts = raw_t.rsplit(" - ", 1)
+                        raw_t = f"{parts[0].strip()} ({parts[1].strip()[:14]})"
+                    headlines.append(f"- {raw_t}")
+                    if len(headlines) >= max_items:
+                        break
+        except Exception:
+            pass
+        return headlines
+
+    @staticmethod
+    def _clean_gem_text(raw: str) -> str:
+        txt = (raw or "").replace("**", "").replace("##", "").replace("`", "").strip()
+        lines = [ln.strip() for ln in txt.splitlines() if ln.strip()]
+        cleaned = "\n".join(lines)
+        return cleaned[:380]
+
+    def run_gem_now(
+        self,
+        gem_id: str,
+        wth_snap: dict = None,
+        mkt_snap: dict = None,
+        sys_snap: dict = None,
+        weather_snap: dict = None,
+        market_snap: dict = None,
+    ) -> dict:
+        wth_snap = wth_snap if wth_snap is not None else (weather_snap or {})
+        mkt_snap = mkt_snap if mkt_snap is not None else (market_snap or {})
+        sys_snap = sys_snap or {}
+        with self._lock:
+            target_gem = None
+            for g in self.gems:
+                if g.get("id") == gem_id:
+                    target_gem = dict(g)
+                    break
+            if not target_gem and self.gems:
+                target_gem = dict(self.gems[0])
+            self._busy = True
+            self._status_msg = f"Executando {target_gem.get('name', 'Gem')}..."
+
+        if not target_gem:
+            with self._lock:
+                self._busy = False
+            return {}
+
+        gid = target_gem.get("id", "gem_custom")
+        gname = target_gem.get("name", "Gem Personalizada")
+        topic = target_gem.get("topic", "Sistemas Embarcados ESP32 IoT")
+        raw_prompt = target_gem.get("prompt", "Traga 3 novidades sobre o tema.")
+
+        ctx_vars = {
+            "city": wth_snap.get("city", "Votuporanga"),
+            "temp": wth_snap.get("temp", 28.0),
+            "feels": wth_snap.get("feels", 29.0),
+            "cond": wth_snap.get("cond", "Céu Limpo"),
+            "rain": wth_snap.get("rain", 0),
+            "wind": wth_snap.get("wind", 10.0),
+            "tmin": wth_snap.get("tmin", 20.0),
+            "tmax": wth_snap.get("tmax", 32.0),
+            "usd": f"{mkt_snap.get('usd', 5.0):.2f}",
+            "btc": f"{mkt_snap.get('btc', 80000):,.0f}",
+            "eth": f"{mkt_snap.get('eth', 2500):,.0f}",
+            "ibov": f"{mkt_snap.get('ibov', 128000):,.0f}",
+            "cpu": f"{sys_snap.get('cpu', 0.0):.1f}",
+            "ram": f"{sys_snap.get('ram', 0.0):.1f}",
+        }
+        try:
+            formatted_prompt = raw_prompt.format(**ctx_vars)
+        except Exception:
+            formatted_prompt = raw_prompt
+
+        ai_text, source_lbl = self._call_gemini_interactions_api(formatted_prompt, topic)
+
+        if not ai_text:
+            if "weather" in gid or "clima" in gname.lower() or "{temp}" in raw_prompt:
+                alert_str = "ALERTA DE TEMPESTADE ATIVO! Redobre a atencao." if wth_snap.get("alert") else "Sem alertas severos no momento."
+                ai_text = (
+                    f"- {ctx_vars['city']}: {ctx_vars['temp']}C (Sens. {ctx_vars['feels']}C), {ctx_vars['cond']}.\n"
+                    f"- Min {ctx_vars['tmin']}C / Max {ctx_vars['tmax']}C | Chuva {ctx_vars['rain']}% | Vento {ctx_vars['wind']} km/h.\n"
+                    f"- {alert_str}"
+                )
+            elif "market" in gid or "mercado" in gname.lower() or "{btc}" in raw_prompt:
+                news = self._fetch_google_news_rss(topic, max_items=2)
+                n_line = news[0] if news else "- Mercado global acompanhando fluxo de cripto e cambio."
+                ai_text = (
+                    f"- Cambio: Dolar R$ {ctx_vars['usd']} | IBOV {ctx_vars['ibov']} pts.\n"
+                    f"- Cripto: BTC US$ {ctx_vars['btc']} | ETH US$ {ctx_vars['eth']}.\n"
+                    f"{n_line}"
+                )
+            else:
+                news = self._fetch_google_news_rss(topic, max_items=3)
+                if news:
+                    ai_text = "\n".join(news)
+                else:
+                    ai_text = (
+                        "- ESP32 & RTOS: Uso de sprites DMA e caches evita flicker em displays SPI TFT.\n"
+                        "- IoT & Edge AI: Agentes locais em Python + Serial JSON reduzem latencia para <50ms.\n"
+                        "- Dica C++: Prefira buffers estaticos char[] no loop principal para evitar fragmentacao de heap."
+                    )
+
+        clean_out = self._clean_gem_text(ai_text)
+        ts_str = brasilia_now().strftime("%H:%M")
+        res_entry = {
+            "id": gid,
+            "title": gname,
+            "text": clean_out,
+            "time": ts_str,
+            "source": source_lbl,
+            "model": source_lbl,
+            "updated_at": time.time(),
+        }
+        with self._lock:
+            self._outputs[gid] = res_entry
+            self._last_run_ts[gid] = time.time()
+            self.active_gem_id = gid
+            self._busy = False
+            self._status_msg = f"Última execução: {gname} às {ts_str} ({source_lbl})"
+        return res_entry
+
+    def tick_scheduler(
+        self,
+        wth_snap: dict = None,
+        mkt_snap: dict = None,
+        sys_snap: dict = None,
+        weather_snap: dict = None,
+        market_snap: dict = None,
+    ) -> dict | None:
+        wth_snap = wth_snap if wth_snap is not None else (weather_snap or {})
+        mkt_snap = mkt_snap if mkt_snap is not None else (market_snap or {})
+        sys_snap = sys_snap or {}
+        now = time.time()
+        with self._lock:
+            if self._busy:
+                return None
+            gems_copy = [dict(g) for g in self.gems if g.get("enabled", True)]
+            act_id = self.active_gem_id
+            rotate = self.auto_rotate
+
+        if not gems_copy:
+            return None
+
+        for g in gems_copy:
+            gid = g.get("id", "")
+            interval_s = max(5, int(g.get("interval_min", 60))) * 60
+            last_t = self._last_run_ts.get(gid, 0.0)
+            if now - last_t >= interval_s:
+                return self.run_gem_now(gid, wth_snap, mkt_snap, sys_snap)
+
+        if rotate and len(gems_copy) > 1 and (now - self._last_rotate_ts >= 25.0):
+            with self._lock:
+                self._last_rotate_ts = now
+                ids = [g["id"] for g in gems_copy if g["id"] in self._outputs]
+                if len(ids) > 1:
+                    cur_idx = ids.index(act_id) if act_id in ids else 0
+                    self.active_gem_id = ids[(cur_idx + 1) % len(ids)]
+        return None
+
+    def get_cyd_payload(self) -> dict:
+        with self._lock:
+            act_id = self.active_gem_id
+            entry = self._outputs.get(act_id)
+            if not entry and self._outputs:
+                entry = next(iter(self._outputs.values()))
+            mdl = self.model
+
+        if not entry:
+            return {
+                "tit": "Gem: Embarcados & IoT",
+                "txt": "Sincronizando manchetes e automacoes diarias do Gemini IA...",
+                "tm": brasilia_now().strftime("%H:%M"),
+                "mdl": mdl[:18],
+            }
+        return {
+            "tit": to_ascii_safe(entry.get("title", "Gem IA"))[:32],
+            "txt": to_ascii_safe(entry.get("text", ""))[:380],
+            "tm": entry.get("time", "--:--")[:8],
+            "mdl": to_ascii_safe(mdl)[:18],
+        }
+
+    def get_ui_snapshot(self) -> dict:
+        with self._lock:
+            act_id = self.active_gem_id
+            entry = self._outputs.get(act_id) or {}
+            if not entry and self._outputs:
+                entry = next(iter(self._outputs.values()))
+            tit = entry.get("title", "🔧 Radar Embarcados & IoT")
+            txt = entry.get("text", "Clique em '▶️ Rodar na CYD' ou '⚡ Executar Gem Ativa Agora' para gerar o briefing.")
+            tm = entry.get("time", "--:--")
+            src = entry.get("source", "Smart Feed / Gemini")
+            return {
+                "active_gem_id": act_id,
+                "active_title": tit,
+                "active_text": txt,
+                "active_time": tm,
+                "active_source": src,
+                "last_title": tit,
+                "last_text": txt,
+                "last_time": tm,
+                "last_model": src,
+                "status_msg": self._status_msg,
+                "busy": self._busy,
+                "has_key": bool(self.api_key),
+                "model": self.model,
+                "auto_rotate": self.auto_rotate,
+                "gems": [dict(g) for g in self.gems],
+            }
+
+
 # ========================================== INTERFACE MODERNA EM FLET (FLUTTER) ==
 def launch_flet_gui(
     col: Collector,
     mkt_col: MarketCollector,
     media_col: MediaCollector,
     pomo_eng: PomodoroEngine,
+    wth_col: WeatherCollector,
+    gems_eng: GeminiGemsEngine,
     cli_args,
 ):
     import flet as ft
@@ -1940,7 +2665,7 @@ def launch_flet_gui(
         return ft.Dropdown(**kw)
 
     def build_app(page: ft.Page):
-        page.title = "CYD Hardware & Financial Market Monitor v4.0 — Central de Controle"
+        page.title = "CYD Hardware & Financial Market Monitor v4.1 — Central de Controle + Clima & Gemini IA"
         page.bgcolor = "#07090E"
         page.padding = 14
         page.scroll = None  # Viewport fixo com abas independentes (zero poluicao visual!)
@@ -1971,6 +2696,12 @@ def launch_flet_gui(
             "pomo_buzzer": bool(cfg.get("pomo_buzzer", True)),
             "media_source_pref": str(cfg.get("media_source_pref", "auto")),
             "media_auto_cover": bool(cfg.get("media_auto_cover", True)),
+            "weather_city": str(cfg.get("weather_city", "Votuporanga")),
+            "gemini_api_key": str(cfg.get("gemini_api_key", os.environ.get("GEMINI_API_KEY", ""))),
+            "gemini_model": str(cfg.get("gemini_model", "gemini-3.8-flash")),
+            "gems": [dict(g) for g in cfg.get("gems", DEFAULT_GEMS)],
+            "active_gem_id": str(cfg.get("active_gem_id", "gem_embedded")),
+            "gem_auto_rotate": bool(cfg.get("gem_auto_rotate", True)),
             "synced_cover_id": "",
             "sd_missing_warned": False,
             "current_effective_brt": int(cfg.get("brt", 200)),
@@ -1984,6 +2715,13 @@ def launch_flet_gui(
         media_col.set_source_pref(state["media_source_pref"])
         pomo_eng.set_durations(state["pomo_work_min"], state["pomo_break_min"], state["pomo_long_min"])
         pomo_eng.buzzer_enabled = state["pomo_buzzer"]
+        gems_eng.configure(
+            api_key=state["gemini_api_key"],
+            model=state["gemini_model"],
+            gems=state["gems"],
+            active_gem_id=state["active_gem_id"],
+            auto_rotate=state["gem_auto_rotate"],
+        )
 
         def restore_window(icon=None, item=None):
             try:
@@ -2130,6 +2868,12 @@ def launch_flet_gui(
                 "pomo_buzzer": state["pomo_buzzer"],
                 "media_source_pref": state["media_source_pref"],
                 "media_auto_cover": state["media_auto_cover"],
+                "weather_city": state["weather_city"],
+                "gemini_api_key": state["gemini_api_key"],
+                "gemini_model": state["gemini_model"],
+                "gems": state["gems"],
+                "active_gem_id": state["active_gem_id"],
+                "gem_auto_rotate": state["gem_auto_rotate"],
             })
             save_ui_config(cfg)
             mkt_col.set_custom_tickers([p.get("ticker", "") for p in state["portfolio"]])
@@ -2146,6 +2890,8 @@ def launch_flet_gui(
                 "portf": portf_pkt,
                 "pomo": pomo_eng.get_payload(),
                 "media": media_col.get_cyd_payload(state["synced_cover_id"]),
+                "wth": wth_col.get_cyd_payload(),
+                "gem": gems_eng.get_cyd_payload(),
             })
 
         def append_log(msg: str):
@@ -2170,6 +2916,7 @@ def launch_flet_gui(
             7: "Portfólio",
             8: "Pomodoro",
             9: "Mídia",
+            10: "Clima & IA",
         }
 
         def switch_tab(tab_idx: int):
@@ -2182,7 +2929,7 @@ def launch_flet_gui(
 
         # ------------------------ CABECALHO COMPACTO + CHIPS GLOBAIS ---------
         lbl_title = ft.Text(
-            "⚡ CYD MONITOR v4.0",
+            "⚡ CYD MONITOR v4.1",
             size=18,
             weight=ft.FontWeight.BOLD,
             color=state["hex_color"],
@@ -2202,8 +2949,28 @@ def launch_flet_gui(
             border_radius=16,
             padding=pad_sym(horizontal=10, vertical=4),
             ink=True,
-            tooltip="Clique para gerenciar as 10 telas da CYD",
+            tooltip="Clique para gerenciar as 11 telas da CYD",
             on_click=lambda e: switch_tab(0),
+        )
+
+        # Micro-indicador global no Header: Hora + Data Atual + Temperatura na Região (Votuporanga)
+        init_wth_snap = wth_col.get_ui_snapshot()
+        lbl_hdr_weather = ft.Text(
+            f"🕒 {datetime.now().strftime('%H:%M')} • 📅 {init_wth_snap['date_short']} • 🌡️ {init_wth_snap['temp']:.1f}°C ({init_wth_snap['city']})",
+            size=11,
+            weight=ft.FontWeight.BOLD,
+            color="#38BDF8",
+            font_family="Consolas",
+        )
+        pill_hdr_weather = ft.Container(
+            content=lbl_hdr_weather,
+            bgcolor="#0F172A",
+            border=border_all(1, "#0284C7"),
+            border_radius=16,
+            padding=pad_sym(horizontal=10, vertical=4),
+            ink=True,
+            tooltip="Hora, Data e Clima Regional (Votuporanga) + Gemini Gems — Clique para abrir Clima & Gemini IA",
+            on_click=lambda e: switch_tab(3),
         )
 
         # Micro-indicador global Pomodoro no Header
@@ -2228,7 +2995,7 @@ def launch_flet_gui(
             color="#94A3B8",
             max_lines=1,
             overflow=ft.TextOverflow.ELLIPSIS,
-            width=165,
+            width=150,
         )
         btn_hdr_media_pp = ft.IconButton(
             icon=icon_val("PLAY_ARROW"),
@@ -2269,7 +3036,7 @@ def launch_flet_gui(
             padding=pad_sym(horizontal=10, vertical=4),
             ink=True,
             tooltip="Brilho Dinâmico & Modo Sleep — Clique para abrir Estúdio & Energia",
-            on_click=lambda e: switch_tab(3),
+            on_click=lambda e: switch_tab(4),
         )
 
         status_dot = ft.Container(
@@ -2299,7 +3066,7 @@ def launch_flet_gui(
             icon_size=18,
             icon_color="#94A3B8",
             tooltip="Abrir QR Code Controle pelo Celular (Wi-Fi)",
-            on_click=lambda e: switch_tab(5),
+            on_click=lambda e: switch_tab(6),
         )
         btn_minimize = ft.IconButton(
             icon=icon_val("MINIMIZE"),
@@ -2321,6 +3088,7 @@ def launch_flet_gui(
                 ft.Row([lbl_title, chip_active_screen], spacing=10, vertical_alignment=ft.CrossAxisAlignment.CENTER),
                 ft.Row(
                     [
+                        pill_hdr_weather,
                         pill_hdr_pomo,
                         pill_hdr_media,
                         pill_hdr_power,
@@ -2482,6 +3250,7 @@ def launch_flet_gui(
                                 [
                                     btn_ticker_quick,
                                     ft.OutlinedButton("💼 Abrir Carteira", on_click=lambda e: switch_tab(2)),
+                                    ft.OutlinedButton("🌦️🤖 Clima & Gemini", on_click=lambda e: switch_tab(3)),
                                 ],
                                 spacing=8,
                             ),
@@ -2537,7 +3306,7 @@ def launch_flet_gui(
             padding=12,
         )
 
-        # ---------------- 1. GERENCIADOR DE TELAS (10 MODOS 0..9) ------------
+        # ---------------- 1. GERENCIADOR DE TELAS (11 MODOS 0..10) -----------
         screen_defs = [
             (0, "⚡ Tela 0: Resumo Gauges", "Gauges circulares de CPU & RAM + Disco/Rede", "SPEED"),
             (1, "🖥️ Tela 1: CPU + RAM", "Barras duplas + Gráficos CPU % e RAM % lado a lado", "TERMINAL"),
@@ -2549,6 +3318,7 @@ def launch_flet_gui(
             (7, "💼 Tela 7: Meu Portfólio", "Patrimônio (R$), Lucro/Prejuízo Dinâmico + Top 3 Ativos", "ACCOUNT_BALANCE_WALLET"),
             (8, "🍅 Tela 8: Pomodoro Focus", "Cronômetro circular Foco 25m / Pausa 5m + Buzzer no fim", "TIMER"),
             (9, "🎵 Tela 9: Spotify & YT Music", "Capa 320x240 no SD + Overlay Translúcido Título/Artista", "ALBUM"),
+            (10, "🌦️🤖 Tela 10: Clima & Gemini Gems", "Data, Localização (Votuporanga), Temp °C, Alertas de Tempestade & IA Gems", "WB_SUNNY"),
         ]
         screen_cards = []
 
@@ -2606,9 +3376,9 @@ def launch_flet_gui(
                 ft.Row([screen_cards[0][1], screen_cards[1][1], screen_cards[2][1]], spacing=8),
                 ft.Row([screen_cards[3][1], screen_cards[4][1], screen_cards[5][1]], spacing=8),
                 ft.Divider(height=4, color="#151C28"),
-                ft.Text("MÓDULOS INTELIGENTES v4.0 — FINANÇAS, PRODUTIVIDADE & MULTIMÍDIA (TELAS 6 A 9)", size=10, weight=ft.FontWeight.BOLD, color="#64748B"),
+                ft.Text("MÓDULOS INTELIGENTES v4.1 — FINANÇAS, FOCO, MÍDIA, CLIMA REGIONAL & GEMINI GEMS (TELAS 6 A 10)", size=10, weight=ft.FontWeight.BOLD, color="#64748B"),
                 ft.Row([screen_cards[6][1], screen_cards[7][1]], spacing=8),
-                ft.Row([screen_cards[8][1], screen_cards[9][1]], spacing=8),
+                ft.Row([screen_cards[8][1], screen_cards[9][1], screen_cards[10][1]], spacing=8),
             ],
             spacing=7,
         )
@@ -2618,7 +3388,7 @@ def launch_flet_gui(
                 [
                     ft.Row(
                         [
-                            ft.Text("🖥️ SELECIONE A TELA ATIVA NA CYD (10 MODOS EM TEMPO REAL)", size=12, weight=ft.FontWeight.BOLD, color="#94A3B8"),
+                            ft.Text("🖥️ SELECIONE A TELA ATIVA NA CYD (11 MODOS EM TEMPO REAL + CLIMA NO TOPO)", size=12, weight=ft.FontWeight.BOLD, color="#94A3B8"),
                             ft.Text("Troca instantânea via USB (< 50ms)", size=11, color="#64748B"),
                         ],
                         alignment=ft.MainAxisAlignment.SPACE_BETWEEN,
@@ -4287,9 +5057,519 @@ def launch_flet_gui(
 
         refresh_focus_media_ui()
 
+        # ---------------- 10. CLIMA REGIONAL (VOTUPORANGA) & GEMINI GEMS (TELA 10) ---
+        txt_weather_city = ft.TextField(
+            label="Cidade / Região (Ex: Votuporanga, São José do Rio Preto, São Paulo)",
+            value=state["weather_city"],
+            expand=True,
+            height=42,
+            text_size=12,
+            content_padding=pad_sym(horizontal=10, vertical=6),
+        )
+        lbl_wth_temp_big = ft.Text("29.0°C", size=34, weight=ft.FontWeight.BOLD, color="#38BDF8", font_family="Consolas")
+        lbl_wth_city_badge = ft.Text("📍 VOTUPORANGA - SP", size=12, weight=ft.FontWeight.BOLD, color="#F8FAFC", font_family="Consolas")
+        lbl_wth_date_badge = ft.Text("📅 SAB 07/11/2026", size=12, weight=ft.FontWeight.BOLD, color="#FACC15", font_family="Consolas")
+        lbl_wth_cond = ft.Text("Céu Limpo", size=13, weight=ft.FontWeight.BOLD, color="#22C55E")
+        lbl_wth_details = ft.Text(
+            "Sensação: 30°C • Mín/Máx: 20°/33°C • Umidade: 52% • Vento: 12 km/h • Chuva: 10%",
+            size=11,
+            color="#94A3B8",
+            font_family="Consolas",
+        )
+        lbl_wth_alert_banner = ft.Text(
+            "🟢 Clima Estável na Região — Sem alertas severos no momento",
+            size=11,
+            weight=ft.FontWeight.BOLD,
+            color="#22C55E",
+        )
+        cont_wth_alert_box = ft.Container(
+            content=lbl_wth_alert_banner,
+            bgcolor="#0B1915",
+            border=border_all(1, "#10B981"),
+            border_radius=8,
+            padding=pad_sym(horizontal=10, vertical=6),
+        )
+
+        def on_save_weather_city(_e):
+            new_c = (txt_weather_city.value or "").strip() or "Votuporanga"
+            state["weather_city"] = new_c
+            wth_col.set_city(new_c)
+            persist_and_queue_ui()
+            append_log(f"🌦️ Localidade alterada para '{new_c}'. Buscando temperatura e previsão...")
+
+        def on_refresh_weather(_e):
+            wth_col.force_refresh()
+            append_log(f"🌦️ Atualizando clima e temperatura de {state['weather_city']}...")
+
+        btn_sim_storm = ft.OutlinedButton(
+            "⛈️ Simular Aviso de Tempestade na CYD",
+            on_click=lambda e: on_toggle_storm_sim(),
+        )
+
+        def on_toggle_storm_sim():
+            snap_w = wth_col.get_ui_snapshot()
+            is_sim = not snap_w.get("sim_storm", False)
+            wth_col.trigger_storm_simulation(
+                active=is_sim,
+                custom_msg=f"ALERTA DE TEMPESTADE EM {state['weather_city'].upper()}: CHUVA FORTE E RAIOS!",
+            )
+            set_btn_text(
+                btn_sim_storm,
+                "🛑 Desativar Simulação de Tempestade" if is_sim else "⛈️ Simular Aviso de Tempestade na CYD",
+            )
+            w_pkt = wth_col.get_cyd_payload()
+            ev = {"wth": w_pkt}
+            if is_sim:
+                ev["alrt"] = {"bz": True, "led": "0xF800", "p": 3}
+                append_log(f"⛈️ AVISO DE TEMPESTADE ATIVADO NA CYD ({state['weather_city']})! Banner de emergência + Buzzer/LED disparados.")
+            else:
+                append_log("🌤️ Simulação de tempestade encerrada na CYD.")
+            ui_event_queue.put(ev)
+            refresh_weather_gems_ui()
+            try:
+                page.update()
+            except Exception:
+                pass
+
+        sec_weather_regional = ft.Container(
+            content=ft.Column(
+                [
+                    ft.Row(
+                        [
+                            ft.Row(
+                                [
+                                    ft.Text("🌦️ CLIMA REGIONAL, DATA & ALERTAS SEVEROS", size=12, weight=ft.FontWeight.BOLD, color="#94A3B8"),
+                                ],
+                                spacing=8,
+                            ),
+                            ft.OutlinedButton("📺 Exibir Tela 10 na CYD", on_click=lambda e: on_select_screen(10)),
+                        ],
+                        alignment=ft.MainAxisAlignment.SPACE_BETWEEN,
+                    ),
+                    ft.Container(
+                        content=ft.Column(
+                            [
+                                ft.Row(
+                                    [
+                                        lbl_wth_city_badge,
+                                        lbl_wth_date_badge,
+                                    ],
+                                    alignment=ft.MainAxisAlignment.SPACE_BETWEEN,
+                                ),
+                                ft.Row(
+                                    [
+                                        lbl_wth_temp_big,
+                                        ft.Column(
+                                            [
+                                                lbl_wth_cond,
+                                                lbl_wth_details,
+                                            ],
+                                            spacing=2,
+                                            expand=True,
+                                        ),
+                                    ],
+                                    spacing=14,
+                                    vertical_alignment=ft.CrossAxisAlignment.CENTER,
+                                ),
+                                cont_wth_alert_box,
+                            ],
+                            spacing=6,
+                        ),
+                        bgcolor="#060911",
+                        border=border_all(1, "#1E293B"),
+                        border_radius=12,
+                        padding=12,
+                    ),
+                    ft.Row(
+                        [
+                            txt_weather_city,
+                            ft.OutlinedButton("💾 Salvar Região", on_click=on_save_weather_city),
+                            ft.OutlinedButton("🔄 Atualizar", on_click=on_refresh_weather),
+                        ],
+                        spacing=8,
+                    ),
+                    ft.Row(
+                        [
+                            btn_sim_storm,
+                            ft.Text(
+                                "Exibe Data + Temp no topo de TODAS as telas e alerta piscante em caso de tempestade.",
+                                size=10,
+                                color="#64748B",
+                                expand=True,
+                            ),
+                        ],
+                        spacing=8,
+                        vertical_alignment=ft.CrossAxisAlignment.CENTER,
+                    ),
+                ],
+                spacing=9,
+            ),
+            bgcolor="#0B0F17",
+            border=border_all(1, "#1A2232"),
+            border_radius=14,
+            padding=13,
+            expand=True,
+        )
+
+        # ---- Painel Direito: Google Gemini & Automação de Gems Diárias ----
+        txt_gemini_key = ft.TextField(
+            label="Google Gemini API Key (Opcional — sem chave usa Smart Feed RSS PT-BR)",
+            value=state["gemini_api_key"],
+            password=True,
+            can_reveal_password=True,
+            expand=True,
+            height=42,
+            text_size=12,
+            content_padding=pad_sym(horizontal=10, vertical=6),
+        )
+        dd_gemini_model = ft.Dropdown(
+            label="Modelo Gemini",
+            value=state["gemini_model"],
+            width=185,
+            text_size=12,
+            content_padding=pad_sym(horizontal=10, vertical=4),
+            options=make_dropdown_options(["gemini-3.8-flash", "gemini-4-argon", "gemini-3.5-flash-lite"]),
+        )
+        sw_gem_autorotate = ft.Switch(
+            value=state["gem_auto_rotate"],
+            active_color="#A855F7",
+            tooltip="Alternar e executar automaticamente as Gems habilitadas conforme o intervalo de cada uma",
+        )
+
+        lbl_gem_active_title = ft.Text("🤖 GEM ATIVA: Radar Embarcados & IoT", size=12, weight=ft.FontWeight.BOLD, color="#C084FC", font_family="Consolas")
+        lbl_gem_active_meta = ft.Text("Modelo: Smart Feed • Atualizado: --:--", size=10, color="#94A3B8", font_family="Consolas")
+        lbl_gem_active_body = ft.Text(
+            "Carregando briefing da Gem...",
+            size=11,
+            color="#E2E8F0",
+            font_family="Consolas",
+            selectable=True,
+        )
+
+        def on_save_gemini_config(_e):
+            state["gemini_api_key"] = (txt_gemini_key.value or "").strip()
+            state["gemini_model"] = dd_gemini_model.value or "gemini-3.8-flash"
+            state["gem_auto_rotate"] = bool(sw_gem_autorotate.value)
+            gems_eng.update_config(
+                api_key=state["gemini_api_key"],
+                model=state["gemini_model"],
+                gems=state["gems"],
+                active_gem_id=state["active_gem_id"],
+                auto_rotate=state["gem_auto_rotate"],
+            )
+            persist_and_queue_ui()
+            mode_str = f"Gemini API ({state['gemini_model']})" if state["gemini_api_key"] else "Smart Feed RSS + Contexto Local"
+            append_log(f"🤖 Configuração Gemini salva ({mode_str}).")
+            refresh_weather_gems_ui()
+
+        sw_gem_autorotate.on_change = on_save_gemini_config
+
+        txt_gem_name = ft.TextField(
+            label="Nome da Gem (Ex: Radar Embarcados & ESP32)",
+            value="🔧 Radar Embarcados & IoT",
+            expand=True,
+            height=40,
+            text_size=12,
+            content_padding=pad_sym(horizontal=10, vertical=6),
+        )
+        dd_gem_cat = ft.Dropdown(
+            label="Categoria / Fonte",
+            value="embarcados",
+            width=145,
+            text_size=12,
+            content_padding=pad_sym(horizontal=8, vertical=4),
+            options=make_dropdown_options(["embarcados", "clima", "mercado", "dev", "custom"]),
+        )
+        txt_gem_interval = ft.TextField(
+            label="Intervalo (min)",
+            value="30",
+            width=105,
+            height=40,
+            text_size=12,
+            content_padding=pad_sym(horizontal=8, vertical=6),
+        )
+        txt_gem_prompt = ft.TextField(
+            label="Prompt / Instrução da Gem (Enviado ao Gemini com Pesquisa Google em tempo real)",
+            value=DEFAULT_GEMS[0]["prompt"],
+            multiline=True,
+            min_lines=2,
+            max_lines=3,
+            text_size=11,
+            content_padding=pad_sym(horizontal=10, vertical=8),
+        )
+
+        gems_list_col = ft.Column(spacing=5, scroll=ft.ScrollMode.AUTO, height=145)
+
+        def on_run_gem_now(gem_id: str):
+            def _worker():
+                append_log(f"🤖 Executando Gem '{gem_id}' e sincronizando com a placa CYD...")
+                gems_eng.set_active_gem(gem_id)
+                state["active_gem_id"] = gem_id
+                res = gems_eng.run_gem_now(
+                    gem_id,
+                    weather_snap=wth_col.get_ui_snapshot(),
+                    market_snap=mkt_col.get_market_dict(),
+                    sys_snap=col.sample_sys(),
+                )
+                persist_and_queue_ui()
+                ui_event_queue.put({
+                    "wth": wth_col.get_cyd_payload(),
+                    "gem": gems_eng.get_cyd_payload(),
+                })
+                append_log(f"✅ Gem '{res.get('title', gem_id)}' atualizada ({res.get('model', '')}) e enviada para a CYD!")
+                refresh_weather_gems_ui()
+                try:
+                    page.update()
+                except Exception:
+                    pass
+
+            threading.Thread(target=_worker, daemon=True).start()
+
+        def on_load_gem_into_editor(g: dict):
+            txt_gem_name.value = g.get("name", "")
+            dd_gem_cat.value = g.get("category", "embarcados")
+            txt_gem_interval.value = str(g.get("interval_min", 30))
+            txt_gem_prompt.value = g.get("prompt", "")
+            try:
+                page.update()
+            except Exception:
+                pass
+
+        def on_save_or_add_gem(_e):
+            name_v = (txt_gem_name.value or "").strip()
+            prompt_v = (txt_gem_prompt.value or "").strip()
+            cat_v = dd_gem_cat.value or "custom"
+            try:
+                int_v = max(5, int(float(txt_gem_interval.value or "30")))
+            except Exception:
+                int_v = 30
+            if not name_v or not prompt_v:
+                append_log("⚠️ Informe o nome e o prompt da Gem.")
+                return
+            # Atualiza se mesmo nome existir, senao cria nova
+            found = False
+            for g in state["gems"]:
+                if g.get("name", "").strip().lower() == name_v.lower():
+                    g["prompt"] = prompt_v
+                    g["category"] = cat_v
+                    g["interval_min"] = int_v
+                    g["enabled"] = True
+                    state["active_gem_id"] = g["id"]
+                    found = True
+                    break
+            if not found:
+                new_id = f"gem_{int(time.time()) % 100000}"
+                state["gems"].append({
+                    "id": new_id,
+                    "name": name_v,
+                    "category": cat_v,
+                    "prompt": prompt_v,
+                    "interval_min": int_v,
+                    "enabled": True,
+                })
+                state["active_gem_id"] = new_id
+            gems_eng.update_config(
+                api_key=state["gemini_api_key"],
+                model=state["gemini_model"],
+                gems=state["gems"],
+                active_gem_id=state["active_gem_id"],
+                auto_rotate=state["gem_auto_rotate"],
+            )
+            persist_and_queue_ui()
+            on_run_gem_now(state["active_gem_id"])
+
+        def on_delete_gem(gid: str):
+            if len(state["gems"]) <= 1:
+                append_log("⚠️ Mantenha pelo menos 1 Gem configurada.")
+                return
+            state["gems"] = [g for g in state["gems"] if g.get("id") != gid]
+            if state["active_gem_id"] == gid:
+                state["active_gem_id"] = state["gems"][0]["id"]
+            gems_eng.update_config(
+                api_key=state["gemini_api_key"],
+                model=state["gemini_model"],
+                gems=state["gems"],
+                active_gem_id=state["active_gem_id"],
+                auto_rotate=state["gem_auto_rotate"],
+            )
+            persist_and_queue_ui()
+            refresh_weather_gems_ui()
+
+        def rebuild_gems_list_ui():
+            gems_list_col.controls.clear()
+            act_id = state["active_gem_id"]
+            for g in state["gems"]:
+                gid = g.get("id", "")
+                is_act = (gid == act_id)
+                row_c = ft.Container(
+                    content=ft.Row(
+                        [
+                            ft.Container(
+                                content=ft.Column(
+                                    [
+                                        ft.Row(
+                                            [
+                                                ft.Text(
+                                                    f"{'🟢 ' if is_act else ''}{g.get('name', 'Gem')}",
+                                                    size=11,
+                                                    weight=ft.FontWeight.BOLD,
+                                                    color="#C084FC" if is_act else "#E2E8F0",
+                                                ),
+                                                ft.Text(
+                                                    f"[{g.get('category', 'ia').upper()} • a cada {g.get('interval_min', 30)}m]",
+                                                    size=10,
+                                                    color="#64748B",
+                                                    font_family="Consolas",
+                                                ),
+                                            ],
+                                            spacing=6,
+                                        ),
+                                        ft.Text(
+                                            g.get("prompt", ""),
+                                            size=10,
+                                            color="#94A3B8",
+                                            max_lines=1,
+                                            overflow=ft.TextOverflow.ELLIPSIS,
+                                        ),
+                                    ],
+                                    spacing=1,
+                                ),
+                                expand=True,
+                                on_click=lambda e, gem_obj=g: on_load_gem_into_editor(gem_obj),
+                            ),
+                            ft.OutlinedButton(
+                                "▶️ Rodar na CYD",
+                                on_click=lambda e, target_id=gid: on_run_gem_now(target_id),
+                            ),
+                            ft.IconButton(
+                                icon=icon_val("DELETE_OUTLINE"),
+                                icon_color="#EF4444",
+                                icon_size=16,
+                                tooltip="Remover Gem",
+                                on_click=lambda e, target_id=gid: on_delete_gem(target_id),
+                            ),
+                        ],
+                        alignment=ft.MainAxisAlignment.SPACE_BETWEEN,
+                        vertical_alignment=ft.CrossAxisAlignment.CENTER,
+                    ),
+                    bgcolor="#151026" if is_act else "#0E1420",
+                    border=border_all(1, "#A855F7" if is_act else "#1E293B"),
+                    border_radius=8,
+                    padding=pad_sym(horizontal=10, vertical=5),
+                )
+                gems_list_col.controls.append(row_c)
+
+        sec_gemini_gems = ft.Container(
+            content=ft.Column(
+                [
+                    ft.Row(
+                        [
+                            ft.Text("🤖 CONEXÃO GOOGLE GEMINI & AUTOMAÇÕES DIÁRIAS (GEMS)", size=12, weight=ft.FontWeight.BOLD, color="#C084FC"),
+                            ft.Row(
+                                [
+                                    ft.Text("Auto-Rotação", size=11, color="#94A3B8"),
+                                    sw_gem_autorotate,
+                                ],
+                                spacing=4,
+                            ),
+                        ],
+                        alignment=ft.MainAxisAlignment.SPACE_BETWEEN,
+                    ),
+                    ft.Row(
+                        [
+                            txt_gemini_key,
+                            dd_gemini_model,
+                            ft.OutlinedButton("🔑 Conectar", on_click=on_save_gemini_config),
+                        ],
+                        spacing=8,
+                    ),
+                    ft.Container(
+                        content=ft.Column(
+                            [
+                                ft.Row(
+                                    [
+                                        lbl_gem_active_title,
+                                        lbl_gem_active_meta,
+                                    ],
+                                    alignment=ft.MainAxisAlignment.SPACE_BETWEEN,
+                                ),
+                                lbl_gem_active_body,
+                            ],
+                            spacing=4,
+                        ),
+                        bgcolor="#090714",
+                        border=border_all(1, "#6B21A8"),
+                        border_radius=10,
+                        padding=10,
+                    ),
+                    ft.Row([txt_gem_name, dd_gem_cat, txt_gem_interval], spacing=8),
+                    txt_gem_prompt,
+                    ft.Row(
+                        [
+                            ft.OutlinedButton("💾 Salvar / Criar Gem & Enviar p/ CYD", on_click=on_save_or_add_gem),
+                            ft.OutlinedButton("⚡ Executar Gem Ativa Agora", on_click=lambda e: on_run_gem_now(state["active_gem_id"])),
+                        ],
+                        spacing=8,
+                    ),
+                    ft.Text("GEMS CONFIGURADAS (CLIQUE PARA EDITAR OU RODAR NA PLACA):", size=10, weight=ft.FontWeight.BOLD, color="#64748B"),
+                    gems_list_col,
+                ],
+                spacing=7,
+            ),
+            bgcolor="#0B0F17",
+            border=border_all(1, "#1A2232"),
+            border_radius=14,
+            padding=13,
+            expand=True,
+        )
+
+        def refresh_weather_gems_ui():
+            ws = wth_col.get_ui_snapshot()
+            gs = gems_eng.get_ui_snapshot()
+            now_hm = datetime.now().strftime("%H:%M")
+
+            # Atualiza o Header Superior (Hora + Data + Temperatura na Região)
+            if ws["alert"]:
+                lbl_hdr_weather.value = f"⛈️ ALERTA {ws['city'].upper()} • {ws['temp']:.1f}°C • 📅 {ws['date_short']} {now_hm}"
+                lbl_hdr_weather.color = "#FEF08A"
+                pill_hdr_weather.bgcolor = "#7F1D1D"
+                pill_hdr_weather.border = border_all(1.5, "#EF4444")
+            else:
+                lbl_hdr_weather.value = f"🕒 {now_hm} • 📅 {ws['date_short']} • 🌡️ {ws['temp']:.1f}°C ({ws['city']})"
+                lbl_hdr_weather.color = "#38BDF8"
+                pill_hdr_weather.bgcolor = "#0F172A"
+                pill_hdr_weather.border = border_all(1, "#0284C7")
+
+            lbl_wth_temp_big.value = f"{ws['temp']:.1f}°C"
+            lbl_wth_city_badge.value = f"📍 {ws['city'].upper()} - {ws['region']}"
+            lbl_wth_date_badge.value = f"📅 {ws['date_full']}"
+            lbl_wth_cond.value = f"{ws['cond']} (Atualizado {ws['updated']})"
+            lbl_wth_details.value = (
+                f"Sensação: {ws['feels']:.0f}°C • Mín/Máx: {ws['tmin']:.0f}°/{ws['tmax']:.0f}°C • "
+                f"Umidade: {ws['hum']}% • Vento: {ws['wind']:.0f} km/h • Chuva: {ws['rain_prob']}%"
+            )
+
+            if ws["alert"]:
+                lbl_wth_alert_banner.value = f"⛈️ ALERTA NA PLACA CYD: {ws['alert_msg']}"
+                lbl_wth_alert_banner.color = "#FEF08A"
+                cont_wth_alert_box.bgcolor = "#450A0A"
+                cont_wth_alert_box.border = border_all(1.5, "#EF4444")
+            else:
+                lbl_wth_alert_banner.value = f"🟢 Clima Estável em {ws['city']} — Sem alertas severos no momento"
+                lbl_wth_alert_banner.color = "#22C55E"
+                cont_wth_alert_box.bgcolor = "#0B1915"
+                cont_wth_alert_box.border = border_all(1, "#10B981")
+
+            lbl_gem_active_title.value = f"🤖 GEM ATIVA: {gs['last_title']}"
+            lbl_gem_active_meta.value = f"Fonte: {gs['last_model']} • Atualizado: {gs['last_time']}"
+            lbl_gem_active_body.value = gs["last_text"]
+            rebuild_gems_list_ui()
+
+        refresh_weather_gems_ui()
+
         # ---------------- CONSOLE SERIAL & LOG (COM COPIAR E LIMPAR) ---------
         txt_console = ft.Text(
-            value="Inicializando agente v4.0 (Telemetria, Mercado, Portfólio, Pomodoro & Spotify/YouTube Music)...",
+            value="Inicializando agente v4.1 (Telemetria, Clima Votuporanga, Gemini Gems, Mercado, Portfólio, Pomodoro & Mídia)...",
             size=11,
             color="#94A3B8",
             font_family="Consolas",
@@ -4375,6 +5655,8 @@ def launch_flet_gui(
                     "portf": mkt_col.compute_portfolio(state["portfolio"], state["portfolio_pnl_mode"])[0] if mkt_col else {},
                     "pomodoro": pomo_eng.get_ui_snapshot() if pomo_eng else {},
                     "media": media_col.get_ui_snapshot() if media_col else {},
+                    "weather": wth_col.get_ui_snapshot() if wth_col else {},
+                    "gems": gems_eng.get_ui_snapshot() if gems_eng else {},
                     "upload": upload_state,
                     "connected": True,
                 }
@@ -4426,7 +5708,7 @@ def launch_flet_gui(
                     if val is not None:
                         try:
                             scr_idx = int(val)
-                            if 0 <= scr_idx <= 9:
+                            if 0 <= scr_idx <= 10:
                                 on_select_screen(scr_idx)
                                 append_log(f"📱 Smartphone selecionou Tela {scr_idx}")
                         except Exception:
@@ -4461,12 +5743,26 @@ def launch_flet_gui(
 
                 if p == "/api/screen":
                     scr = int(body.get("screen", state["screen"]))
-                    if 0 <= scr <= 9:
+                    if 0 <= scr <= 10:
                         on_select_screen(scr)
                         append_log(f"📱 Smartphone selecionou Tela {scr}")
                     else:
                         ok = False
-                        err_msg = "Tela inválida (0-9)"
+                        err_msg = "Tela inválida (0-10)"
+
+                elif p == "/api/weather":
+                    act = str(body.get("action", "refresh")).lower()
+                    if act == "city" and body.get("city"):
+                        txt_weather_city.value = str(body["city"]).strip()
+                        on_save_weather_city(None)
+                    elif act == "storm":
+                        on_toggle_storm_sim()
+                    else:
+                        on_refresh_weather(None)
+
+                elif p == "/api/gem":
+                    gid = str(body.get("gem_id", state["active_gem_id"]))
+                    on_run_gem_now(gid)
 
                 elif p == "/api/color":
                     hex_c = body.get("hex", state["hex_color"])
@@ -4652,7 +5948,7 @@ def launch_flet_gui(
                             ),
                             ft.Text(
                                 "Aponte a câmera do seu celular para o QR Code ou acesse o link abaixo na mesma rede Wi-Fi.\n"
-                                "Alterne as 10 telas, controle Pomodoro e Spotify/YouTube Music, mude cores RGB565, brilho PWM e envie fotos!",
+                                "Alterne as 11 telas, veja o Clima de Votuporanga, rode Gems da IA, controle Pomodoro e Mídia!",
                                 size=11,
                                 color="#94A3B8",
                             ),
@@ -4698,18 +5994,19 @@ def launch_flet_gui(
             padding=14,
         )
 
-        # ---------------- NAVEGACAO POR ABAS (6 VIEWS LIMPAS E ORGANIZADAS) --
+        # ---------------- NAVEGACAO POR ABAS (7 VIEWS LIMPAS E ORGANIZADAS) --
         tab_defs = [
             (0, "Painel & Telas", "DASHBOARD"),
             (1, "Foco & Mídia", "ALBUM"),
             (2, "Mercado & Carteira", "ACCOUNT_BALANCE_WALLET"),
-            (3, "Estúdio & Energia", "PALETTE"),
-            (4, "Alertas Físicos", "NOTIFICATIONS_ACTIVE"),
-            (5, "Remoto & Serial", "QR_CODE_2"),
+            (3, "Clima & Gemini IA", "WB_SUNNY"),
+            (4, "Estúdio & Energia", "PALETTE"),
+            (5, "Alertas Físicos", "NOTIFICATIONS_ACTIVE"),
+            (6, "Remoto & Serial", "QR_CODE_2"),
         ]
 
         tab_views = [
-            # Aba 0: Painel Geral & Seletor de 10 Telas (Home limpa e rápida)
+            # Aba 0: Painel Geral & Seletor de 11 Telas (Home limpa e rápida)
             ft.Column(
                 [telemetry_row, sec_market_quick, sec_screens],
                 spacing=10,
@@ -4733,7 +6030,15 @@ def launch_flet_gui(
                 expand=True,
                 visible=False,
             ),
-            # Aba 3: Aparência & Energia — Cores RGB565 + Wallpaper SD + Brilho PWM + Sleep/Noturno
+            # Aba 3: Clima Regional (Votuporanga), Avisos de Tempestade & Conexão Google Gemini Gems (Tela 10)
+            ft.Column(
+                [ft.Row([sec_weather_regional, sec_gemini_gems], spacing=12, vertical_alignment=ft.CrossAxisAlignment.START)],
+                spacing=10,
+                scroll=ft.ScrollMode.AUTO,
+                expand=True,
+                visible=False,
+            ),
+            # Aba 4: Aparência & Energia — Cores RGB565 + Wallpaper SD + Brilho PWM + Sleep/Noturno
             ft.Column(
                 [sec_colors, sec_bg_and_brt, sec_sleep],
                 spacing=10,
@@ -4741,7 +6046,7 @@ def launch_flet_gui(
                 expand=True,
                 visible=False,
             ),
-            # Aba 4: Módulo 1 — Alertas Físicos Avançados (Buzzer & LED RGB)
+            # Aba 5: Módulo 1 — Alertas Físicos Avançados (Buzzer & LED RGB)
             ft.Column(
                 [sec_alerts],
                 spacing=10,
@@ -4749,7 +6054,7 @@ def launch_flet_gui(
                 expand=True,
                 visible=False,
             ),
-            # Aba 5: Controle Remoto Smartphone Wi-Fi + Console Serial
+            # Aba 6: Controle Remoto Smartphone Wi-Fi + Console Serial
             ft.Column(
                 [sec_mobile_remote, sec_console],
                 spacing=10,
@@ -4912,6 +6217,7 @@ def launch_flet_gui(
             try:
                 refresh_portfolio_ui()
                 refresh_focus_media_ui()
+                refresh_weather_gems_ui()
             except Exception:
                 pass
 
@@ -4960,6 +6266,7 @@ def launch_flet_gui(
             last_telemetry_t = 0.0
             last_fired_alerts = {}
             last_dispatched_brt = -1
+            last_storm_alert_state = False
             pending_cov_id = ""
             pending_cov_t0 = 0.0
 
@@ -4985,6 +6292,12 @@ def launch_flet_gui(
                     if now - last_telemetry_t >= cli_args.interval:
                         last_telemetry_t = now
                         sys_metrics = col.sample_sys()
+                        # Tick agendador de Gems (Automações Diárias Gemini / Smart Feed)
+                        gems_eng.tick_scheduler(
+                            weather_snap=wth_col.get_ui_snapshot(),
+                            market_snap=mkt_metrics,
+                            sys_snap=sys_metrics,
+                        )
                         update_pc_telemetry_cards(sys_metrics, mkt_metrics)
 
                     # Avaliação do Brilho Dinâmico (Modo Sleep & Modo Noturno)
@@ -5052,13 +6365,22 @@ def launch_flet_gui(
                         state["ui_dirty"] = False
                         state["last_ui_sync"] = time.time()
 
-                    # 3) Envio periodico de telemetria + Mercado + Portfólio + Pomodoro + Mídia + Alertas
+                    # 3) Envio periodico de telemetria + Clima Regional + Gemini Gems + Mercado + Portfólio + Pomodoro + Mídia
                     if sys_metrics is not None:
+                        wth_payload = wth_col.get_cyd_payload()
                         payload = {
                             "sys": sys_metrics,
                             "pomo": pomo_eng.get_payload(),
                             "media": media_col.get_cyd_payload(state["synced_cover_id"]),
+                            "wth": wth_payload,
                         }
+
+                        # Alerta físico automático quando aviso de tempestade entra em vigor
+                        curr_storm = bool(wth_payload.get("alrt", False))
+                        if curr_storm and not last_storm_alert_state:
+                            payload["alrt"] = {"bz": True, "led": "0xF800", "p": 3}
+                            append_log(f"⛈️ ALERTA METEOROLÓGICO EM {wth_payload.get('city', 'Votuporanga').upper()}: {wth_payload.get('amsg', '')}")
+                        last_storm_alert_state = curr_storm
 
                         # Avaliação de Alertas Físicos (Buzzer & LED RGB)
                         trig = evaluate_alert_rules(state.get("alert_rules", []), sys_metrics, mkt_metrics, last_fired_alerts, now)
@@ -5079,6 +6401,7 @@ def launch_flet_gui(
                                 state["portfolio"],
                                 state["portfolio_pnl_mode"],
                             )[0]
+                            payload["gem"] = gems_eng.get_cyd_payload()
 
                         line = json.dumps(payload, separators=(",", ":")) + "\n"
                         ser.write(line.encode("utf-8"))
@@ -5112,7 +6435,7 @@ def launch_flet_gui(
 
 
 def main():
-    ap = argparse.ArgumentParser(description="Agente CYD Hardware & Financial Market Monitor v4.0 (Flet / Flutter Edition)")
+    ap = argparse.ArgumentParser(description="Agente CYD Hardware, Clima Regional, Gemini Gems & Financial Monitor v4.1 (Flet / Flutter Edition)")
     ap.add_argument("-p", "--port", help="Porta serial, ex: COM5 ou /dev/ttyUSB0")
     ap.add_argument("-i", "--interval", type=float, default=INTERVAL)
     ap.add_argument("--stdout", action="store_true", help="Imprime o JSON no terminal e nao abre GUI")
@@ -5130,6 +6453,14 @@ def main():
         long_min=cfg.get("pomo_long_min", 15),
         buzzer_enabled=cfg.get("pomo_buzzer", True),
     )
+    wth_col = WeatherCollector(city=cfg.get("weather_city", "Votuporanga"), interval=300.0)
+    gems_eng = GeminiGemsEngine(
+        api_key=cfg.get("gemini_api_key", ""),
+        model=cfg.get("gemini_model", "gemini-3.8-flash"),
+        gems=cfg.get("gems", DEFAULT_GEMS),
+        active_gem_id=cfg.get("active_gem_id", "gem_emb"),
+        auto_rotate=cfg.get("gem_auto_rotate", True),
+    )
     time.sleep(0.55)
 
     if args.stdout or args.once:
@@ -5143,6 +6474,11 @@ def main():
                 cfg.get("portfolio", []),
                 cfg.get("portfolio_pnl_mode", "hist"),
             )
+            gems_eng.tick_scheduler(
+                weather_snap=wth_col.get_ui_snapshot(),
+                market_snap=mkt_s,
+                sys_snap=sys_s,
+            )
             eff_brt, _ = calculate_dynamic_brightness(cfg["brt"], cfg)
             payload = {
                 "sys": sys_s,
@@ -5150,6 +6486,8 @@ def main():
                 "portf": portf_s,
                 "pomo": pomo_eng.get_payload(),
                 "media": media_col.get_cyd_payload(),
+                "wth": wth_col.get_cyd_payload(),
+                "gem": gems_eng.get_cyd_payload(),
                 "ui": {
                     "screen": cfg["screen"],
                     "color": cfg["color"],
@@ -5164,7 +6502,7 @@ def main():
                 return
             time.sleep(args.interval)
 
-    launch_flet_gui(col, mkt_col, media_col, pomo_eng, args)
+    launch_flet_gui(col, mkt_col, media_col, pomo_eng, wth_col, gems_eng, args)
 
 
 if __name__ == "__main__":

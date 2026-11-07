@@ -1,12 +1,13 @@
-# ⚡ CYD Hardware & Financial Market Monitor (v4.0)
+# ⚡ CYD Hardware, Clima Regional, Gemini Gems & Financial Market Monitor (v4.1)
 
-![Versão](https://img.shields.io/badge/vers%C3%A3o-4.0.0-00FF00?style=for-the-badge)
+![Versão](https://img.shields.io/badge/vers%C3%A3o-4.1.0-00FF00?style=for-the-badge)
 ![Plataforma](https://img.shields.io/badge/ESP32-2432S028R%20(CYD)-blue?style=for-the-badge&logo=espressif)
 ![Interface PC](https://img.shields.io/badge/GUI%20PC-Flet%20%2F%20Flutter-02569B?style=for-the-badge&logo=flutter)
+![CI/CD](https://img.shields.io/badge/CI%2FCD-GitHub%20Actions-2088FF?style=for-the-badge&logo=githubactions)
 ![Autor](https://img.shields.io/badge/Autor-Matheus%20Ribeiro%20(z1po)-FF5500?style=for-the-badge)
 ![Licença](https://img.shields.io/badge/Licen%C3%A7a-MIT-green?style=for-the-badge)
 
-Um **monitor de hardware, terminal de mercado financeiro e hub de produtividade multimídia em tempo real** de código aberto para a placa **ESP32-2432S028R (*Cheap Yellow Display* / CYD 2.8" 320×240)**, controlado **100% pelo PC via USB Serial** através de uma interface desktop moderna em abas construída em **Flet (Flutter para Python)** e controle remoto pelo smartphone via **Wi-Fi local (PWA)**.
+Um **monitor de hardware, estação meteorológica regional, hub de automações com Google Gemini e terminal de mercado financeiro em tempo real** de código aberto para a placa **ESP32-2432S028R (*Cheap Yellow Display* / CYD 2.8" 320×240)**, controlado **100% pelo PC via USB Serial** através de uma interface desktop moderna em 7 abas construída em **Flet (Flutter para Python)**, CI/CD automatizado no GitHub Actions e controle remoto pelo smartphone via **Wi-Fi local (PWA)**.
 
 ---
 
@@ -68,6 +69,10 @@ Um **monitor de hardware, terminal de mercado financeiro e hub de produtividade 
 * **💼 Gestão de Portfólio de Investimentos (Tela 7):** Monitoramento de patrimônio pessoal em Reais (`R$`), cálculo de Lucro/Prejuízo (PnL) histórico ou diário (24h) com cor dinâmica (verde/vermelho) e ranking dos Top 3 ativos da carteira (Cripto, B3, Câmbio e EUA).
 * **🔔 Sistema de Alertas Físicos Avançados:** Criação de gatilhos customizados (`CPU Temp > 85°C`, `GPU Uso > 95%`, `Bitcoin > $100k`, etc.) para disparar **bipes sonoros no Buzzer** e padrões visuais no **LED RGB traseiro** da CYD sem travar o processamento do ESP32.
 * **🌙 Controle de Brilho Dinâmico & Modo Sleep:** Monitoramento de inatividade do mouse/teclado no PC para apagar a tela (`brt: 0`), Modo Noturno automático entre 22h e 06h e transição suave por PWM no Pino 21.
+* **🌦️ Clima Regional & Temperatura no Topo (Todas as Telas):** Localidade configurável (padrão: `Votuporanga - SP`), exibindo permanentemente ao lado da Hora a Data Atual (`DD/MM`), a Temperatura Atual (`°C`) e a Cidade no menu superior da CYD e no cabeçalho do Desktop.
+* **🤖 Conexão Google Gemini & Automações Diárias (Gems):** Integração com a API oficial Google Gemini Interactions (`gemini-3.8-flash` / `gemini-4-argon` com Grounding `google_search`), além de fallback automático para Smart Feed RSS PT-BR para buscar notícias recentes sobre Sistemas Embarcados, ESP32, IoT, Clima e Mercado mesmo sem API Key.
+* **⛈️ Sistema de Alerta de Tempestade na Placa CYD:** Detecção automática de tempestades/raios via Open-Meteo com disparo de Banner de Emergência piscante vermelho/amarelo no topo de qualquer tela, alerta sonoro no Buzzer, LED RGB e aviso no Ticker Tape.
+* **🚀 CI/CD Totalmente Automatizado (GitHub Actions):** Pipeline configurado em `.github/workflows/build-release.yml` para compilar o executável Windows (`CYD-Hardware-Monitor.exe`) e o firmware ESP32 (`cyd_firmware.bin`), publicando releases com os binários anexados a cada tag `v*`.
 
 ---
 
@@ -79,12 +84,12 @@ Um **monitor de hardware, terminal de mercado financeiro e hub de produtividade 
 | **v2.0** | **Arquitetura *No-Touch***: Suporte a Wallpapers no MicroSD, Color Picker RGB565 e Brilho PWM | ✅ Concluído |
 | **v3.0** | **Painel Desktop em Flet** + **Gráfico Duplo CPU vs RAM** + **Terminal Financeiro (Bolsa & Cripto)** + **Ticker Tape a ~28 FPS** | ✅ Concluído |
 | **v3.1** | **Controle Remoto pelo Celular (Wi-Fi PWA com QR Code & App Flutter em `mobile/`)** + **Upload de fotos do smartphone p/ SD** | ✅ Concluído |
-| **v4.0 (Atual)** | **Pomodoro (Tela 8) + Spotify & YouTube Music (Tela 9) + Portfólio Pessoal (Tela 7) + Alertas Físicos Buzzer/LED + Modo Sleep/Noturno + UI 6 Abas** | ✅ **Concluído (v4.0)** |
-| **v4.1 (Próximo)** | **Notificações Inteligentes no Ticker Tape** (interceptação temporária do rodapé para avisos do OS) | 🚧 Em Andamento |
+| **v4.0** | **Pomodoro (Tela 8) + Spotify & YouTube Music (Tela 9) + Portfólio Pessoal (Tela 7) + Alertas Físicos Buzzer/LED + Modo Sleep/Noturno + UI 6 Abas** | ✅ Concluído |
+| **v4.1 (Atual)** | **Clima Regional (Votuporanga) no Topo + Tela 10 (Clima & Gemini Gems) + Alerta de Tempestade + CI/CD GitHub Actions + UI 7 Abas** | ✅ **Concluído (v4.1)** |
 
 ---
 
-## 🖥️ As 10 Telas da CYD (320×240)
+## 🖥️ As 11 Telas da CYD (320×240)
 
 Todas as telas podem ser alternadas instantaneamente pelo painel Desktop, pelo aplicativo do celular (Wi-Fi) ou pelo botão físico `BOOT` traseiro:
 
@@ -98,6 +103,7 @@ Todas as telas podem ser alternadas instantaneamente pelo painel Desktop, pelo a
 8. **💼 Tela 7 — `Portfólio de Investimentos` (`SCR_PORTFOLIO`):** Patrimônio total consolidado (`R$`), badge dinâmico de PnL (Lucro/Prejuízo) e Top 3 ativos da carteira.
 9. **🍅 Tela 8 — `Pomodoro Focus Hub` (`SCR_POMODORO`):** Cronômetro circular anti-flicker (25m Trabalho / 5m Pausa / 15m Longa), contador de ciclos, mini-status da música atual e bipe no Buzzer ao finalizar.
 10. **🎵 Tela 9 — `Player Spotify & YouTube Music` (`SCR_MEDIA`):** Capa do álbum em tela cheia do MicroSD com card de vidro fumê translúcido, Título, Artista, badge de fonte (`SPOTIFY` verde / `YT MUSIC` vermelho) e barra de progresso.
+11. **🌦️🤖 Tela 10 — `Clima Regional & Gemini Gems` (`SCR_WEATHER_GEMS`):** Data completa, Cidade (`VOTUPORANGA`), Temperatura Atual em destaque (`°C`), Sensação Térmica, Mín/Máx, Umidade, Vento, Probabilidade de Chuva com ícone climático vetorial e carrossel de notícias geradas pelas Gems da IA.
 
 ---
 

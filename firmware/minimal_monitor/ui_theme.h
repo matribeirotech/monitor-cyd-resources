@@ -43,7 +43,7 @@ void applyColor565(uint16_t color565);
 #define LOG_MSG_MAX  37
 
 // ---- Layouts / Telas (Controladas 100% pelo Agente Python no PC) ----
-#define SCREENS          10
+#define SCREENS          11
 #define SCR_RESUMO       0   // Tela 0: Resumo Geral (Gauges de CPU & RAM + Barras Disco/Rede/Temp)
 #define SCR_CPU_RAM      1   // Tela 1: Painel CPU + RAM (Barras + Graficos de CPU e RAM lado a lado, estilo sys.monitor_)
 #define SCR_CPU_RAM_DUAL 2   // Tela 2: Grafico Combinado CPU + RAM (2 curvas sobrepostas no mesmo grafico grande)
@@ -54,6 +54,7 @@ void applyColor565(uint16_t color565);
 #define SCR_PORTFOLIO    7   // Tela 7: Gestao de Portfolio Pessoal (Patrimonio, PnL & Top 3 Ativos)
 #define SCR_POMODORO     8   // Tela 8: Hub de Produtividade Pomodoro (Trabalho / Pausa + Buzzer)
 #define SCR_MEDIA        9   // Tela 9: Hub Multimidia (Spotify & YouTube Music + Capa SD + Overlay)
+#define SCR_WEATHER_GEMS 10  // Tela 10: Clima Regional (Votuporanga), Data & Gemini Gems (IA)
 
 // Estrutura geometrica auxiliar
 struct Rect { int16_t x, y, w, h; };

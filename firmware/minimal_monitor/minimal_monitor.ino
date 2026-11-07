@@ -581,6 +581,32 @@ struct MediaStats {
   uint32_t syncMs        = 0;
 } mediaSt;
 
+// ======================================= Clima Regional, Data & Gemini Gems =
+struct WeatherGemsStats {
+  bool     valid        = false;
+  char     city[24]     = "Votuporanga";
+  char     dateShort[8] = "--/--";       // "07/11" exibido no Menu Superior ao lado da Hora
+  char     dateFull[16] = "--/--/----";  // "07/11/2026" exibido na Tela 10
+  char     dow[8]       = "---";         // "SAB", "DOM", "SEG"...
+  float    temp         = 0.0f;          // Temperatura atual na regiao (C)
+  float    feels        = 0.0f;          // Sensacao termica (C)
+  float    tmin         = 0.0f;          // Minima do dia (C)
+  float    tmax         = 0.0f;          // Maxima do dia (C)
+  uint8_t  hum          = 0;             // Umidade relativa (%)
+  float    wind         = 0.0f;          // Velocidade do vento (km/h)
+  uint8_t  rainProb     = 0;             // Probabilidade de chuva (%)
+  uint8_t  icon         = 0;             // 0=Sol, 1=Nublado, 2=Chuva, 3=Tempestade
+  char     cond[24]     = "Sincronizando...";
+  bool     alert        = false;         // Alerta de tempestade / clima severo ativo
+  char     alertMsg[56] = "TEMPESTADE / CHUVA FORTE EM VOTUPORANGA!";
+  // Gemini Gems (Automacoes Diarias via IA / RSS)
+  bool     gemValid     = false;
+  char     gemTitle[34] = "Gem: Embarcados & IoT";
+  char     gemText[420] = "Conecte o Gemini ou execute uma Gem na aba Clima & Gemini IA do PC para receber resumos diarios aqui.";
+  char     gemTime[10]  = "--:--";
+  char     gemModel[20] = "gemini-3.8-flash";
+} wth;
+
 // Sanitiza strings UTF-8 caso algum caractere acentuado escape para o TFT_eSPI
 static void sanitizeAscii(char* dst, const char* src, size_t maxLen) {
   if (!dst || maxLen == 0) return;
@@ -633,7 +659,7 @@ uint8_t  hCpu[HIST], hGpu[HIST], hRam[HIST], hTmp[HIST];
 uint16_t hPos    = 0;
 bool     hFilled = false;
 
-char     lineBuf[3072];
+char     lineBuf[4096];
 uint16_t lineLen = 0;
 
 // Caches de desenho dos gauges circulares e boxes dinamicos (evita flicker)
@@ -644,6 +670,11 @@ int8_t   gLastPomoPhase = -99;
 char     gLastMediaSig[128] = "";
 bool     gLastMediaPlay = false;
 int32_t  gLastMediaFillW = -1;
+char     gLastWthSig[96] = "";
+char     gLastGemSig[160] = "";
+int8_t   gLastGemPage = -1;
+bool     gLastStormAlert = false;
+uint8_t  gLastStormFlash = 255;
 
 void resetDrawCache() {
   gGaugeEnd[0] = gGaugeEnd[1] = -999;
@@ -652,6 +683,10 @@ void resetDrawCache() {
   gLastPomoPhase = -99;
   gLastMediaSig[0] = '\0';
   gLastMediaFillW = -1;
+  gLastWthSig[0] = '\0';
+  gLastGemSig[0] = '\0';
+  gLastGemPage = -1;
+  gLastStormFlash = 255;
 }
 
 static void setLed(uint8_t r, uint8_t g, uint8_t b) {
@@ -903,67 +938,151 @@ void drawHeader() {
   tft.fillRect(0, HDR_H - 2, SCR_W, 2, C_ACCENT);
 
   // Icone moderno de terminal/sistema
-  tft.fillRoundRect(5, 4, 14, 14, 3, C_ACCENT);
-  tft.fillRoundRect(7, 6, 10, 10, 2, C_ACCENT_DK);
-  tft.drawPixel(10, 10, C_ACCENT);
-  tft.drawPixel(11, 11, C_ACCENT);
-  tft.drawPixel(10, 12, C_ACCENT);
-  tft.drawFastHLine(12, 13, 3, C_ACCENT);
+  tft.fillRoundRect(4, 4, 14, 14, 3, C_ACCENT);
+  tft.fillRoundRect(6, 6, 10, 10, 2, C_ACCENT_DK);
+  tft.drawPixel(9, 10, C_ACCENT);
+  tft.drawPixel(10, 11, C_ACCENT);
+  tft.drawPixel(9, 12, C_ACCENT);
+  tft.drawFastHLine(11, 13, 3, C_ACCENT);
 
-  // Titulo da tela atual
+  // Titulo compacto da tela atual a esquerda (x = 21..96)
   const char* scrTitle = "RESUMO";
-  if      (currentScreen == SCR_CPU_RAM)      scrTitle = "sys.monitor_";
-  else if (currentScreen == SCR_CPU_RAM_DUAL) scrTitle = "CPU + RAM";
+  if      (currentScreen == SCR_CPU_RAM)      scrTitle = "sys.mon_";
+  else if (currentScreen == SCR_CPU_RAM_DUAL) scrTitle = "CPU+RAM";
   else if (currentScreen == SCR_GPU_FOCUS)    scrTitle = "GPU FOCUS";
-  else if (currentScreen == SCR_GRAPH)        scrTitle = "4x GRAFICOS";
+  else if (currentScreen == SCR_GRAPH)        scrTitle = "4x GRAF";
   else if (currentScreen == SCR_WALLPAPER)    scrTitle = "WALLPAPER";
-  else if (currentScreen == SCR_MARKET)       scrTitle = "BOLSA & CRIPTO";
-  else if (currentScreen == SCR_PORTFOLIO)    scrTitle = "MEU PORTFOLIO";
-  else if (currentScreen == SCR_POMODORO)     scrTitle = "POMODORO FOCUS";
-  else if (currentScreen == SCR_MEDIA)        scrTitle = "NOW PLAYING";
+  else if (currentScreen == SCR_MARKET)       scrTitle = "MERCADO";
+  else if (currentScreen == SCR_PORTFOLIO)    scrTitle = "PORTFOLIO";
+  else if (currentScreen == SCR_POMODORO)     scrTitle = "POMODORO";
+  else if (currentScreen == SCR_MEDIA)        scrTitle = "PLAYER";
+  else if (currentScreen == SCR_WEATHER_GEMS) scrTitle = "CLIMA & IA";
 
   tft.setTextDatum(ML_DATUM);
   tft.setTextColor(C_ACCENT, C_ACCENT_DK);
-  tft.drawString(scrTitle, 24, (HDR_H - 2) / 2, 2);
+  tft.drawString(scrTitle, 21, (HDR_H - 2) / 2, 2);
+}
 
-  // Hostname + Status
+// Renderiza no Menu Superior: [HORA (HH:MM)] + [DATA (DD/MM)] + [TEMP (°C)] + [REGIAO / STATUS]
+void drawClock() {
+  char timeDateBuf[20];
+  bool hasTime = (linked && st.hh >= 0 && st.mm >= 0);
+  bool hasDate = (wth.dateShort[0] != '\0' && wth.dateShort[0] != '-');
+
+  if (hasTime && hasDate) {
+    snprintf(timeDateBuf, sizeof(timeDateBuf), "%02d:%02d %s", st.hh, st.mm, wth.dateShort);
+  } else if (hasTime) {
+    snprintf(timeDateBuf, sizeof(timeDateBuf), "%02d:%02d", st.hh, st.mm);
+  } else {
+    snprintf(timeDateBuf, sizeof(timeDateBuf), "--:-- --/--");
+  }
+
+  // Limpa faixa central-direita do Header (x = 96..319) sem piscar
+  tft.fillRect(96, 0, SCR_W - 96, HDR_H - 2, C_ACCENT_DK);
+
+  // 1) Hora + Data Atual (x = 98)
+  tft.setTextDatum(ML_DATUM);
+  tft.setTextColor(C_TEXT, C_ACCENT_DK);
+  int wTD = tft.drawString(timeDateBuf, 98, (HDR_H - 2) / 2, 2);
+
+  // 2) Pill de Temperatura da Regiao ao lado da Data (ex: 29°C)
+  int pillX = 98 + wTD + 5;
+  int pillW = 42;
+  uint16_t tCol = 0x07FF; // Ciano agradavel
+  if (wth.valid) {
+    if      (wth.alert || wth.temp >= 35.0f) tCol = 0xF800; // Vermelho calor extremo/alerta
+    else if (wth.temp >= 30.0f)              tCol = 0xFD20; // Laranja quente
+    else if (wth.temp >= 20.0f)              tCol = 0x07E0; // Verde confortavel
+    else                                     tCol = 0x07FF; // Ciano frio
+  } else {
+    tCol = C_DIM;
+  }
+
+  uint16_t pillBg = scale565(tCol, 1, 5);
+  tft.fillRoundRect(pillX, 3, pillW, 16, 3, pillBg);
+  tft.drawRoundRect(pillX, 3, pillW, 16, 3, tCol);
+
+  char tBuf[10];
+  if (wth.valid) {
+    snprintf(tBuf, sizeof(tBuf), "%.0fC", wth.temp);
+  } else {
+    snprintf(tBuf, sizeof(tBuf), "--C");
+  }
+  tft.setTextDatum(MC_DATUM);
+  tft.setTextColor(wth.valid ? 0xFFFF : C_DIM, pillBg);
+  tft.drawString(tBuf, pillX + pillW / 2, 11, 2);
+  // Desenha bolinha de grau (°) antes do C se temperatura valida
+  if (wth.valid) {
+    int degX = pillX + pillW - 12;
+    tft.drawCircle(degX, 6, 1, tCol);
+  }
+
+  // 3) Extremo Direito do Menu Superior: Alerta de Tempestade, Cidade ou Status da Tela
   tft.setTextDatum(MR_DATUM);
-  tft.setTextColor(linked ? C_TEXT : C_WARN, C_ACCENT_DK);
-  tft.setTextPadding(95);
-  if (currentScreen == SCR_MARKET && mkt.valid) {
-    tft.setTextColor(0x07E0, C_ACCENT_DK);
-    tft.drawString("LIVE MARKET", SCR_W - 6, (HDR_H - 2) / 2, 2);
-  } else if (currentScreen == SCR_PORTFOLIO && portf.valid) {
-    tft.setTextColor(portf.pnl_val >= 0.0f ? 0x07E0 : 0xF800, C_ACCENT_DK);
-    tft.drawString("PATRIMONIO", SCR_W - 6, (HDR_H - 2) / 2, 2);
+  if (wth.alert) {
+    bool flashOn = ((millis() / 450) % 2 == 0);
+    uint16_t aBg = flashOn ? 0xF800 : 0xFFE0;
+    uint16_t aFg = flashOn ? 0xFFFF : 0x0000;
+    tft.fillRoundRect(232, 3, 84, 16, 3, aBg);
+    tft.setTextColor(aFg, aBg);
+    tft.drawString("! ALERTA !", 312, 11, 1);
   } else if (currentScreen == SCR_POMODORO) {
     bool isBrk = (strcasecmp(pomo.state, "WORK") != 0);
     uint16_t pCol = !pomo.running ? 0xFD20 : (isBrk ? 0x07FF : 0x07E0);
     tft.setTextColor(pCol, C_ACCENT_DK);
-    tft.drawString(!pomo.running ? "PAUSADO" : (isBrk ? "PAUSA" : "EM FOCO"), SCR_W - 6, (HDR_H - 2) / 2, 2);
+    tft.drawString(!pomo.running ? "PAUSADO" : (isBrk ? "PAUSA" : "EM FOCO"), SCR_W - 4, 11, 1);
   } else if (currentScreen == SCR_MEDIA) {
     uint16_t mCol = getMediaAccentColor();
     tft.setTextColor(mCol, C_ACCENT_DK);
     const char* sLbl = (strcasecmp(mediaSt.source, "NONE") == 0) ? "PLAYER" : mediaSt.source;
-    tft.drawString(sLbl, SCR_W - 6, (HDR_H - 2) / 2, 2);
+    tft.drawString(sLbl, SCR_W - 4, 11, 1);
+  } else if (wth.valid && wth.city[0]) {
+    char cityShort[14];
+    snprintf(cityShort, sizeof(cityShort), "%.11s", wth.city);
+    for (int i = 0; cityShort[i]; i++) cityShort[i] = toupper((unsigned char)cityShort[i]);
+    tft.setTextColor(C_ACCENT, C_ACCENT_DK);
+    tft.drawString(cityShort, SCR_W - 4, 11, 1);
   } else {
-    tft.drawString(linked ? st.host : "AGUARDANDO PC", SCR_W - 6, (HDR_H - 2) / 2, 2);
+    tft.setTextColor(linked ? C_TEXT : C_WARN, C_ACCENT_DK);
+    tft.drawString(linked ? st.host : "OFFLINE", SCR_W - 4, 11, 1);
   }
-  tft.setTextPadding(0);
 }
 
-void drawClock() {
-  char buf[8];
-  if (linked && st.hh >= 0 && st.mm >= 0)
-    snprintf(buf, sizeof(buf), "%02d:%02d", st.hh, st.mm);
-  else
-    snprintf(buf, sizeof(buf), "--:--");
+// Banner de Emergencia / Aviso de Tempestade na Tela da Placa CYD
+void drawStormAlertBanner() {
+  if (!wth.alert) {
+    if (gLastStormAlert) {
+      gLastStormAlert = false;
+      gLastStormFlash = 255;
+      needFullDraw = true; // Restaura a tela limpa quando o alerta de tempestade encerra
+    }
+    return;
+  }
+  gLastStormAlert = true;
+  uint8_t flashPhase = (uint8_t)((millis() / 500) % 2);
+  if (flashPhase == gLastStormFlash && !needFullDraw) return;
+  gLastStormFlash = flashPhase;
+
+  uint16_t bgCol = flashPhase ? 0xC800 : 0xFFE0; // Alterna Vermelho Intenso e Amarelo Alerta
+  uint16_t fgCol = flashPhase ? 0xFFFF : 0x0000;
+  uint16_t bdCol = flashPhase ? 0xFFE0 : 0xF800;
+
+  const int by = HDR_H;
+  const int bh = 18;
+  tft.fillRect(0, by, SCR_W, bh, bgCol);
+  tft.drawRect(0, by, SCR_W, bh, bdCol);
+
+  // Icone de raio a esquerda e a direita
+  tft.fillTriangle(12, by + 2, 7, by + 9, 12, by + 9, fgCol);
+  tft.fillTriangle(10, by + 9, 15, by + 9, 9, by + 16, fgCol);
+
+  char bannerTxt[58];
+  snprintf(bannerTxt, sizeof(bannerTxt), "AVISO %s: %.34s", wth.city, wth.alertMsg);
+  for (int i = 0; bannerTxt[i]; i++) bannerTxt[i] = toupper((unsigned char)bannerTxt[i]);
 
   tft.setTextDatum(MC_DATUM);
-  tft.setTextColor(C_TEXT, C_ACCENT_DK);
-  tft.setTextPadding(42);
-  tft.drawString(buf, SCR_W / 2, (HDR_H - 2) / 2, 2);
-  tft.setTextPadding(0);
+  tft.setTextColor(fgCol, bgCol);
+  tft.drawString(bannerTxt, SCR_W / 2, by + bh / 2, 1);
 }
 
 // ======================================= Letreiro Infinito (Ticker Tape) ===
@@ -1000,13 +1119,34 @@ int drawTickerSegment(int x, const char* sym, const char* priceStr, float chgPct
 // Renderiza uma passagem completa de todos os ativos financeiros a partir de `baseX`
 int drawFullTickerCycle(int baseX) {
   int x = baseX;
-  char pBuf[24];
+  char pBuf[64];
+
+  // 0) Se houver Alerta de Tempestade ativo na regiao, destaca em vermelho/amarelo no inicio do letreiro!
+  if (wth.alert) {
+    tickerSpr.setTextDatum(ML_DATUM);
+    tickerSpr.setTextColor(0xFFE0, 0x0421);
+    int wA = tickerSpr.drawString("[! ALERTA CLIMA !] ", x, 10, 2);
+    x += wA;
+    snprintf(pBuf, sizeof(pBuf), "%s: %s (%.0fC | Chuva %u%%)   ", wth.city, wth.alertMsg, wth.temp, (unsigned)wth.rainProb);
+    tickerSpr.setTextColor(0xF800, 0x0421);
+    x += tickerSpr.drawString(pBuf, x, 10, 2) + 12;
+  } else if (wth.valid) {
+    // Clima da regiao configurada (ex: VOTUPORANGA 29.4C)
+    tickerSpr.setTextDatum(ML_DATUM);
+    tickerSpr.setTextColor(0x07FF, 0x0421);
+    x += tickerSpr.drawString(wth.city, x, 10, 2) + 4;
+    snprintf(pBuf, sizeof(pBuf), "%.1fC (%s)", wth.temp, wth.cond);
+    tickerSpr.setTextColor(0xFFFF, 0x0421);
+    x += tickerSpr.drawString(pBuf, x, 10, 2) + 10;
+    tickerSpr.fillCircle(x, 9, 2, C_DIM);
+    x += 12;
+  }
 
   if (!mkt.valid) {
     tickerSpr.setTextDatum(ML_DATUM);
     tickerSpr.setTextColor(C_TEXT, 0x0421);
     int w = tickerSpr.drawString("Sincronizando cotacoes em tempo real (USD/BRL, EUR/BRL, BTC, ETH, SOL, BNB, XRP, IBOV, S&P500)...   ", x, 10, 2);
-    return max(w, 320);
+    return max((x - baseX) + w, 320);
   }
 
   // 1) Dolar (USD/BRL)
@@ -2224,6 +2364,267 @@ void screenMediaDynamic() {
   tft.drawString(tBuf, 265, 206, 1);
 }
 
+// ================================================= TELA 10: CLIMA & GEMINI ==
+// Desenha icone vetorial de clima (0=Sol, 1=Nublado, 2=Chuva, 3=Tempestade)
+void drawWeatherIcon(int cx, int cy, uint8_t iconType, bool isAlert) {
+  tft.fillRect(cx - 24, cy - 22, 48, 44, C_CARD);
+  if (isAlert || iconType == 3) {
+    // Nuvem de tempestade escura + Raio Amarelo Brilhante + Gotas
+    uint16_t cld = 0x7BEF;
+    tft.fillCircle(cx - 8, cy - 5, 9, cld);
+    tft.fillCircle(cx + 2, cy - 9, 11, cld);
+    tft.fillCircle(cx + 12, cy - 4, 8, cld);
+    tft.fillRoundRect(cx - 16, cy - 5, 34, 10, 4, cld);
+    // Raio amarelo
+    tft.fillTriangle(cx + 2, cy + 1, cx - 6, cy + 11, cx + 1, cy + 11, 0xFFE0);
+    tft.fillTriangle(cx - 1, cy + 10, cx + 6, cy + 10, cx - 3, cy + 20, 0xFFE0);
+    // Gotas laterais
+    tft.drawLine(cx - 12, cy + 8, cx - 15, cy + 15, 0x07FF);
+    tft.drawLine(cx + 12, cy + 8, cx + 9,  cy + 15, 0x07FF);
+  } else if (iconType == 2) {
+    // Nuvem prateada + Chuva Ciano
+    uint16_t cld = 0xAD55;
+    tft.fillCircle(cx - 8, cy - 6, 9, cld);
+    tft.fillCircle(cx + 2, cy - 10, 11, cld);
+    tft.fillCircle(cx + 12, cy - 5, 8, cld);
+    tft.fillRoundRect(cx - 16, cy - 6, 34, 10, 4, cld);
+    for (int i = -10; i <= 10; i += 10) {
+      tft.drawLine(cx + i, cy + 7, cx + i - 3, cy + 16, 0x07FF);
+      tft.drawLine(cx + i + 1, cy + 7, cx + i - 2, cy + 16, 0x07FF);
+    }
+  } else if (iconType == 1) {
+    // Sol atras da nuvem (Parcialmente nublado)
+    tft.fillCircle(cx - 9, cy - 10, 8, 0xFFE0);
+    uint16_t cld = 0xDEFB;
+    tft.fillCircle(cx - 6, cy - 2, 9, cld);
+    tft.fillCircle(cx + 4, cy - 6, 11, cld);
+    tft.fillCircle(cx + 13, cy - 1, 8, cld);
+    tft.fillRoundRect(cx - 14, cy - 2, 33, 10, 4, cld);
+  } else {
+    // Sol Radiante (Ceu limpo)
+    tft.fillCircle(cx, cy, 11, 0xFFE0);
+    tft.drawCircle(cx, cy, 13, 0xFD20);
+    for (int a = 0; a < 360; a += 45) {
+      float rad = a * 0.0174532925f;
+      int x0 = cx + (int)(cosf(rad) * 15.0f);
+      int y0 = cy + (int)(sinf(rad) * 15.0f);
+      int x1 = cx + (int)(cosf(rad) * 20.0f);
+      int y1 = cy + (int)(sinf(rad) * 20.0f);
+      tft.drawLine(x0, y0, x1, y1, 0xFFE0);
+    }
+  }
+}
+
+// Quebra `wth.gemText` em linhas de ate `maxChars` caracteres sem cortar palavras no meio
+static int wrapGemLines(const char* txt, char lines[][40], int maxLines, int maxChars) {
+  if (!txt || !txt[0]) return 0;
+  int lineCount = 0;
+  int len = strlen(txt);
+  int pos = 0;
+
+  while (pos < len && lineCount < maxLines) {
+    while (pos < len && (txt[pos] == ' ' || txt[pos] == '\n' || txt[pos] == '\r')) {
+      pos++;
+    }
+    if (pos >= len) break;
+
+    // Respeita quebras de linha explicitas ('\n' ou '|')
+    int nlPos = -1;
+    for (int k = pos; k < len && (k - pos) <= maxChars; k++) {
+      if (txt[k] == '\n' || txt[k] == '|') {
+        nlPos = k;
+        break;
+      }
+    }
+
+    int endPos = pos + maxChars;
+    if (nlPos >= 0) {
+      endPos = nlPos;
+    } else if (endPos < len) {
+      int lastSpace = -1;
+      for (int k = pos; k < endPos; k++) {
+        if (txt[k] == ' ') lastSpace = k;
+      }
+      if (lastSpace > pos + 10) endPos = lastSpace;
+    } else {
+      endPos = len;
+    }
+
+    int copyLen = endPos - pos;
+    if (copyLen > maxChars) copyLen = maxChars;
+    memcpy(lines[lineCount], txt + pos, copyLen);
+    lines[lineCount][copyLen] = '\0';
+    lineCount++;
+    pos = endPos;
+    if (pos < len && (txt[pos] == '\n' || txt[pos] == '|')) pos++;
+  }
+  return lineCount;
+}
+
+void screenWeatherGemsStatic() {
+  renderBackground();
+  drawHeader();
+  drawClock();
+
+  // Card Superior: Data Atual, Localizacao (Votuporanga) & Temperatura Regional
+  drawModernCard(6, 27, 308, 76, "CLIMA REGIONAL & DATA ATUAL");
+
+  // Card Inferior: Gemini Gems (Automacoes Diarias via IA)
+  drawModernCard(6, 106, 308, 112, "");
+  // Destaque especial Gemini IA no topo do card inferior
+  tft.fillRoundRect(12, 110, 16, 12, 3, 0x07FF);
+  tft.setTextDatum(MC_DATUM);
+  tft.setTextColor(0x0000, 0x07FF);
+  tft.drawString("IA", 20, 116, 1);
+
+  gLastWthSig[0] = '\0';
+  gLastGemSig[0] = '\0';
+  gLastGemPage   = -1;
+}
+
+void screenWeatherGemsDynamic() {
+  // 1) Atualiza Card Superior (Clima, Data e Localidade) apenas quando mudam os dados
+  char wSig[96];
+  snprintf(wSig, sizeof(wSig), "%s|%s|%s|%.1f|%.1f|%u|%.0f|%u|%u|%d|%s",
+           wth.city, wth.dateFull, wth.dow, wth.temp, wth.feels,
+           (unsigned)wth.hum, wth.wind, (unsigned)wth.rainProb,
+           (unsigned)wth.icon, wth.alert ? 1 : 0, wth.cond);
+
+  if (strcmp(wSig, gLastWthSig) != 0) {
+    strlcpy(gLastWthSig, wSig, sizeof(gLastWthSig));
+
+    // Pill de Data Completa + Dia da Semana no canto superior direito do Card 1
+    char dtBadge[28];
+    if (wth.dow[0] && wth.dow[0] != '-') {
+      snprintf(dtBadge, sizeof(dtBadge), "%s %s", wth.dow, wth.dateFull);
+    } else {
+      snprintf(dtBadge, sizeof(dtBadge), "DATA: %s", wth.dateFull);
+    }
+    tft.fillRoundRect(184, 29, 124, 12, 3, scale565(C_ACCENT, 1, 5));
+    tft.setTextDatum(MC_DATUM);
+    tft.setTextColor(0xFFFF, scale565(C_ACCENT, 1, 5));
+    tft.drawString(dtBadge, 246, 35, 1);
+
+    // Icone vetorial de clima a esquerda
+    drawWeatherIcon(34, 68, wth.icon, wth.alert);
+
+    // Limpa miolo central do Card 1 (x = 62..202, y = 42..99)
+    tft.fillRect(62, 42, 140, 58, C_CARD);
+
+    // Cidade / Localidade em destaque
+    char cityLine[28];
+    snprintf(cityLine, sizeof(cityLine), "LOCAL: %s", wth.city);
+    for (int i = 0; cityLine[i]; i++) cityLine[i] = toupper((unsigned char)cityLine[i]);
+    tft.setTextDatum(TL_DATUM);
+    tft.setTextColor(C_ACCENT, C_CARD);
+    tft.drawString(cityLine, 64, 42, 1);
+
+    // Temperatura grande ao lado do icone
+    uint16_t tCol = 0x07E0;
+    if      (wth.alert || wth.temp >= 35.0f) tCol = 0xF800;
+    else if (wth.temp >= 30.0f)              tCol = 0xFD20;
+    else if (wth.temp <  20.0f)              tCol = 0x07FF;
+
+    char tempBig[16];
+    if (wth.valid) snprintf(tempBig, sizeof(tempBig), "%.1f", wth.temp);
+    else           snprintf(tempBig, sizeof(tempBig), "--.-");
+    tft.setTextColor(tCol, C_CARD);
+    int wT = tft.drawString(tempBig, 64, 53, 4);
+    tft.drawCircle(64 + wT + 4, 57, 2, tCol);
+    tft.drawString("C", 64 + wT + 9, 54, 2);
+
+    // Condicao + Min/Max
+    char condLine[36];
+    if (wth.valid) {
+      snprintf(condLine, sizeof(condLine), "%.13s | %.0f/%.0fC", wth.cond, wth.tmin, wth.tmax);
+    } else {
+      snprintf(condLine, sizeof(condLine), "Buscando clima...");
+    }
+    tft.setTextColor(C_TEXT, C_CARD);
+    tft.drawString(condLine, 64, 83, 2);
+
+    // Coluna Direita do Card 1: 3 Pílulas de Telemetria Climatica (x = 204..308)
+    char p1[22], p2[22], p3[22];
+    snprintf(p1, sizeof(p1), "SENSACAO: %.1fC", wth.feels);
+    snprintf(p2, sizeof(p2), "UMID:%u%% CHV:%u%%", (unsigned)wth.hum, (unsigned)wth.rainProb);
+    if (wth.alert) {
+      snprintf(p3, sizeof(p3), "! TEMPESTADE !");
+    } else {
+      snprintf(p3, sizeof(p3), "VENTO: %.0f km/h", wth.wind);
+    }
+
+    // Pill 1
+    tft.fillRoundRect(204, 44, 102, 16, 3, 0x1082);
+    tft.setTextDatum(MC_DATUM);
+    tft.setTextColor(C_TEXT, 0x1082);
+    tft.drawString(p1, 255, 52, 1);
+
+    // Pill 2
+    tft.fillRoundRect(204, 63, 102, 16, 3, 0x1082);
+    tft.setTextColor(0x07FF, 0x1082);
+    tft.drawString(p2, 255, 71, 1);
+
+    // Pill 3 (Alerta ou Vento)
+    uint16_t p3Bg = wth.alert ? 0xF800 : 0x1082;
+    uint16_t p3Fg = wth.alert ? 0xFFFF : C_DIM;
+    tft.fillRoundRect(204, 82, 102, 16, 3, p3Bg);
+    tft.setTextColor(p3Fg, p3Bg);
+    tft.drawString(p3, 255, 90, 1);
+  }
+
+  // 2) Atualiza Card Inferior (Gemini Gems — Automacao Diaria) com paginacao automatica
+  char gLines[12][40];
+  int totalLines = wrapGemLines(wth.gemText, gLines, 12, 36);
+  if (totalLines <= 0) totalLines = 1;
+  int totalPages = (totalLines + 3) / 4; // 4 linhas por pagina em Fonte 2
+  if (totalPages < 1) totalPages = 1;
+  int curPage = (totalPages > 1) ? (int)((millis() / 6000) % totalPages) : 0;
+
+  char gSig[160];
+  snprintf(gSig, sizeof(gSig), "%s|%s|%.80s", wth.gemTitle, wth.gemTime, wth.gemText);
+
+  if (strcmp(gSig, gLastGemSig) != 0 || curPage != gLastGemPage) {
+    strlcpy(gLastGemSig, gSig, sizeof(gLastGemSig));
+    gLastGemPage = curPage;
+
+    // Cabecalho da Gem ativa
+    tft.fillRect(32, 109, 276, 15, C_CARD);
+    tft.setTextDatum(ML_DATUM);
+    tft.setTextColor(0x07FF, C_CARD);
+    char titBuf[34];
+    snprintf(titBuf, sizeof(titBuf), "%.28s", wth.gemTitle);
+    for (int i = 0; titBuf[i]; i++) titBuf[i] = toupper((unsigned char)titBuf[i]);
+    tft.drawString(titBuf, 32, 116, 1);
+
+    // Horario da Gem + Indicador de Pagina (ex: 14:10 [1/2])
+    char pgBuf[20];
+    snprintf(pgBuf, sizeof(pgBuf), "%s [%d/%d]", wth.gemTime, curPage + 1, totalPages);
+    tft.setTextDatum(MR_DATUM);
+    tft.setTextColor(C_DIM, C_CARD);
+    tft.drawString(pgBuf, 306, 116, 1);
+
+    // Linha divisoria sutil abaixo do titulo da Gem
+    tft.drawFastHLine(12, 125, 296, C_CARD_HI);
+
+    // Corpo do texto da Gem (4 linhas em Fonte 2 para leitura nitida a distancia)
+    tft.fillRect(12, 127, 296, 86, C_CARD);
+    tft.setTextDatum(TL_DATUM);
+    int startLine = curPage * 4;
+    for (int row = 0; row < 4; row++) {
+      int idx = startLine + row;
+      if (idx >= totalLines) break;
+      const char* ln = gLines[idx];
+      // Destaca topicos iniciados por '-' ou '*' ou numeros com a cor de destaque
+      if (ln[0] == '-' || ln[0] == '*' || (ln[0] >= '1' && ln[0] <= '9' && ln[1] == '.')) {
+        tft.setTextColor(0xFFFF, C_CARD);
+      } else {
+        tft.setTextColor(0xDEFB, C_CARD);
+      }
+      tft.drawString(ln, 14, 129 + row * 20, 2);
+    }
+  }
+}
+
 // ================================================= Serial / Protocolo JSON =
 void applyJson(const char *json) {
   JsonDocument doc;
@@ -2334,7 +2735,8 @@ void applyJson(const char *json) {
     } else if (vScr.is<const char*>()) {
       String s = String(vScr.as<const char*>());
       s.toLowerCase();
-      if (s.indexOf("pomo") >= 0 || s.indexOf("foco") >= 0) newScr = SCR_POMODORO;
+      if (s.indexOf("wth") >= 0 || s.indexOf("clim") >= 0 || s.indexOf("gem") >= 0 || s.indexOf("ia") >= 0 || s.indexOf("vot") >= 0) newScr = SCR_WEATHER_GEMS;
+      else if (s.indexOf("pomo") >= 0 || s.indexOf("foco") >= 0) newScr = SCR_POMODORO;
       else if (s.indexOf("med") >= 0 || s.indexOf("spot") >= 0 || s.indexOf("yt") >= 0 || s.indexOf("mus") >= 0) newScr = SCR_MEDIA;
       else if (s.indexOf("port") >= 0 || s.indexOf("cart") >= 0 || s.indexOf("patr") >= 0) newScr = SCR_PORTFOLIO;
       else if (s.indexOf("mkt") >= 0 || s.indexOf("merc") >= 0 || s.indexOf("bolsa") >= 0) newScr = SCR_MARKET;
@@ -2584,6 +2986,44 @@ void applyJson(const char *json) {
     mediaSt.valid  = true;
   }
 
+  // 7.5) Processa Clima Regional, Data & Localidade ("wth") + Gemini Gems ("gem")
+  JsonVariant jw = root["wth"];
+  if (!jw.isNull()) {
+    if (!jw["city"].isNull()) sanitizeAscii(wth.city, jw["city"] | "Votuporanga", sizeof(wth.city));
+    if (!jw["dt"].isNull())   sanitizeAscii(wth.dateShort, jw["dt"]  | "--/--", sizeof(wth.dateShort));
+    if (!jw["dtf"].isNull())  sanitizeAscii(wth.dateFull,  jw["dtf"] | "--/--/----", sizeof(wth.dateFull));
+    if (!jw["dow"].isNull())  sanitizeAscii(wth.dow,       jw["dow"] | "---", sizeof(wth.dow));
+    if (!jw["temp"].isNull()) {
+      wth.temp  = jw["temp"]  | wth.temp;
+      wth.valid = true;
+    }
+    wth.feels    = jw["feels"] | wth.feels;
+    wth.tmin     = jw["tmin"]  | wth.tmin;
+    wth.tmax     = jw["tmax"]  | wth.tmax;
+    wth.hum      = (uint8_t)constrain((int)(jw["hum"]  | wth.hum), 0, 100);
+    wth.wind     = jw["wind"]  | wth.wind;
+    wth.rainProb = (uint8_t)constrain((int)(jw["rain"] | wth.rainProb), 0, 100);
+    wth.icon     = (uint8_t)constrain((int)(jw["icon"] | wth.icon), 0, 3);
+    if (!jw["cond"].isNull()) sanitizeAscii(wth.cond, jw["cond"] | "Normal", sizeof(wth.cond));
+    if (!jw["amsg"].isNull()) sanitizeAscii(wth.alertMsg, jw["amsg"] | "TEMPESTADE NA REGIAO!", sizeof(wth.alertMsg));
+
+    bool newAlert = jw["alert"] | false;
+    if (newAlert && !wth.alert) {
+      // Dispara aviso sonoro + LED vermelho critico ao iniciar um Alerta de Tempestade!
+      triggerAlert(true, 0xF800, 3);
+    }
+    wth.alert = newAlert;
+  }
+
+  JsonVariant jg = root["gem"];
+  if (!jg.isNull()) {
+    if (!jg["tit"].isNull()) sanitizeAscii(wth.gemTitle, jg["tit"] | "Gem: Embarcados & IoT", sizeof(wth.gemTitle));
+    if (!jg["txt"].isNull()) sanitizeAscii(wth.gemText,  jg["txt"] | "", sizeof(wth.gemText));
+    if (!jg["tm"].isNull())  sanitizeAscii(wth.gemTime,  jg["tm"]  | "--:--", sizeof(wth.gemTime));
+    if (!jg["mdl"].isNull()) sanitizeAscii(wth.gemModel, jg["mdl"] | "gemini-3.8-flash", sizeof(wth.gemModel));
+    wth.gemValid = true;
+  }
+
   // 8) Processa Bloco de Alertas Fisicos ("alrt") - Buzzer e LED RGB
   JsonVariant alrt = root["alrt"];
   if (!alrt.isNull()) {
@@ -2727,6 +3167,7 @@ void loop() {
     else if (currentScreen == SCR_PORTFOLIO)    screenPortfolioStatic();
     else if (currentScreen == SCR_POMODORO)     screenPomodoroStatic();
     else if (currentScreen == SCR_MEDIA)        screenMediaStatic();
+    else if (currentScreen == SCR_WEATHER_GEMS) screenWeatherGemsStatic();
     needFullDraw = false;
   }
 
@@ -2758,8 +3199,10 @@ void loop() {
     else if (currentScreen == SCR_PORTFOLIO)    screenPortfolioDynamic();
     else if (currentScreen == SCR_POMODORO)     screenPomodoroDynamic();
     else if (currentScreen == SCR_MEDIA)        screenMediaDynamic();
+    else if (currentScreen == SCR_WEATHER_GEMS) screenWeatherGemsDynamic();
 
     drawClock();
+    drawStormAlertBanner();
   }
 
   delay(5);

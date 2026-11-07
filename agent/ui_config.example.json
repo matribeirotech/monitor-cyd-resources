@@ -4,6 +4,9 @@
   "color": "0x07FF",
   "bg": "",
   "brt": 220,
-  "ticker": true
+  "ticker": true,
+  "weather_city": "Votuporanga",
+  "gemini_api_key": "",
+  "gemini_model": "gemini-3.8-flash"
 }
 
