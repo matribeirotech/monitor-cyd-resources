@@ -17,6 +17,7 @@ import argparse
 import asyncio
 import base64
 import ctypes
+import getpass
 import hashlib
 import http.server
 import inspect
@@ -44,6 +45,11 @@ try:
     import qrcode
 except ImportError:
     qrcode = None
+
+try:
+    import paramiko
+except ImportError:
+    paramiko = None
 
 try:
     import mobile_web
@@ -760,17 +766,80 @@ def find_port():
     return None
 
 
+UDP_DEFAULT_PORT = 8888
+# lwIP do Arduino-ESP32 vem com CONFIG_LWIP_IP4_REASSEMBLY desativado: datagramas
+# maiores que o MTU (~1472 B) sao DESCARTADOS pela placa. Mantemos margem de seguranca.
+UDP_MAX_DATAGRAM = 1400
+UDP_ALIVE_TIMEOUT_S = 6.0
+UDP_PING_INTERVAL_S = 2.0
+
+
+def _json_compact(pkt) -> str:
+    return json.dumps(pkt, separators=(",", ":"), ensure_ascii=True)
+
+
+def split_payload_for_udp(pkt: dict, max_bytes: int = UDP_MAX_DATAGRAM) -> list[str]:
+    """
+    Fragmenta um payload JSON em datagramas independentes <= max_bytes.
+      - Agrupa chaves de topo ("sys", "mkt", "ui", "news"...) de forma gulosa: o firmware
+        processa cada bloco de forma independente em applyJson(), entao a divisao e segura.
+      - Se um bloco isolado ainda exceder o limite (ex: "news" com fila de manchetes),
+        reduz a fila de manchetes progressivamente ate caber.
+    """
+    raw = _json_compact(pkt)
+    if len(raw) <= max_bytes or not isinstance(pkt, dict):
+        return [raw]
+
+    def _shrink_block(key, val):
+        blk = {key: val}
+        if len(_json_compact(blk)) <= max_bytes:
+            return blk
+        if key == "news" and isinstance(val, dict) and isinstance(val.get("queue"), list):
+            v2 = dict(val)
+            q = list(v2["queue"])
+            while q and len(_json_compact({key: v2})) > max_bytes:
+                q = q[:-1]
+                v2["queue"] = q
+            if len(_json_compact({key: v2})) <= max_bytes:
+                return {key: v2}
+        return blk  # Ultimo recurso: envia mesmo assim (pode ser descartado pela placa)
+
+    datagrams: list[str] = []
+    cur: dict = {}
+    for k, v in pkt.items():
+        blk = _shrink_block(k, v)
+        trial = dict(cur)
+        trial.update(blk)
+        if cur and len(_json_compact(trial)) > max_bytes:
+            datagrams.append(_json_compact(cur))
+            cur = dict(blk)
+        else:
+            cur = trial
+    if cur:
+        datagrams.append(_json_compact(cur))
+    return datagrams
+
+
 class SerialManager:
     """
-    Gerenciador Dedicado de Comunicação Serial Assíncrona (115200 bps):
-      - Isola 100% do I/O de porta COM (`pyserial`) em uma thread exclusiva (`SerialManagerThread`).
-      - O loop principal do Flet NUNCA espera a resposta da CYD nem bloqueia em `ser.write()`.
-      - Faz o flush explícito de buffers (`reset_input_buffer`, `reset_output_buffer`, `flush`)
-        e opera com 3 canais de prioridade:
-          1. `transfer_queue`: Blocos de imagem/capa para o Cartão SD (controle por ACK).
-          2. `event_queue`: Mudanças de tela, cor, brilho, alertas e comandos de Terminal (< 20ms).
-          3. `_latest_telemetry`: Slot atômico de último valor para telemetria (descarta frames velhos
-             automaticamente caso a porta esteja ocupada, eliminando lag acumulado!).
+    Gerenciador Híbrido de Transporte (USB Serial 115200 bps + Wi-Fi UDP :8888):
+      - Isola 100% do I/O (pyserial + socket UDP) em threads dedicadas. O loop do Flet
+        NUNCA espera resposta da CYD nem bloqueia em `ser.write()` / `sendto()`.
+      - Rota única por pacote (nunca duplicada): se o mesmo pacote fosse por USB e UDP,
+        chunks de upload seriam gravados 2x no SD, o Buzzer tocaria 2x e os gráficos
+        avançariam em dobro. Política de roteamento:
+          1. UDP ativo + placa respondendo PONG (< 6s)  -> Wi-Fi UDP (rota principal)
+          2. USB conectado                               -> USB Serial (fallback/debug)
+          3. UDP ativo sem resposta e sem USB            -> Wi-Fi UDP "às cegas"
+      - Heartbeat `{"cmd":"udp_ping"}` a cada 2s; a CYD responde `UDP_PONG:<uptime>:<ip>`.
+        Uptime regressivo = placa reiniciou -> dispara `MONITOR_READY` para reenviar o estado.
+      - 3 canais de prioridade:
+          1. `transfer_queue`: blocos de imagem/capa para o Cartão SD (controle por ACK).
+          2. `event_queue`: tela, cor, brilho, alertas, Terminal (< 20ms). Aceita `dict`
+             ou tupla `("serial", dict)` para forçar a rota USB (ex: provisionamento Wi-Fi).
+          3. `_latest_telemetry`: slot atômico (descarta frames velhos, zero lag acumulado).
+      - Abertura da porta COM sem `sleep` bloqueante: a janela de boot do ESP32 (1.5s) é
+        controlada por timestamp, então o UDP continua transmitindo durante a reconexão USB.
     """
 
     def __init__(
@@ -781,6 +850,9 @@ class SerialManager:
         on_status_change=None,
         on_log=None,
         auto_start: bool = True,
+        udp_enabled: bool = False,
+        udp_ip: str = "",
+        udp_port: int = UDP_DEFAULT_PORT,
     ):
         self.preferred_port = preferred_port
         self.baud = int(baud)
@@ -796,6 +868,19 @@ class SerialManager:
         self._telemetry_lock = threading.Lock()
         self._latest_telemetry: dict | None = None
 
+        # ---- Wi-Fi UDP ----
+        self._udp_lock = threading.Lock()
+        self._udp_enabled = bool(udp_enabled)
+        self._udp_ip = (udp_ip or "").strip()
+        self._udp_port = int(udp_port or UDP_DEFAULT_PORT)
+        self._udp_sock: socket.socket | None = None
+        self._udp_rx_thread: threading.Thread | None = None
+        self._udp_alive_t = 0.0
+        self._udp_last_uptime = -1
+        self._udp_last_ping_t = 0.0
+        self._udp_ping_sent_t = 0.0
+        self.detected_ip = ""
+
         self._status_lock = threading.Lock()
         self._status = {
             "connected": False,
@@ -806,6 +891,13 @@ class SerialManager:
             "rx_packets": 0,
             "tx_bytes_sec": 0,
             "last_error": "",
+            "transport": "NONE",  # NONE | USB | UDP
+            "udp_enabled": self._udp_enabled,
+            "udp_target": self._udp_target_str(),
+            "udp_alive": False,
+            "udp_rtt_ms": 0,
+            "udp_tx": 0,
+            "udp_drop": 0,
         }
         self._running = False
         self._reconnect_flag = threading.Event()
@@ -814,6 +906,7 @@ class SerialManager:
         if auto_start:
             self.start()
 
+    # ------------------------------------------------------------ API pública
     def set_callbacks(self, on_rx_line=None, on_status_change=None, on_log=None):
         """Define ou atualiza callbacks assíncronos de linha recebida e status."""
         if on_rx_line is not None:
@@ -833,17 +926,55 @@ class SerialManager:
         if self._running:
             return
         self._running = True
+        self._ensure_udp_socket()
         self._thread = threading.Thread(target=self._io_worker, daemon=True, name="SerialManagerThread")
         self._thread.start()
 
     def stop(self):
         self._running = False
         self._reconnect_flag.set()
+        with self._udp_lock:
+            if self._udp_sock is not None:
+                try:
+                    self._udp_sock.close()
+                except Exception:
+                    pass
+                self._udp_sock = None
 
     def request_reconnect(self, new_port: str = None):
         if new_port is not None:
             self.preferred_port = new_port.strip() or None
         self._reconnect_flag.set()
+
+    def configure_udp(self, enabled: bool, ip: str = None, port: int = None):
+        """Ativa/desativa a transmissão Wi-Fi UDP e define o IP:porta da placa CYD (thread-safe)."""
+        with self._udp_lock:
+            self._udp_enabled = bool(enabled)
+            if ip is not None:
+                self._udp_ip = (ip or "").strip()
+            if port is not None:
+                try:
+                    self._udp_port = max(1, min(65535, int(port)))
+                except Exception:
+                    self._udp_port = UDP_DEFAULT_PORT
+            self._udp_alive_t = 0.0
+            self._udp_last_ping_t = 0.0
+        self._ensure_udp_socket()
+        self._update_status(
+            udp_enabled=self._udp_enabled,
+            udp_target=self._udp_target_str(),
+            udp_alive=False,
+        )
+        if self.on_log:
+            if self._udp_enabled and self._udp_ip:
+                self.on_log(f"📶 Wi-Fi UDP ativado → {self._udp_target_str()} (USB Serial como fallback)")
+            elif self._udp_enabled:
+                self.on_log("📶 Wi-Fi UDP ativado, mas sem IP da CYD configurado.")
+            else:
+                self.on_log("🔌 Wi-Fi UDP desativado. Transmissão 100% via USB Serial.")
+
+    def is_udp_alive(self) -> bool:
+        return self._udp_ready() and (time.monotonic() - self._udp_alive_t) < UDP_ALIVE_TIMEOUT_S
 
     def clear_pending_events(self):
         while not self.event_queue.empty():
@@ -852,13 +983,14 @@ class SerialManager:
             except Exception:
                 break
 
-    def send_event(self, pkt: dict, coalesce: bool = False):
-        """Enfileira um comando/evento de alta prioridade para envio imediato (< 20ms) sem bloquear a UI."""
+    def send_event(self, pkt: dict, coalesce: bool = False, route: str = "auto"):
+        """Enfileira um comando/evento de alta prioridade (< 20ms) sem bloquear a UI.
+        route="serial" força o envio exclusivamente pela USB (ex: credenciais Wi-Fi)."""
         if not pkt:
             return
         if coalesce:
             self.clear_pending_events()
-        self.event_queue.put(pkt)
+        self.event_queue.put((route, pkt) if route != "auto" else pkt)
 
     def send_transfer(self, pkt: dict):
         """Enfileira um bloco de transferência para o Cartão SD."""
@@ -866,12 +998,12 @@ class SerialManager:
             self.transfer_queue.put(pkt)
 
     def send_telemetry(self, payload: dict):
-        """Atualiza o slot atômico de telemetria (sempre envia o pacote mais fresco a 115200 bps)."""
+        """Atualiza o slot atômico de telemetria (sempre envia o pacote mais fresco)."""
         with self._telemetry_lock:
             self._latest_telemetry = payload
 
     def wait_for_ack(self, expected_prefix: str, timeout: float = 4.0) -> tuple[bool, str]:
-        """Aguarda resposta ACK_/ERR_ da placa CYD (usado por background workers de upload SD)."""
+        """Aguarda resposta ACK_/ERR_ da placa CYD (chega por USB ou UDP, conforme a rota ativa)."""
         t0 = time.monotonic()
         while (time.monotonic() - t0) < timeout:
             if self.ack_event.wait(timeout=0.06):
@@ -889,6 +1021,13 @@ class SerialManager:
         with self._status_lock:
             return dict(self._status)
 
+    # ------------------------------------------------------------ internos
+    def _udp_target_str(self) -> str:
+        return f"{self._udp_ip}:{self._udp_port}" if self._udp_ip else ""
+
+    def _udp_ready(self) -> bool:
+        return self._udp_enabled and bool(self._udp_ip) and self._udp_sock is not None
+
     def _update_status(self, **kwargs):
         changed = False
         with self._status_lock:
@@ -903,8 +1042,53 @@ class SerialManager:
             except Exception:
                 pass
 
+    def _ensure_udp_socket(self):
+        """Cria (uma única vez) o socket UDP não-bloqueante + thread receptora de respostas."""
+        with self._udp_lock:
+            if self._udp_sock is not None:
+                return
+            try:
+                s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+                s.setsockopt(socket.SOL_SOCKET, socket.SO_SNDBUF, 64 * 1024)
+                s.bind(("0.0.0.0", 0))  # Porta efêmera: a CYD responde para (ip, porta) de origem
+                s.settimeout(0.5)
+                # Windows: evita WSAECONNRESET (10054) no recvfrom quando a CYD está offline
+                if IS_WINDOWS and hasattr(socket, "SIO_UDP_CONNRESET"):
+                    try:
+                        s.ioctl(socket.SIO_UDP_CONNRESET, False)
+                    except Exception:
+                        pass
+                self._udp_sock = s
+            except Exception as ex:
+                self._udp_sock = None
+                if self.on_log:
+                    self.on_log(f"⚠️ Falha ao criar socket UDP: {str(ex)[:60]}")
+                return
+        self._udp_rx_thread = threading.Thread(target=self._udp_rx_worker, daemon=True, name="UdpRxThread")
+        self._udp_rx_thread.start()
+
+    def _udp_sendto(self, pkt: dict) -> int:
+        """Envia um pacote via UDP (fragmentado em datagramas <= 1400 B). Nunca lança exceção."""
+        sock = self._udp_sock
+        if sock is None or not self._udp_ip:
+            return 0
+        sent = 0
+        target = (self._udp_ip, self._udp_port)
+        for dg in split_payload_for_udp(pkt):
+            try:
+                sock.sendto(dg.encode("utf-8"), target)
+                sent += len(dg)
+            except OSError:
+                with self._status_lock:
+                    self._status["udp_drop"] += 1
+        if sent:
+            with self._status_lock:
+                self._status["tx_packets"] += 1
+                self._status["udp_tx"] += 1
+        return sent
+
     def _write_json_line(self, ser, pkt: dict) -> int:
-        raw_bytes = (json.dumps(pkt, separators=(",", ":"), ensure_ascii=True) + "\n").encode("utf-8")
+        raw_bytes = (_json_compact(pkt) + "\n").encode("utf-8")
         # Se o buffer de saída do driver estiver congestionado, faz flush preventivo
         try:
             out_w = getattr(ser, "out_waiting", 0)
@@ -917,6 +1101,84 @@ class SerialManager:
         with self._status_lock:
             self._status["tx_packets"] += 1
         return len(raw_bytes)
+
+    def _resolve_route(self, ser_ready: bool) -> str | None:
+        if self._udp_ready() and self.is_udp_alive():
+            return "udp"
+        if ser_ready:
+            return "serial"
+        if self._udp_ready():
+            return "udp"
+        return None
+
+    def _send_pkt(self, ser, route: str, pkt: dict) -> int:
+        if route == "udp":
+            return self._udp_sendto(pkt)
+        if route == "serial" and ser is not None:
+            return self._write_json_line(ser, pkt)
+        return 0
+
+    def _handle_rx_line(self, raw: str, via: str):
+        """Processa uma linha recebida da CYD (mesmo tratamento para USB e UDP)."""
+        if not raw:
+            return
+        with self._status_lock:
+            self._status["rx_packets"] += 1
+
+        if raw.startswith("UDP_PONG"):
+            # Formato: UDP_PONG:<uptime_s>:<ip>
+            parts = raw.split(":")
+            now_m = time.monotonic()
+            rtt = int((now_m - self._udp_ping_sent_t) * 1000) if self._udp_ping_sent_t else 0
+            self._udp_alive_t = now_m
+            try:
+                up = int(parts[1]) if len(parts) > 1 else -1
+            except Exception:
+                up = -1
+            rebooted = self._udp_last_uptime >= 0 and 0 <= up < self._udp_last_uptime
+            self._udp_last_uptime = up
+            if len(parts) > 2 and parts[2]:
+                self.detected_ip = parts[2]
+            self._update_status(udp_alive=True, udp_rtt_ms=max(0, min(rtt, 9999)))
+            if rebooted and self.on_rx_line:
+                try:
+                    self.on_rx_line("MONITOR_READY")
+                except Exception:
+                    pass
+            return
+
+        if raw.startswith("WIFI_IP:"):
+            self.detected_ip = raw.split("WIFI_IP:", 1)[1].strip()
+
+        if raw.startswith("ACK_") or raw.startswith("ERR_"):
+            self.last_ack["val"] = raw
+            self.ack_event.set()
+        elif self.on_rx_line:
+            try:
+                self.on_rx_line(raw)
+            except Exception:
+                pass
+
+    def _udp_rx_worker(self):
+        """Thread receptora: respostas da CYD (TERM_LOG, ACK_, SD_FILES, UDP_PONG) via Wi-Fi."""
+        while self._running or self._udp_sock is not None:
+            sock = self._udp_sock
+            if sock is None:
+                break
+            try:
+                data, addr = sock.recvfrom(4096)
+            except socket.timeout:
+                continue
+            except OSError:
+                # Windows: WSAECONNRESET (10054) quando um ICMP "port unreachable" retorna; ignora
+                if not self._running:
+                    break
+                time.sleep(0.05)
+                continue
+            if self._udp_ip and addr[0] != self._udp_ip:
+                continue  # Ignora pacotes de outros hosts da rede
+            for ln in data.decode("utf-8", errors="ignore").splitlines():
+                self._handle_rx_line(ln.strip(), via="udp")
 
     def _read_available_lines(self, ser):
         lines_read = 0
@@ -938,94 +1200,125 @@ class SerialManager:
             except Exception:
                 break
             lines_read += 1
-            if not raw:
-                continue
-            with self._status_lock:
-                self._status["rx_packets"] += 1
-            if raw.startswith("ACK_") or raw.startswith("ERR_"):
-                self.last_ack["val"] = raw
-                self.ack_event.set()
-            elif self.on_rx_line:
-                try:
-                    self.on_rx_line(raw)
-                except Exception:
-                    pass
+            self._handle_rx_line(raw, via="serial")
 
     def _io_worker(self):
         import serial
 
         ser = None
+        ser_settle_until = 0.0  # Janela de boot do ESP32 após abrir a COM (DTR/RTS reset)
+        ser_ready = False
+        next_port_scan = 0.0
         bytes_window = 0
         window_t0 = time.monotonic()
 
+        def _close_serial():
+            nonlocal ser, ser_ready
+            if ser is not None:
+                try:
+                    ser.reset_input_buffer()
+                    ser.reset_output_buffer()
+                    ser.close()
+                except Exception:
+                    pass
+            ser = None
+            ser_ready = False
+
         while self._running:
+            now_m = time.monotonic()
+
+            # ---------- 1) Ciclo de vida da porta USB (100% não-bloqueante) ----------
             try:
                 if self._reconnect_flag.is_set():
                     self._reconnect_flag.clear()
-                    if ser is not None:
-                        try:
-                            ser.reset_input_buffer()
-                            ser.reset_output_buffer()
-                            ser.close()
-                        except Exception:
-                            pass
-                        ser = None
+                    _close_serial()
+                    next_port_scan = 0.0
                     self._update_status(connected=False, state="RECONNECTING", port="", tx_bytes_sec=0)
 
-                if ser is None:
+                if ser is None and now_m >= next_port_scan:
                     port = self.preferred_port or find_port()
                     if not port:
-                        self._update_status(connected=False, state="SEARCHING", port="", tx_bytes_sec=0)
-                        time.sleep(1.2)
-                        continue
+                        self._update_status(connected=False, state="SEARCHING", port="")
+                        next_port_scan = now_m + 1.5
+                    else:
+                        self._update_status(connected=False, state="CONNECTING", port=port)
+                        ser = serial.Serial(port=port, baudrate=self.baud, timeout=0.04, write_timeout=0.35)
+                        ser_settle_until = now_m + 1.5
+                        ser_ready = False
 
-                    self._update_status(connected=False, state="CONNECTING", port=port, tx_bytes_sec=0)
-                    ser = serial.Serial(
-                        port=port,
-                        baudrate=self.baud,
-                        timeout=0.04,
-                        write_timeout=0.35,
-                    )
-                    # Aguarda estabilização do bootloader ESP32 após abertura da porta DTR/RTS
-                    time.sleep(1.5)
+                if ser is not None and not ser_ready and now_m >= ser_settle_until:
                     ser.reset_input_buffer()
                     ser.reset_output_buffer()
-                    self._update_status(connected=True, state="CONNECTED", port=port, last_error="")
+                    ser_ready = True
+                    port_name = getattr(ser, "port", "") or ""
+                    self._update_status(connected=True, state="CONNECTED", port=port_name, last_error="")
                     if self.on_log:
-                        self.on_log(f"⚡ SerialManager conectado em {port} ({self.baud} bps • Non-Blocking I/O)")
+                        self.on_log(f"⚡ USB Serial conectada em {port_name} ({self.baud} bps • Non-Blocking I/O)")
                     if self.on_rx_line:
                         try:
                             self.on_rx_line("SERIAL_CONNECTED")
                         except Exception:
                             pass
+            except Exception as ex:
+                err_s = str(ex)[:60]
+                _close_serial()
+                next_port_scan = now_m + 1.5
+                self._update_status(connected=False, state="DISCONNECTED", port="", last_error=err_s)
 
-                # 1) Leitura não-bloqueante de respostas da CYD
-                self._read_available_lines(ser)
+            # ---------- 2) Heartbeat UDP + estado da rota Wi-Fi ----------
+            if self._udp_ready() and (now_m - self._udp_last_ping_t) >= UDP_PING_INTERVAL_S:
+                self._udp_last_ping_t = now_m
+                self._udp_ping_sent_t = now_m
+                self._udp_sendto({"cmd": "udp_ping"})
+            udp_alive = self.is_udp_alive()
+            if self._status.get("udp_alive") != udp_alive:
+                self._update_status(udp_alive=udp_alive)
 
-                # 2) Prioridade 1: Transferência de blocos para o Cartão SD
-                if not self.transfer_queue.empty():
-                    pkt = self.transfer_queue.get_nowait()
-                    bytes_window += self._write_json_line(ser, pkt)
+            route = self._resolve_route(ser_ready)
+            self._update_status(transport={"udp": "UDP", "serial": "USB"}.get(route, "NONE"))
+
+            # ---------- 3) Leitura + envio por prioridade ----------
+            try:
+                if ser_ready:
+                    self._read_available_lines(ser)
+
+                if route is None:
+                    time.sleep(0.05)
                     continue
 
-                # 3) Prioridade 2: Eventos imediatos de UI / Terminal / Alertas (< 20ms)
+                # Prioridade 1: Transferência de blocos para o Cartão SD (sincronizada por ACK)
+                if not self.transfer_queue.empty():
+                    pkt = self.transfer_queue.get_nowait()
+                    bytes_window += self._send_pkt(ser, route, pkt)
+                    continue
+
+                # Prioridade 2: Eventos imediatos de UI / Terminal / Alertas (< 20ms)
                 ev_sent = 0
                 while not self.event_queue.empty() and ev_sent < 3:
-                    ev_pkt = self.event_queue.get_nowait()
-                    bytes_window += self._write_json_line(ser, ev_pkt)
+                    item = self.event_queue.get_nowait()
+                    ev_route = route
+                    if isinstance(item, tuple):
+                        forced, item = item
+                        if forced == "serial":
+                            if not ser_ready:
+                                if self.on_log:
+                                    self.on_log("⚠️ Comando exige USB Serial conectada (descartado).")
+                                ev_sent += 1
+                                continue
+                            ev_route = "serial"
+                    bytes_window += self._send_pkt(ser, ev_route, item)
                     ev_sent += 1
 
-                # 4) Prioridade 3: Telemetria periódica (apenas o snapshot mais recente)
+                # Prioridade 3: Telemetria periódica (apenas o snapshot mais recente)
                 tele_pkt = None
                 with self._telemetry_lock:
                     if self._latest_telemetry is not None:
                         tele_pkt = self._latest_telemetry
                         self._latest_telemetry = None
                 if tele_pkt is not None:
-                    bytes_window += self._write_json_line(ser, tele_pkt)
+                    bytes_window += self._send_pkt(ser, route, tele_pkt)
 
                 # Atualiza taxa de transmissão (B/s) a cada 1.0s
-                now_m = time.monotonic()
                 if now_m - window_t0 >= 1.0:
                     bps = int(round(bytes_window / (now_m - window_t0)))
                     bytes_window = 0
@@ -1034,27 +1327,18 @@ class SerialManager:
                         self._status["tx_bytes_sec"] = bps
 
             except Exception as ex:
+                # Somente erros de I/O USB chegam aqui (envios UDP nunca lançam exceção)
                 err_s = str(ex)[:60]
-                self._update_status(connected=False, state="DISCONNECTED", port="", tx_bytes_sec=0, last_error=err_s)
+                self._update_status(connected=False, state="DISCONNECTED", port="", last_error=err_s)
                 if self.on_log:
                     self.on_log(f"⚠️ Porta USB desconectada ou ocupada ({err_s}). Reconectando em background...")
-                if ser is not None:
-                    try:
-                        ser.close()
-                    except Exception:
-                        pass
-                    ser = None
-                time.sleep(1.5)
+                _close_serial()
+                next_port_scan = time.monotonic() + 1.5
                 continue
 
             time.sleep(0.015)
 
-        if ser is not None:
-            try:
-                ser.reset_output_buffer()
-                ser.close()
-            except Exception:
-                pass
+        _close_serial()
 
 
 def get_local_lan_ip() -> str:
@@ -1430,6 +1714,11 @@ def load_ui_config():
         "media_source_pref": "auto",
         "media_auto_cover": True,
         "weather_city": "Votuporanga",
+        "udp_enabled": False,
+        "udp_ip": "",
+        "udp_port": UDP_DEFAULT_PORT,
+        "esp_wifi_ssid": "",
+        "esp_wifi_pass": "",
         "news_topics": list(DEFAULT_NEWS_TOPICS),
         "news_api_key": os.environ.get("NEWS_API_KEY", ""),
         "news_rotate_sec": 15,
@@ -3100,23 +3389,37 @@ GeminiGemsEngine = NewsFeedCollector
 class CyberDeckTerminalEngine:
     """
     Motor do Terminal Administrativo Cyber Deck (`SCR_TERMINAL` - Tela 11):
-      - Processa comandos locais no Python e envia o output enxuto linha a linha para a tela da CYD:
-        * `ping [alvo]`   : Dispara pings ICMP e transmite a latência em tempo real para a CYD.
-        * `fetch [url]`   : Faz um HTTP GET na URL/Repositório e informa Status (ex: 200 OK) e latência.
-        * `docker [cmd]`  : Executa subprocessos Docker locais (ex: `docker ps`, `docker stats --no-stream`).
-        * `ip` / `top`    : Utilitários administrativos rápidos de rede e processos do PC.
-      - Delega comandos nativos para o hardware ESP32 executar:
-        * `wifi scan`     : Envia `{"cmd": "wifi_scan"}` para o ESP32 rodar `WiFi.scanNetworks()` e listar SSID/RSSI.
-        * `esp info`      : Envia `{"cmd": "esp_info"}` para o ESP32 imprimir Heap livre, Clock e Uptime.
+      - Processa comandos locais no Python (Linux-like) e envia o output enxuto linha a linha para a tela da CYD:
+        * `whoami`        : Usuario logado e nome do host (ex: matheus@z1popc).
+        * `neofetch`      : Resumo grafico em arte ASCII compacta do hardware do PC (OS, CPU, RAM, GPU).
+        * `df` / `df -h`  : Particoes de disco, tamanho, usado e livre via psutil.
+        * `free` / `free -m`: Memoria RAM e Swap usada/livre em MB.
+        * `uptime`        : Tempo de atividade continua do sistema.
+        * `ip addr` / `ip`: Interfaces de rede ativas (LAN, Wi-Fi, Tailscale) e IPv4.
+        * `netstat -tuln` : Portas locais abertas em estado LISTEN e processos.
+        * `ssh u@h [cmd]` : Executa comandos rapidos em servidores Linux remotos (Homelab/VPS).
+        * `docker ps`     : Lista containers Docker ativos no PC.
+        * `docker stats`  : Consumo instantaneo de CPU/RAM por container.
+        * `docker logs`   : Exibe as ultimas linhas de log de um container.
+        * `ping [alvo]`   : Dispara pings ICMP e transmite latencia linha a linha.
+        * `fetch [url]`   : Executa HTTP GET e mede status e tempo de resposta.
+      - Delega comandos nativos para o firmware ESP32 executar:
+        * `wifi scan`     : Envia {"cmd": "wifi_scan"} para escanear redes Wi-Fi 2.4GHz.
+        * `esp info`      : Envia {"cmd": "esp_info"} para imprimir IP, RSSI, MAC e firmware.
+        * `esp mem`       : Envia {"cmd": "esp_mem"} para imprimir Heap livre, Min e PSRAM.
+        * `esp reboot`    : Envia {"cmd": "esp_reboot"} para reiniciar a placa CYD.
+        * `cmatrix`       : Envia {"cmd": "cmatrix"} para ativar o easter egg Matrix Rain.
+        * `clear`         : Envia {"cmd": "term_clear"} para limpar o terminal.
     """
 
-    def __init__(self, max_history: int = 120):
+    def __init__(self, max_history: int = 150, collector=None):
         self._lock = threading.Lock()
         self.max_history = max_history
+        self.collector = collector
         self._lines: list[str] = [
             "================================================",
-            " CYD CYBER DECK TERMINAL v4.0 [115200 bps READY]",
-            " Comandos: ping <alvo> | fetch <url> | docker <cmd> | wifi scan",
+            " CYD CYBER DECK TERMINAL v4.2 [115200 bps READY]",
+            " Digite 'help' para listar todos os comandos.",
             "================================================",
         ]
         self._cmd_history: list[str] = []
@@ -3141,14 +3444,14 @@ class CyberDeckTerminalEngine:
                 "text": "\n".join(self._lines),
                 "busy": self._busy,
                 "last_cmd": self._last_cmd,
-                "history": list(self._cmd_history[-15:]),
+                "history": list(self._cmd_history),
             }
 
     def clear(self, dispatch_fn=None):
         with self._lock:
             self._lines = [
-                "CYD CYBER DECK OS v4.0 - Terminal limpo.",
-                "Digite 'help' ou use os atalhos rapidos abaixo.",
+                "CYD CYBER DECK OS v4.2 - Terminal limpo.",
+                "Digite 'help' ou utilize os atalhos rapidos abaixo.",
             ]
             self._last_cmd = "clear"
         if dispatch_fn:
@@ -3161,7 +3464,10 @@ class CyberDeckTerminalEngine:
             return
 
         with self._lock:
-            self._cmd_history.append(cmd_str)
+            if not self._cmd_history or self._cmd_history[-1] != cmd_str:
+                self._cmd_history.append(cmd_str)
+                if len(self._cmd_history) > 60:
+                    self._cmd_history = self._cmd_history[-60:]
             self._last_cmd = cmd_str
 
         def _send_cyd_lines(lines_list: list[str], switch_scr: bool = False):
@@ -3170,7 +3476,7 @@ class CyberDeckTerminalEngine:
                 return
             for c_ln in clean_batch:
                 self.append_line(c_ln)
-            # Divide em pacotes enxutos de até 4 linhas para não saturar a Serial a 115200 bps
+            # Divide em pacotes enxutos de ate 4 linhas para nao saturar a Serial a 115200 bps
             for i in range(0, len(clean_batch), 4):
                 chunk = clean_batch[i : i + 4]
                 pkt = {
@@ -3190,11 +3496,12 @@ class CyberDeckTerminalEngine:
         arg_rest = cmd_str[len(parts[0]) :].strip()
 
         # 1) Comando Limpar Terminal
-        if verb in ("clear", "cls"):
+        if verb in ("clear", "cls", "reset"):
             self.clear(dispatch_fn)
             return
 
-        # 2) Comando Delegado ao ESP32: `wifi scan` (ou `wifi`)
+        # 2) Comandos Nativos Delegados ao ESP32
+        # a) Wi-Fi Scan
         if verb == "wifi" or cmd_str.lower().startswith("wifi scan") or cmd_str.lower() == "wifiscan":
             self.append_line(f"$ {cmd_str}")
             self.append_line("[PC->ESP32] Delegando 'wifi_scan' para execucao nativa na placa CYD...")
@@ -3204,35 +3511,328 @@ class CyberDeckTerminalEngine:
                 log_fn("💻 Terminal CYD: Trigger {'cmd': 'wifi_scan'} enviado ao ESP32!")
             return
 
-        # 3) Comando Delegado ao ESP32: `esp` / `esp_info` / `free`
-        if verb in ("esp", "esp_info", "espinfo", "free"):
+        # b) Easter egg: Matrix Rain (cmatrix)
+        if verb in ("cmatrix", "matrix"):
             self.append_line(f"$ {cmd_str}")
+            self.append_line("[PC->ESP32] Ativando Easter Egg Matrix Rain na SCR_TERMINAL...")
+            if dispatch_fn:
+                dispatch_fn({"cmd": "cmatrix"})
+            if log_fn:
+                log_fn("🟢 Terminal CYD: Easter egg Matrix Rain iniciado no ESP32!")
+            return
+
+        # c) ESP32 Memoria Heap (esp mem)
+        if cmd_str.lower() in ("esp mem", "espmem"):
+            self.append_line(f"$ {cmd_str}")
+            self.append_line("[PC->ESP32] Requisitando diagnostico de Heap RAM para a placa CYD...")
+            if dispatch_fn:
+                dispatch_fn({"cmd": "esp_mem"})
+            return
+
+        # d) ESP32 Reboot (esp reboot)
+        if cmd_str.lower() in ("esp reboot", "espreboot") or (verb == "reboot" and ("esp" in cmd_str.lower() or len(parts) == 1)):
+            self.append_line(f"$ {cmd_str}")
+            self.append_line("[PC->ESP32] Enviando sinal de REBOOT remoto para o hardware ESP32...")
+            if dispatch_fn:
+                dispatch_fn({"cmd": "esp_reboot"})
+            if log_fn:
+                log_fn("⚠️ Terminal CYD: Reboot remoto enviado a placa CYD!")
+            return
+
+        # e) ESP32 Info (esp info / esp_info)
+        if cmd_str.lower() in ("esp info", "esp_info", "espinfo", "esp"):
+            self.append_line(f"$ {cmd_str}")
+            self.append_line("[PC->ESP32] Consultando telemetria de hardware interna do ESP32...")
             if dispatch_fn:
                 dispatch_fn({"cmd": "esp_info"})
             return
 
-        # 4) Comandos Processados no Agente Python em Thread Assíncrona
+        # 3) Comandos Processados no Agente Python em Thread Assincrona
         def _runner():
             with self._lock:
                 self._busy = True
             try:
                 _send_cyd_lines([f"$ {cmd_str}"], switch_scr=auto_switch_screen)
 
-                if verb == "help":
+                # ================================== HELP ==================================
+                if verb in ("help", "?", "man"):
                     _send_cyd_lines([
-                        "Comandos disponiveis no CYD Cyber Deck:",
-                        "  ping <alvo>   : Testa latencia ICMP (ex: ping 8.8.8.8)",
-                        "  fetch <url>   : HTTP GET status/tempo (ex: fetch github.com)",
-                        "  docker <cmd>  : Executa Docker CLI (ex: docker ps)",
-                        "  wifi scan     : Escaneia redes Wi-Fi 2.4GHz no ESP32",
-                        "  esp info      : Exibe Heap livre e Uptime do ESP32",
-                        "  ip / top      : Rede local e Top Processos do PC",
-                        "  clear         : Limpa a tela do terminal",
+                        "=== GUIA DE COMANDOS CYD CYBER DECK v4.2 ===",
+                        "[SISTEMA PC & HOMELAB]:",
+                        "  whoami        : Usuario e nome da maquina",
+                        "  neofetch      : Banner de hardware compacto",
+                        "  df -h         : Discos e espaco livre",
+                        "  free -m       : RAM e Swap usados/livres",
+                        "  uptime        : Tempo ligado do sistema",
+                        "[REDE & INFRAESTRUTURA]:",
+                        "  ip addr       : IPs e interfaces de rede ativas",
+                        "  netstat -tuln : Portas abertas e servicos",
+                        "  ping <alvo>   : Latencia ICMP (ex: 8.8.8.8)",
+                        "  fetch <url>   : HTTP GET status (ex: github.com)",
+                        "  ssh u@h <cmd> : Executa comando remoto SSH",
+                        "[DOCKER]:",
+                        "  docker ps     : Lista containers ativos",
+                        "  docker stats  : CPU e RAM dos containers",
+                        "  docker logs <c>: Ultimas linhas de log",
+                        "[HARDWARE ESP32]:",
+                        "  esp info      : IP, RSSI, MAC e firmware CYD",
+                        "  esp mem       : Heap e diagnostico de memoria",
+                        "  esp reboot    : Reinicia o ESP32 remotamente",
+                        "  wifi scan     : Escaneia redes Wi-Fi 2.4GHz",
+                        "  cmatrix       : Easter egg Matrix Rain",
+                        "  clear         : Limpa o terminal",
                     ])
 
+                # ================================== WHOAMI ================================
+                elif verb == "whoami":
+                    user = getpass.getuser()
+                    host = socket.gethostname()
+                    lan = get_local_lan_ip()
+                    _send_cyd_lines([
+                        f"[WHOAMI] {user}@{host}",
+                        f"OS: {platform.system()} {platform.release()} ({platform.machine()})",
+                        f"LAN IP: {lan} | PID: {os.getpid()}",
+                    ])
+
+                # ================================== NEOFETCH ==============================
+                elif verb == "neofetch":
+                    user = getpass.getuser()
+                    host = socket.gethostname()
+                    os_str = f"{platform.system()} {platform.release()}"
+                    # Uptime
+                    boot_t = psutil.boot_time()
+                    up_s = int(time.time() - boot_t)
+                    up_d, rem = divmod(up_s, 86400)
+                    up_h, rem = divmod(rem, 3600)
+                    up_m, _ = divmod(rem, 60)
+                    up_str = f"{up_d}d {up_h}h {up_m}m" if up_d > 0 else f"{up_h}h {up_m}m"
+                    # CPU
+                    cpu_name = platform.processor() or "CPU"
+                    if IS_WINDOWS:
+                        try:
+                            import winreg
+                            k = winreg.OpenKey(winreg.HKEY_LOCAL_MACHINE, r"HARDWARE\DESCRIPTION\System\CentralProcessor\0")
+                            cpu_name, _ = winreg.QueryValueEx(k, "ProcessorNameString")
+                            winreg.CloseKey(k)
+                        except Exception:
+                            pass
+                    cpu_short = re.sub(r"(?i)\s*(Processor|8-Core|16-Thread|with Radeon Graphics|Six-Core|Eight-Core).*", "", cpu_name).strip()[:24]
+                    if not cpu_short:
+                        cpu_short = "x86_64 CPU"
+                    # RAM
+                    vm = psutil.virtual_memory()
+                    ram_used_gb = vm.used / (1024 ** 3)
+                    ram_tot_gb = vm.total / (1024 ** 3)
+                    # GPU
+                    gpu_short = "N/A"
+                    if self.collector and getattr(self.collector, "last_gpu_name", None):
+                        gpu_short = self.collector.last_gpu_name[:22]
+                    elif IS_WINDOWS:
+                        try:
+                            w_res = subprocess.run(
+                                ["wmic", "path", "win32_VideoController", "get", "name"],
+                                capture_output=True, text=True, timeout=1.5,
+                                creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+                            )
+                            g_lines = [ln.strip() for ln in w_res.stdout.splitlines() if ln.strip() and "name" not in ln.lower()]
+                            if g_lines:
+                                gpu_short = g_lines[0][:22]
+                        except Exception:
+                            gpu_short = "GPU Integrada / Dedicada"
+
+                    _send_cyd_lines([
+                        f"  /\\_/\\     {user}@{host}",
+                        f" ( o.o )    OS: {os_str[:22]}",
+                        f"  > ^ <     Host: {host[:18]}",
+                        f" CYBERDECK  Uptime: {up_str}",
+                        f" v4.2 ESP   CPU: {cpu_short}",
+                        f" [===>  ]   RAM: {ram_used_gb:.1f}G/{ram_tot_gb:.1f}G ({vm.percent:.0f}%)",
+                        f"            GPU: {gpu_short}",
+                    ])
+
+                # ================================== DF -H =================================
+                elif verb == "df" or cmd_str.lower().startswith("df"):
+                    lines_df = ["Filesystem      Size   Used  Avail  Use%"]
+                    parts_found = 0
+                    for p in psutil.disk_partitions(all=False):
+                        try:
+                            usage = psutil.disk_usage(p.mountpoint)
+                            tot_g = usage.total / (1024 ** 3)
+                            used_g = usage.used / (1024 ** 3)
+                            free_g = usage.free / (1024 ** 3)
+                            dev = (p.device or p.mountpoint)[:13]
+                            lines_df.append(f"{dev:<15} {tot_g:>5.0f}G {used_g:>5.0f}G {free_g:>5.0f}G {usage.percent:>4.0f}%")
+                            parts_found += 1
+                            if parts_found >= 6:
+                                break
+                        except Exception:
+                            pass
+                    if len(lines_df) == 1:
+                        lines_df.append("Nenhuma particao de disco acessivel.")
+                    _send_cyd_lines(lines_df)
+
+                # ================================== FREE -M ===============================
+                elif verb == "free" or cmd_str.lower().startswith("free"):
+                    vm = psutil.virtual_memory()
+                    sw = psutil.swap_memory()
+                    vm_tot = vm.total // (1024 * 1024)
+                    vm_used = vm.used // (1024 * 1024)
+                    vm_free = vm.available // (1024 * 1024)
+                    sw_tot = sw.total // (1024 * 1024)
+                    sw_used = sw.used // (1024 * 1024)
+                    sw_free = sw.free // (1024 * 1024)
+                    _send_cyd_lines([
+                        "          total(MB)  used(MB)  free(MB)   %use",
+                        f"Mem:     {vm_tot:>9} {vm_used:>9} {vm_free:>9}  {vm.percent:>4.1f}%",
+                        f"Swap:    {sw_tot:>9} {sw_used:>9} {sw_free:>9}  {sw.percent:>4.1f}%",
+                    ])
+
+                # ================================== UPTIME ================================
+                elif verb == "uptime":
+                    boot_t = psutil.boot_time()
+                    up_s = int(time.time() - boot_t)
+                    up_d, rem = divmod(up_s, 86400)
+                    up_h, rem = divmod(rem, 3600)
+                    up_m, up_sec = divmod(rem, 60)
+                    dt_boot = datetime.fromtimestamp(boot_t).strftime("%Y-%m-%d %H:%M:%S")
+                    d_txt = f"{up_d}d " if up_d else ""
+                    _send_cyd_lines([
+                        f"[UPTIME] {d_txt}{up_h:02d}:{up_m:02d}:{up_sec:02d}",
+                        f"Boot: {dt_boot}",
+                        f"Carga: CPU {psutil.cpu_percent():.0f}% | RAM {psutil.virtual_memory().percent:.0f}%",
+                    ])
+
+                # ================================== IP / IFCONFIG =========================
+                elif verb in ("ip", "ifconfig", "ipconfig") or cmd_str.lower().startswith("ip addr"):
+                    lines_ip = ["[NET] Interfaces de Rede Ativas:"]
+                    try:
+                        addrs = psutil.net_if_addrs()
+                        stats = psutil.net_if_stats()
+                        for if_name, if_addrs in addrs.items():
+                            st = stats.get(if_name)
+                            if st and not st.isup:
+                                continue
+                            for a in if_addrs:
+                                if a.family == socket.AF_INET:
+                                    ip_val = a.address
+                                    if ip_val.startswith("127."):
+                                        continue
+                                    alias = if_name[:16]
+                                    lines_ip.append(f"  * {alias}: {ip_val}")
+                    except Exception as e_ip:
+                        lines_ip.append(f"  [ERR] {str(e_ip)[:30]}")
+                    if len(lines_ip) == 1:
+                        lines_ip.append(f"  * IPv4 LAN: {get_local_lan_ip()}")
+                    lines_ip.append(f"Host: {socket.gethostname()}")
+                    _send_cyd_lines(lines_ip[:8])
+
+                # ================================== NETSTAT ===============================
+                elif verb in ("netstat", "ports") or cmd_str.lower().startswith("netstat"):
+                    lines_ns = ["[NETSTAT] Portas Abertas em Escuta (LISTEN):"]
+                    try:
+                        conns = psutil.net_connections(kind="inet")
+                        seen_ports = set()
+                        for c in conns:
+                            if c.status == "LISTEN" and c.laddr:
+                                port = c.laddr.port
+                                if port in seen_ports:
+                                    continue
+                                seen_ports.add(port)
+                                pname = "sys"
+                                if c.pid:
+                                    try:
+                                        pname = psutil.Process(c.pid).name()[:14]
+                                    except Exception:
+                                        pass
+                                lines_ns.append(f"  :{port:<5} | PID {c.pid or 0:<5} ({pname})")
+                                if len(lines_ns) >= 7:
+                                    break
+                    except Exception as ex:
+                        lines_ns.append(f"  [Aviso] Requer admin: {str(ex)[:28]}")
+                    if len(lines_ns) == 1:
+                        lines_ns.append("  Nenhuma porta TCP/UDP em LISTEN identificada.")
+                    _send_cyd_lines(lines_ns)
+
+                # ================================== SSH (Homelab/VPS) =====================
+                elif verb == "ssh":
+                    ssh_args = parts[1:]
+                    if not ssh_args:
+                        _send_cyd_lines([
+                            "[SSH] Uso: ssh <user>@<host> [comando]",
+                            "Ex: ssh root@192.168.1.100 df -h",
+                            "Ex: ssh user@vps docker ps",
+                        ])
+                    else:
+                        target_spec = ssh_args[0]
+                        remote_cmd = " ".join(ssh_args[1:]).strip() or "uname -a"
+                        user = None
+                        host = target_spec
+                        port = 22
+                        if "@" in target_spec:
+                            user, host = target_spec.split("@", 1)
+                        if ":" in host:
+                            host, port_str = host.split(":", 1)
+                            try:
+                                port = int(port_str)
+                            except Exception:
+                                pass
+                        _send_cyd_lines([f"[SSH] {user or 'auto'}@{host}:{port} -> '{remote_cmd[:24]}'"])
+
+                        ran_ok = False
+                        if paramiko is not None:
+                            try:
+                                client = paramiko.SSHClient()
+                                client.set_missing_host_key_policy(paramiko.AutoAddPolicy())
+                                client.connect(
+                                    hostname=host,
+                                    port=port,
+                                    username=user,
+                                    timeout=6.0,
+                                    look_for_keys=True,
+                                    allow_agent=True,
+                                )
+                                stdin, stdout, stderr = client.exec_command(remote_cmd, timeout=8.0)
+                                out_s = stdout.read().decode("utf-8", errors="ignore")
+                                err_s = stderr.read().decode("utf-8", errors="ignore")
+                                client.close()
+                                out_lines = [ln.strip() for ln in (out_s + "\n" + err_s).splitlines() if ln.strip()]
+                                if out_lines:
+                                    _send_cyd_lines(out_lines[:8])
+                                else:
+                                    _send_cyd_lines(["[SSH OK] Comando executado sem retorno."])
+                                ran_ok = True
+                            except Exception:
+                                pass
+
+                        if not ran_ok:
+                            try:
+                                creation_flags = getattr(subprocess, "CREATE_NO_WINDOW", 0) if IS_WINDOWS else 0
+                                sub_cmd = ["ssh", "-o", "BatchMode=yes", "-o", "ConnectTimeout=5", "-p", str(port), f"{user + '@' if user else ''}{host}", remote_cmd]
+                                res = subprocess.run(
+                                    sub_cmd,
+                                    capture_output=True,
+                                    text=True,
+                                    timeout=9.0,
+                                    encoding="utf-8",
+                                    errors="ignore",
+                                    creationflags=creation_flags,
+                                )
+                                out_txt = (res.stdout or "") + ("\n" + res.stderr if res.stderr else "")
+                                out_lines = [ln.strip() for ln in out_txt.splitlines() if ln.strip()]
+                                if out_lines:
+                                    _send_cyd_lines(out_lines[:8])
+                                else:
+                                    _send_cyd_lines([f"[SSH Code {res.returncode}] Concluido."])
+                            except FileNotFoundError:
+                                _send_cyd_lines(["[SSH ERR] Cliente SSH / OpenSSH nao encontrado no PC."])
+                            except subprocess.TimeoutExpired:
+                                _send_cyd_lines(["[SSH ERR] Timeout (9s) aguardando resposta remota."])
+                            except Exception as ex_sub:
+                                _send_cyd_lines([f"[SSH ERR] {str(ex_sub)[:36]}"])
+
+                # ================================== PING ==================================
                 elif verb == "ping":
                     target = arg_rest or "8.8.8.8"
-                    # Sanitiza alvo para segurança
                     target = re.sub(r"[^a-zA-Z0-9.\-:]", "", target) or "8.8.8.8"
                     _send_cyd_lines([f"[PING] Disparando 4 pacotes para {target}..."])
                     ping_cmd = ["ping", "-n", "4", "-w", "2000", target] if IS_WINDOWS else ["ping", "-c", "4", "-W", "2", target]
@@ -3252,7 +3852,6 @@ class CyberDeckTerminalEngine:
                         line_s = raw_line.strip()
                         if not line_s:
                             continue
-                        # Extrai tempo=XXms / time=XXms
                         m_time = re.search(r"(?:tempo|time)[=<]\s*([\d.]+)\s*ms", line_s, re.IGNORECASE)
                         m_ttl = re.search(r"TTL=(\d+)", line_s, re.IGNORECASE)
                         if m_time:
@@ -3273,6 +3872,7 @@ class CyberDeckTerminalEngine:
                     else:
                         _send_cyd_lines([f"[ERR] {target}: Sem resposta ICMP (100% perda)"])
 
+                # ================================== FETCH =================================
                 elif verb in ("fetch", "curl", "http"):
                     url = arg_rest or "https://api.github.com"
                     if not url.startswith("http://") and not url.startswith("https://"):
@@ -3283,7 +3883,7 @@ class CyberDeckTerminalEngine:
                         req = urllib.request.Request(
                             url,
                             headers={
-                                "User-Agent": "CYD-CyberDeck-Terminal/4.0",
+                                "User-Agent": "CYD-CyberDeck-Terminal/4.2",
                                 "Accept": "*/*",
                             },
                         )
@@ -3297,7 +3897,6 @@ class CyberDeckTerminalEngine:
                                 f"[OK] ONLINE - Status {code} OK ({elapsed_ms:.0f} ms)",
                                 f"Srv: {srv} | Tipo: {ctype}",
                             ])
-                            # Tenta extrair <title> ou chave JSON de resumo
                             m_tit = re.search(r"<title[^>]*>(.*?)</title>", body_sample, re.IGNORECASE | re.DOTALL)
                             if m_tit:
                                 clean_t = re.sub(r"\s+", " ", m_tit.group(1)).strip()[:44]
@@ -3309,9 +3908,15 @@ class CyberDeckTerminalEngine:
                     except Exception as ex:
                         _send_cyd_lines([f"[ERR] OFFLINE / Falha ao conectar: {str(ex)[:40]}"])
 
+                # ================================== DOCKER ================================
                 elif verb == "docker":
-                    sub_args = parts[1:] if len(parts) > 1 else ["ps", "--format", "table {{.Names}}\t{{.Status}}"]
-                    _send_cyd_lines([f"[DOCKER] Executando: docker {' '.join(sub_args)[:30]}..."])
+                    sub_args = parts[1:]
+                    if not sub_args or sub_args[0] == "ps":
+                        sub_args = ["ps", "--format", "table {{.Names}}\t{{.Status}}\t{{.Ports}}"]
+                    elif sub_args[0] == "stats":
+                        sub_args = ["stats", "--no-stream", "--format", "table {{.Name}}\t{{.CPUPerc}}\t{{.MemUsage}}"]
+
+                    _send_cyd_lines([f"[DOCKER] docker {' '.join(sub_args)[:32]}..."])
                     creation_flags = getattr(subprocess, "CREATE_NO_WINDOW", 0) if IS_WINDOWS else 0
                     try:
                         res = subprocess.run(
@@ -3340,15 +3945,8 @@ class CyberDeckTerminalEngine:
                     except Exception as ex:
                         _send_cyd_lines([f"[ERR] Falha ao executar docker: {str(ex)[:38]}"])
 
-                elif verb in ("ip", "ipconfig", "ifconfig", "net"):
-                    lan = get_local_lan_ip()
-                    host = socket.gethostname()
-                    _send_cyd_lines([
-                        f"[NET] Host: {host}",
-                        f"[NET] IPv4 LAN: {lan} [ONLINE]",
-                    ])
-
-                elif verb in ("top", "ps", "procs"):
+                # ================================== TOP ===================================
+                elif verb in ("top", "procs"):
                     procs = []
                     for p in psutil.process_iter(["name", "cpu_percent", "memory_percent"]):
                         try:
@@ -3366,7 +3964,7 @@ class CyberDeckTerminalEngine:
                 else:
                     _send_cyd_lines([
                         f"[ERR] Comando desconhecido: '{verb}'",
-                        "Use: ping <alvo>, fetch <url>, docker <cmd>, wifi scan",
+                        "Digite 'help' para ver os comandos disponiveis.",
                     ])
 
                 if log_fn:
@@ -3392,7 +3990,9 @@ def launch_flet_gui(
     import flet as ft
 
     if term_eng is None:
-        term_eng = CyberDeckTerminalEngine()
+        term_eng = CyberDeckTerminalEngine(collector=col)
+    elif term_eng.collector is None:
+        term_eng.collector = col
 
     # Helpers compativeis entre Flet 0.2x e Flet 1.0+
     _ICONS = getattr(ft, "Icons", getattr(ft, "icons", None))
@@ -3434,7 +4034,7 @@ def launch_flet_gui(
         return ft.Dropdown(**kw)
 
     def build_app(page: ft.Page):
-        page.title = "CYD Cyber Deck v4.0 — Terminal Administrativo, News Feed, Clima & Telemetria"
+        page.title = "CYD Cyber Deck v4.2 — Terminal Administrativo, News Feed, Clima & Telemetria"
         page.bgcolor = "#07090E"
         page.padding = 14
         page.scroll = None  # Viewport fixo com abas independentes (zero poluicao visual!)
@@ -3468,6 +4068,11 @@ def launch_flet_gui(
             "weather_city": str(cfg.get("weather_city", "Votuporanga")),
             "news_topics": list(cfg.get("news_topics", DEFAULT_NEWS_TOPICS)),
             "news_api_key": str(cfg.get("news_api_key", os.environ.get("NEWS_API_KEY", ""))),
+            "udp_enabled": bool(cfg.get("udp_enabled", False)),
+            "udp_ip": str(cfg.get("udp_ip", "") or ""),
+            "udp_port": int(cfg.get("udp_port", UDP_DEFAULT_PORT) or UDP_DEFAULT_PORT),
+            "esp_wifi_ssid": str(cfg.get("esp_wifi_ssid", "") or ""),
+            "esp_wifi_pass": str(cfg.get("esp_wifi_pass", "") or ""),
             "term_auto_switch": True,
             "synced_cover_id": "",
             "sd_missing_warned": False,
@@ -3622,7 +4227,13 @@ def launch_flet_gui(
         except Exception:
             tray_icon = None
 
-        serial_mgr = SerialManager(preferred_port=cli_args.port, baud=BAUD)
+        serial_mgr = SerialManager(
+            preferred_port=cli_args.port,
+            baud=BAUD,
+            udp_enabled=bool(cfg.get("udp_enabled", False)),
+            udp_ip=str(cfg.get("udp_ip", "") or ""),
+            udp_port=int(cfg.get("udp_port", UDP_DEFAULT_PORT) or UDP_DEFAULT_PORT),
+        )
         ui_event_queue = serial_mgr.event_queue
         transfer_queue = serial_mgr.transfer_queue
         ack_event = serial_mgr.ack_event
@@ -3674,8 +4285,18 @@ def launch_flet_gui(
                 "weather_city": state["weather_city"],
                 "news_topics": state["news_topics"],
                 "news_api_key": state["news_api_key"],
+                "udp_enabled": state.get("udp_enabled", False),
+                "udp_ip": state.get("udp_ip", ""),
+                "udp_port": state.get("udp_port", UDP_DEFAULT_PORT),
+                "esp_wifi_ssid": state.get("esp_wifi_ssid", ""),
+                "esp_wifi_pass": state.get("esp_wifi_pass", ""),
             })
             save_ui_config(cfg)
+            serial_mgr.configure_udp(
+                enabled=state.get("udp_enabled", False),
+                ip=state.get("udp_ip", ""),
+                port=state.get("udp_port", UDP_DEFAULT_PORT),
+            )
             mkt_col.set_custom_tickers([p.get("ticker", "") for p in state["portfolio"]])
             portf_pkt, _ = mkt_col.compute_portfolio(state["portfolio"], state["portfolio_pnl_mode"])
             state["ui_dirty"] = True
@@ -6309,7 +6930,7 @@ def launch_flet_gui(
             expand=True,
         )
         txt_term_input = ft.TextField(
-            hint_text="Digite um comando (ex: ping 8.8.8.8, fetch https://api.github.com, docker ps, wifi scan)...",
+            hint_text="Digite um comando (ex: neofetch, df -h, free -m, ip addr, netstat -tuln, esp mem, cmatrix, ping)...",
             value="",
             expand=True,
             height=44,
@@ -6331,6 +6952,8 @@ def launch_flet_gui(
             on_change=lambda e: state.update({"term_auto_switch": bool(e.control.value)}),
         )
 
+        term_history_idx = -1
+
         def refresh_terminal_ui():
             snap_t = term_eng.get_snapshot()
             txt_term_screen.value = snap_t["text"]
@@ -6342,11 +6965,48 @@ def launch_flet_gui(
                 lbl_term_status_badge.color = "#22C55E"
             if state.get("active_tab") == 4:
                 safe_update(txt_term_screen, lbl_term_status_badge, txt_term_input)
+                try:
+                    term_scroll_col.scroll_to(offset=-1, duration=50)
+                except Exception:
+                    pass
+
+        def on_term_keyboard_event(e: ft.KeyboardEvent):
+            nonlocal term_history_idx
+            if state.get("active_tab") != 4:
+                return
+            key_name = (e.key or "").strip()
+            snap_t = term_eng.get_snapshot()
+            hist = snap_t.get("history", [])
+            if not hist:
+                return
+
+            if key_name in ("Arrow Up", "Up", "ArrowUp"):
+                if term_history_idx == -1:
+                    term_history_idx = len(hist) - 1
+                else:
+                    term_history_idx = max(0, term_history_idx - 1)
+                txt_term_input.value = hist[term_history_idx]
+                safe_update(txt_term_input)
+
+            elif key_name in ("Arrow Down", "Down", "ArrowDown"):
+                if term_history_idx == -1:
+                    return
+                if term_history_idx + 1 < len(hist):
+                    term_history_idx += 1
+                    txt_term_input.value = hist[term_history_idx]
+                else:
+                    term_history_idx = -1
+                    txt_term_input.value = ""
+                safe_update(txt_term_input)
+
+        page.on_keyboard_event = on_term_keyboard_event
 
         def run_terminal_command(cmd_raw: str = None):
+            nonlocal term_history_idx
             cmd_to_run = (cmd_raw if cmd_raw is not None else (txt_term_input.value or "")).strip()
             if not cmd_to_run:
                 return
+            term_history_idx = -1
             if cmd_raw is None:
                 txt_term_input.value = ""
 
@@ -6396,7 +7056,7 @@ def launch_flet_gui(
                                         font_family="Consolas",
                                     ),
                                     ft.Text(
-                                        "Execute diagnósticos de rede (ping, fetch), containers (docker) no PC ou delegue Wi-Fi Scan nativo para o ESP32:",
+                                        "Execute comandos Unix-like (neofetch, df, free, uptime, ip, netstat, ssh, docker) e comandos nativos no ESP32:",
                                         size=11,
                                         color="#94A3B8",
                                     ),
@@ -6415,14 +7075,23 @@ def launch_flet_gui(
                     ),
                     ft.Row(
                         [
-                            make_cmd_chip("📡 wifi scan (ESP32 Nativo)", "wifi scan", "#38BDF8"),
+                            make_cmd_chip("📡 wifi scan", "wifi scan", "#38BDF8"),
+                            make_cmd_chip("ℹ️ esp info", "esp info", "#38BDF8"),
+                            make_cmd_chip("🧠 esp mem", "esp mem", "#38BDF8"),
+                            make_cmd_chip("🔄 esp reboot", "esp reboot", "#F87171"),
+                            make_cmd_chip("🟢 cmatrix (Rain)", "cmatrix", "#4ADE80"),
+                            make_cmd_chip("🖥️ neofetch", "neofetch", "#C084FC"),
+                            make_cmd_chip("💾 df -h", "df -h", "#60A5FA"),
+                            make_cmd_chip("📊 free -m", "free -m", "#34D399"),
+                            make_cmd_chip("⏱️ uptime", "uptime", "#FBBF24"),
+                            make_cmd_chip("👤 whoami", "whoami", "#F472B6"),
+                            make_cmd_chip("🌐 ip addr", "ip addr", "#38BDF8"),
+                            make_cmd_chip("🔌 netstat -tuln", "netstat -tuln", "#F59E0B"),
                             make_cmd_chip("⚡ ping 8.8.8.8", "ping 8.8.8.8", "#22C55E"),
-                            make_cmd_chip("⚡ ping 1.1.1.1", "ping 1.1.1.1", "#22C55E"),
-                            make_cmd_chip("🌐 fetch https://api.github.com", "fetch https://api.github.com", "#A855F7"),
+                            make_cmd_chip("🌐 fetch github", "fetch https://api.github.com", "#A855F7"),
                             make_cmd_chip("🐳 docker ps", "docker ps", "#F59E0B"),
-                            make_cmd_chip("🧠 esp info", "esp info", "#38BDF8"),
-                            make_cmd_chip("📊 top (Processos PC)", "top", "#22C55E"),
-                            make_cmd_chip("🖧 ip (Rede LAN)", "ip", "#22C55E"),
+                            make_cmd_chip("🐳 docker stats", "docker stats", "#FB923C"),
+                            make_cmd_chip("❓ help", "help", "#22C55E"),
                             make_cmd_chip("🧹 clear", "clear", "#EF4444"),
                         ],
                         wrap=True,
@@ -6435,7 +7104,7 @@ def launch_flet_gui(
                         border=border_all(1.5, "#15803D"),
                         border_radius=10,
                         padding=12,
-                        height=285,
+                        height=300,
                         width=float("inf"),
                     ),
                     ft.Row(
@@ -6504,6 +7173,195 @@ def launch_flet_gui(
             rebuild_news_topics_and_queue_ui(ns)
 
         refresh_weather_gems_ui()
+
+        # ---------------- 12. TELEMETRIA WI-FI (UDP) & COMUNICAÇÃO SEM FIO ----
+        sw_udp_enabled = ft.Switch(
+            label="Ativar Transmissão de Telemetria via Wi-Fi (Protocolo UDP)",
+            value=state.get("udp_enabled", False),
+            active_color="#38BDF8",
+        )
+        txt_udp_ip = ft.TextField(
+            label="IP da Placa CYD na Rede Local",
+            value=state.get("udp_ip", ""),
+            hint_text="ex: 192.168.0.150",
+            width=260,
+            text_size=13,
+            color="#38BDF8",
+            bgcolor="#05070B",
+            border_color="#1E293B",
+            focused_border_color="#38BDF8",
+            text_style=ft.TextStyle(font_family="Consolas", weight=ft.FontWeight.BOLD),
+        )
+        txt_udp_port = ft.TextField(
+            label="Porta UDP",
+            value=str(state.get("udp_port", UDP_DEFAULT_PORT)),
+            hint_text="8888",
+            width=110,
+            text_size=13,
+            color="#38BDF8",
+            bgcolor="#05070B",
+            border_color="#1E293B",
+            focused_border_color="#38BDF8",
+            text_style=ft.TextStyle(font_family="Consolas"),
+        )
+        lbl_udp_route_badge = ft.Text(
+            "🔌 ROTA ATIVA: USB SERIAL",
+            size=11,
+            weight=ft.FontWeight.BOLD,
+            color="#22C55E",
+            font_family="Consolas",
+        )
+        lbl_udp_diag = ft.Text(
+            "UDP: Standby (Sem IP ativo) • Porta 8888",
+            size=10,
+            color="#64748B",
+            font_family="Consolas",
+        )
+
+        def on_save_udp_settings(_e=None):
+            new_en = bool(sw_udp_enabled.value)
+            new_ip = (txt_udp_ip.value or "").strip()
+            try:
+                new_port = int(txt_udp_port.value or UDP_DEFAULT_PORT)
+            except Exception:
+                new_port = UDP_DEFAULT_PORT
+            state["udp_enabled"] = new_en
+            state["udp_ip"] = new_ip
+            state["udp_port"] = new_port
+            persist_and_queue_ui()
+            refresh_serial_indicators()
+            append_log(f"Configuração Wi-Fi UDP salva: Ativo={new_en} • Destino={new_ip}:{new_port}")
+
+        sw_udp_enabled.on_change = on_save_udp_settings
+        txt_udp_ip.on_submit = on_save_udp_settings
+        txt_udp_port.on_submit = on_save_udp_settings
+
+        def on_detect_ip(_e):
+            det = (serial_mgr.detected_ip or "").strip()
+            if det:
+                txt_udp_ip.value = det
+                state["udp_ip"] = det
+                persist_and_queue_ui()
+                safe_update(txt_udp_ip)
+                append_log(f"IP detectado da CYD aplicado: {det}")
+            else:
+                append_log("Nenhum IP detectado ainda. Conecte a CYD via USB ou digite o IP manualmente.")
+
+        def on_test_udp_ping(_e):
+            target_ip = (txt_udp_ip.value or state.get("udp_ip", "")).strip()
+            if not target_ip:
+                append_log("⚠️ Digite o IP da placa CYD antes de disparar o Ping UDP.")
+                return
+            serial_mgr.send_event({"cmd": "udp_ping"})
+            append_log(f"📡 Heartbeat 'udp_ping' disparado para {target_ip}:{state.get('udp_port', UDP_DEFAULT_PORT)}...")
+
+        txt_esp_ssid = ft.TextField(
+            label="Nome da Rede Wi-Fi (SSID)",
+            value=state.get("esp_wifi_ssid", ""),
+            hint_text="ex: MinhaCasa_2.4G",
+            width=220,
+            text_size=12,
+            color="#FFFFFF",
+            bgcolor="#05070B",
+            border_color="#1E293B",
+            focused_border_color="#38BDF8",
+        )
+        txt_esp_pass = ft.TextField(
+            label="Senha da Rede Wi-Fi",
+            value=state.get("esp_wifi_pass", ""),
+            hint_text="********",
+            password=True,
+            can_reveal_password=True,
+            width=200,
+            text_size=12,
+            color="#FFFFFF",
+            bgcolor="#05070B",
+            border_color="#1E293B",
+            focused_border_color="#38BDF8",
+        )
+
+        def on_send_wifi_cfg_to_esp(_e):
+            ssid_v = (txt_esp_ssid.value or "").strip()
+            pass_v = (txt_esp_pass.value or "").strip()
+            if not ssid_v:
+                append_log("⚠️ Digite o nome da rede (SSID) antes de enviar para a CYD.")
+                return
+            state["esp_wifi_ssid"] = ssid_v
+            state["esp_wifi_pass"] = pass_v
+            cfg["esp_wifi_ssid"] = ssid_v
+            cfg["esp_wifi_pass"] = pass_v
+            save_ui_config(cfg)
+            serial_mgr.send_event({"wifi_cfg": {"ssid": ssid_v, "pass": pass_v}}, route="serial")
+            append_log(f"📡 Credenciais Wi-Fi enviadas para gravação no NVS da CYD: SSID '{ssid_v}'")
+
+        sec_wifi_udp = ft.Container(
+            content=ft.Column(
+                [
+                    ft.Row(
+                        [
+                            ft.Row(
+                                [
+                                    ft.Icon(icon_val("WIFI") or ft.Icons.WIFI, size=20, color="#38BDF8"),
+                                    ft.Text("MÓDULO DE TRANSMISSÃO WI-FI (UDP) & COMUNICAÇÃO SEM FIO", size=13, weight=ft.FontWeight.BOLD, color="#38BDF8"),
+                                ],
+                                spacing=8,
+                            ),
+                            lbl_udp_route_badge,
+                        ],
+                        alignment=ft.MainAxisAlignment.SPACE_BETWEEN,
+                    ),
+                    ft.Text(
+                        "Transmita telemetria, notícias e comandos do terminal sem fios via UDP (Porta 8888). "
+                        "A porta USB Serial permanece ativa simultaneamente como canal de fallback e debug:",
+                        size=11,
+                        color="#94A3B8",
+                    ),
+                    ft.Row(
+                        [
+                            sw_udp_enabled,
+                            lbl_udp_diag,
+                        ],
+                        alignment=ft.MainAxisAlignment.SPACE_BETWEEN,
+                        vertical_alignment=ft.CrossAxisAlignment.CENTER,
+                    ),
+                    ft.Row(
+                        [
+                            txt_udp_ip,
+                            txt_udp_port,
+                            ft.OutlinedButton("Salvar Destino", icon=icon_val("SAVE"), on_click=on_save_udp_settings),
+                            ft.OutlinedButton("🔍 Preencher IP Detectado", on_click=on_detect_ip),
+                            ft.OutlinedButton("⚡ Ping UDP", icon=icon_val("FLASH_ON"), on_click=on_test_udp_ping),
+                        ],
+                        wrap=True,
+                        spacing=8,
+                        run_spacing=8,
+                        vertical_alignment=ft.CrossAxisAlignment.CENTER,
+                    ),
+                    ft.Divider(height=1, color="#1E293B"),
+                    ft.Row(
+                        [
+                            ft.Text("PROVISIONAMENTO WI-FI DA PLACA CYD (GRAVAÇÃO DIRETA NO NVS):", size=11, weight=ft.FontWeight.BOLD, color="#64748B"),
+                        ],
+                    ),
+                    ft.Row(
+                        [
+                            txt_esp_ssid,
+                            txt_esp_pass,
+                            _Button("📡 Salvar Wi-Fi na Placa", icon=icon_val("SEND"), on_click=on_send_wifi_cfg_to_esp),
+                        ],
+                        wrap=True,
+                        spacing=8,
+                        run_spacing=8,
+                        vertical_alignment=ft.CrossAxisAlignment.CENTER,
+                    ),
+                ],
+                spacing=9,
+            ),
+            bgcolor="#0B0F17",
+            border=border_all(1, "#38BDF844"),
+            border_radius=14,
+            padding=14,
+        )
 
         # ---------------- CONSOLE SERIAL & LOG (COM COPIAR E LIMPAR) ---------
         txt_console = ft.Text(
@@ -6961,7 +7819,7 @@ def launch_flet_gui(
             (4, "Terminal CYD", "TERMINAL"),
             (5, "Estúdio & Energia", "PALETTE"),
             (6, "Alertas Físicos", "NOTIFICATIONS_ACTIVE"),
-            (7, "Remoto & Serial", "QR_CODE_2"),
+            (7, "Wi-Fi & Remoto", "WIFI"),
         ]
 
         tab_views = [
@@ -7021,9 +7879,9 @@ def launch_flet_gui(
                 expand=True,
                 visible=False,
             ),
-            # Aba 7: Controle Remoto Smartphone Wi-Fi + Console Serial
+            # Aba 7: Telemetria Wi-Fi UDP (Porta 8888) + Controle Remoto Smartphone + Console Serial
             ft.Column(
-                [sec_mobile_remote, sec_console],
+                [sec_wifi_udp, sec_mobile_remote, sec_console],
                 spacing=10,
                 scroll=ft.ScrollMode.AUTO,
                 expand=True,
@@ -7240,7 +8098,17 @@ def launch_flet_gui(
             port_str = s.get("port") or ""
             tx_cnt = s.get("tx_packets", 0)
             bps = s.get("tx_bytes_sec", 0)
-            if s.get("connected") and st_code == "connected":
+            transport = str(s.get("transport", "NONE")).upper()
+
+            if transport == "UDP":
+                c_hex = "#38BDF8"
+                b_hex = "#0284C7"
+                target_str = s.get("udp_target", "") or "UDP:8888"
+                rtt = s.get("udp_rtt_ms", 0)
+                hdr_txt = f"Wi-Fi • {target_str}"
+                rail_t = "Wi-Fi UDP"
+                rail_s = f"{target_str} • {rtt}ms"
+            elif s.get("connected") and st_code == "connected":
                 c_hex = "#22C55E"
                 b_hex = "#14532D"
                 hdr_txt = f"{port_str} • 115k"
@@ -7262,8 +8130,8 @@ def launch_flet_gui(
                 c_hex = "#F59E0B"
                 b_hex = "#78350F"
                 hdr_txt = "Buscando CYD..."
-                rail_t = "Sem Porta COM"
-                rail_s = "Aguardando USB..."
+                rail_t = "Sem Conexão"
+                rail_s = "Aguardando USB/Wi-Fi..."
 
             status_dot.bgcolor = c_hex
             status_badge.border = border_all(1, b_hex)
@@ -7273,7 +8141,27 @@ def launch_flet_gui(
             rail_serial_card.border = border_all(1, b_hex)
             lbl_rail_serial_title.value = rail_t
             lbl_rail_serial_sub.value = rail_s
-            safe_update(status_badge, rail_serial_card)
+
+            if transport == "UDP":
+                lbl_udp_route_badge.value = f"📶 ROTA ATIVA: WI-FI UDP ({s.get('udp_target', '8888')})"
+                lbl_udp_route_badge.color = "#38BDF8"
+            elif s.get("connected") and st_code == "connected":
+                lbl_udp_route_badge.value = f"🔌 ROTA ATIVA: USB SERIAL ({port_str})"
+                lbl_udp_route_badge.color = "#22C55E"
+            else:
+                lbl_udp_route_badge.value = "⚠️ NENHUM TRANSPORTE CONECTADO"
+                lbl_udp_route_badge.color = "#F59E0B"
+
+            rtt_val = s.get("udp_rtt_ms", 0)
+            tx_udp = s.get("udp_tx", 0)
+            drp = s.get("udp_drop", 0)
+            target = s.get("udp_target", "") or "Sem IP configurado"
+            lbl_udp_diag.value = f"Destino: {target} • RTT: {rtt_val}ms • TX UDP: {tx_udp} • Drops: {drp}"
+
+            dirty_list = [status_badge, rail_serial_card]
+            if state.get("active_tab") == 7:
+                dirty_list.extend([lbl_udp_route_badge, lbl_udp_diag])
+            safe_update(*dirty_list)
 
         def on_serial_status_change(snap: dict):
             st_code = str(snap.get("state", "")).lower()
@@ -7597,7 +8485,7 @@ def main():
         news_api_key=cfg.get("news_api_key", ""),
         rotate_sec=15.0,
     )
-    term_eng = CyberDeckTerminalEngine()
+    term_eng = CyberDeckTerminalEngine(collector=col)
     time.sleep(0.55)
 
     if args.stdout or args.once:

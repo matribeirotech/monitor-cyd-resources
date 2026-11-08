@@ -26,6 +26,7 @@ a = Analysis(
         'winrt.windows.storage.streams',
         'winrt.windows.foundation',
         'winrt.windows.foundation.collections',
+        'paramiko',
     ],
     hookspath=[],
     hooksconfig={},

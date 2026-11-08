@@ -111,13 +111,41 @@ Todas as fotos abaixo foram capturadas diretamente da placa física em funcionam
   * **State Management Granular:** As atualizações periódicas afetam exclusivamente a aba visível (`active_tab`) e os chips do cabeçalho via `safe_update()`, reduzindo drasticamente o uso de CPU e memória RAM do agente no PC.
 * **🛡️ Nova Identidade Visual Oficial:**
   * Novos ícones vetorizados de alta resolução (`icone-cyd-resource-monitor.ico` e `icone-cyd-resource-monitor.png`) embutidos na barra de títulos da janela, no topo do menu lateral, na bandeja do sistema Windows (`pystray`) e no binário compilado `.exe`.
+* **📡 Telemetria Wi-Fi (UDP) & Modo Híbrido (USB + Sem Fio):**
+  * **Zero Latência Sem Fio:** Transmissão contínua de telemetria e controle de telas através de datagramas UDP na porta `8888` via `<WiFiUdp.h>` nativo do ESP32.
+  * **Modo Híbrido com Failover Inteligente:** O agente desktop detecta a saúde do link Wi-Fi via heartbeats periódicos (`udp_ping` / `udp_pong`). Se a rede oscilar, o sistema realiza fallback transparente e imediato para a porta USB Serial (115200 bps) sem perda de quadros.
+  * **Fragmentação Segura (< 1400 bytes):** O Python divide payloads extensos em blocos de topo seguros, contornando limitações de reassembly do lwIP e garantindo recepção íntegra no ESP32.
+  * **Provisionamento Remoto de Wi-Fi:** Configuração de SSID e senha direto pela interface Flet com gravação permanente na memória NVS (`Preferences`) do ESP32 via comando `wifi_cfg`.
+  * **Loop Não-Bloqueante:** Processamento dreno de buffer assíncrono mantendo a taxa de renderização de ~28 FPS no display TFT.
 * **📰 Feed de Notícias Customizável (Tela 10 / `SCR_NEWS`):**
   * Módulo passivo de notícias por tópicos customizáveis ("Política", "Tecnologia", "Mercado Financeiro", "Inteligência Artificial", etc.) via NewsAPI.org ou feeds RSS gratuitos (Google/Bing News RSS).
   * Fila inteligente com rotação automática a cada 15 segundos e letreiro deslizante suave na tela da CYD via `TFT_eSprite`.
-* **💻 O Terminal CYD — Ferramentas de Rede e Sistema (Tela 11 / `SCR_TERMINAL`):**
+* **💻 O Terminal CYD — Ferramentas de Rede, Homelab e Sistema (Tela 11 / `SCR_TERMINAL`):**
   * Prompt interativo estilo hacker retrô / terminal CRT verde com buffer de rolagem vertical (*scroll* suave linha por linha).
-  * **Comandos Locais do PC:** `ping [alvo]`, `fetch [url]`, `docker [cmd]` e subprocessos de terminal.
-  * **Comandos de Hardware da CYD:** `wifi scan` (dispara `WiFi.scanNetworks()` nativo do ESP32 e imprime os SSIDs e potências RSSI direto no terminal da placa).
+  * **UX Avançada no Flet:** Histórico com navegação por setas **Cima / Baixo** (estilo bash), rolagem automática inteligente e chips de acesso rápido com 1-toque.
+  * **Comandos do Sistema (PC / Homelab):**
+    * `whoami`: Exibe usuário ativo, máquina, SO e PID.
+    * `neofetch`: Banner de hardware compacto com arte ASCII (OS, Host, Uptime, CPU, RAM e GPU).
+    * `df -h`: Partições de disco ativas, espaço livre, ocupado e percentual de uso via `psutil`.
+    * `free -m`: Memória RAM e Swap usada/livre em Megabytes.
+    * `uptime`: Tempo contínuo de atividade do PC e timestamp de inicialização.
+    * `top`: Ranking dos 5 principais processos por consumo de memória RAM.
+  * **Rede & Infraestrutura:**
+    * `ip addr` / `ifconfig`: Detecção automática das interfaces de rede ativas (Ethernet, Wi-Fi, Tailscale, etc.) e seus respectivos IPs locais.
+    * `netstat -tuln`: Lista portas abertas em estado `LISTEN` e seus processos associados.
+    * `ping [alvo]`: Teste ICMP de latência em tempo real transmitido linha a linha para a placa.
+    * `fetch [url]`: Disparo de HTTP GET com aferição de tempo de resposta, headers e status code.
+    * `ssh [user]@[host] [cmd]`: Execução remota rápida em servidores Linux / VPS / Homelab com suporte a `paramiko` e fallback para o cliente OpenSSH.
+  * **Gerenciamento Docker:**
+    * `docker ps`: Lista os containers ativos, status e portas mapeadas.
+    * `docker stats`: Consumo instantâneo de CPU e memória RAM dos containers ativos.
+    * `docker logs [container]`: Inspeção das últimas 10 linhas de log de um container específico.
+  * **Comandos Nativos Executados em Hardware na CYD (ESP32):**
+    * `wifi scan`: Dispara `WiFi.scanNetworks()` nativo do ESP32 e imprime os SSIDs e potências RSSI direto no terminal da placa.
+    * `esp info`: Retorna IP local da placa, força do sinal Wi-Fi (dBm), MAC Address, versão do firmware e clock do chip.
+    * `esp mem`: Diagnóstico detalhado de memória RAM (Heap livre, tamanho total, mínimo histórico, maior bloco contínuo e status de PSRAM).
+    * `esp reboot`: Aciona remotamente o `ESP.restart()` na placa CYD com aviso prévio no display.
+    * `cmatrix`: *Easter egg* visual que inicia uma chuva de código verde estilo Matrix Rain fosforescente na `SCR_TERMINAL`.
 * **🍅 Módulo de Foco Pomodoro (Tela 8):** Máquina de estados completa no PC (Trabalho 25m, Pausa Curta 5m, Pausa Longa 15m), anel circular anti-flicker (`drawSmoothArc`) na CYD com interpolação de 1s, contador de ciclos diários e **bipes sonoros automáticos no Buzzer** ao concluir cada ciclo.
 * **🎵 Hub Multimídia Spotify & YouTube Music (Tela 9):**
   * Integração nativa com Windows GSMTC (`winrt.windows.media.control`) identificando **Spotify** (Desktop/Store/Web) e **YouTube Music** (Chrome/Edge/Brave/Firefox/PWA/Desktop).
@@ -142,7 +170,8 @@ Todas as fotos abaixo foram capturadas diretamente da placa física em funcionam
 | **v3.1** | **Controle Remoto pelo Celular (Wi-Fi PWA com QR Code & App Flutter em `mobile/`)** + **Upload de fotos do smartphone p/ SD** | ✅ Concluído |
 | **v4.0** | **Pomodoro (Tela 8) + Spotify & YouTube Music (Tela 9) + Portfólio Pessoal (Tela 7) + Alertas Físicos Buzzer/LED + Modo Sleep/Noturno + UI 6 Abas** | ✅ Concluído |
 | **v4.1** | **Clima Regional (Votuporanga) no Topo + Tela 10 (Clima & Gemini Gems) + Alerta de Tempestade + CI/CD GitHub Actions** | ✅ Concluído |
-| **v4.2 (Atual)** | **CYD Cyber Deck (12 Telas) + Feed de Notícias (Tela 10) + Terminal CYD (Tela 11) + Serial Assíncrona (115200 bps) + Clean UI (NavigationRail) + Nova Identidade Visual** | ✅ **Concluído (v4.2)** |
+| **v4.2** | **CYD Cyber Deck (12 Telas) + Feed de Notícias (Tela 10) + Terminal CYD (Tela 11) + Serial Assíncrona (115200 bps) + Clean UI (NavigationRail) + Nova Identidade Visual** | ✅ Concluído |
+| **v4.3 (Atual)** | **Telemetria Wi-Fi (UDP Porta 8888) + Modo Híbrido (USB & Sem Fio) + Fragmentação MTU + Terminal Linux Expandido** | ✅ **Concluído (v4.3)** |
 
 ---
 

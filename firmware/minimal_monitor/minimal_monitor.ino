@@ -24,9 +24,46 @@
 #include <AnimatedGIF.h>
 #include <TJpg_Decoder.h>
 #include <WiFi.h>
+#include <WiFiUdp.h>
 #include "mbedtls/base64.h"
 
 #include "ui_theme.h"
+
+// ------------------------------------------------ Wi-Fi & UDP Telemetry ----
+// Credenciais padrao de fallback (podem ser definidas aqui OU configuradas
+// dinamicamente pelo Painel Desktop Flet e salvas na memoria Flash NVS)
+#ifndef WIFI_SSID_DEFAULT
+#define WIFI_SSID_DEFAULT "SUA_REDE_WIFI"
+#endif
+#ifndef WIFI_PASS_DEFAULT
+#define WIFI_PASS_DEFAULT "SUA_SENHA_WIFI"
+#endif
+#define UDP_PORT          8888
+
+WiFiUDP   udp;
+bool      udpListening      = false;
+char      wifiSsid[64]      = WIFI_SSID_DEFAULT;
+char      wifiPass[64]      = WIFI_PASS_DEFAULT;
+char      udpBuf[2560];
+uint32_t  lastWifiCheckMs   = 0;
+bool      wifiWasConnected  = false;
+IPAddress lastUdpRemoteIP;
+uint16_t  lastUdpRemotePort = 0;
+bool      replyViaUdp       = false; // true enquanto applyJson() processa um pacote vindo do UDP
+
+// Responde SOMENTE pelo canal de origem do comando (USB ou UDP). Se respondesse pelos
+// dois, o agente receberia cada TERM_LOG/ACK em duplicidade quando ambos estao ativos.
+void sendReplyLine(const char* line) {
+  if (!line || !line[0]) return;
+  if (replyViaUdp && udpListening && WiFi.status() == WL_CONNECTED && lastUdpRemotePort > 0) {
+    udp.beginPacket(lastUdpRemoteIP, lastUdpRemotePort);
+    udp.write((const uint8_t*)line, strlen(line));
+    udp.write((const uint8_t*)"\n", 1);
+    udp.endPacket();
+    return;
+  }
+  Serial.println(line);
+}
 
 // ------------------------------------------------------------- hardware ----
 // NOTA: Inicializacao e leitura de Touch (XPT2046) foram totalmente removidas
@@ -444,7 +481,7 @@ void GIFDraw(GIFDRAW *pDraw) {
 // Lista arquivos de imagem do Cartao SD e envia para o PC via Serial
 void listSdFilesToSerial() {
   if (!initOrVerifySD()) {
-    Serial.println("SD_FILES:[]");
+    sendReplyLine("SD_FILES:[]");
     return;
   }
   JsonDocument doc;
@@ -482,9 +519,9 @@ void listSdFilesToSerial() {
     }
     root.close();
   }
-  Serial.print("SD_FILES:");
-  serializeJson(doc, Serial);
-  Serial.println();
+  String out = "SD_FILES:";
+  serializeJson(doc, out);
+  sendReplyLine(out.c_str());
 }
 
 // =========================================================== telemetria ====
@@ -645,6 +682,8 @@ struct TerminalState {
   bool     dirty       = true;
   char     lastCmd[40] = "ready";
 } termSt;
+
+static bool isMatrixRain = false;
 
 // Sanitiza strings UTF-8 caso algum caractere acentuado escape para o TFT_eSPI
 static void sanitizeAscii(char* dst, const char* src, size_t maxLen) {
@@ -2786,6 +2825,7 @@ static void appendRawTerminalLine(const char* s) {
 
 // Funcao publica pedida na especificacao: faz o texto rolar para cima conforme novas linhas chegam
 void log_to_terminal(String text) {
+  isMatrixRain = false;
   char cleanBuf[512];
   sanitizeAscii(cleanBuf, text.c_str(), sizeof(cleanBuf));
   if (!cleanBuf[0]) return;
@@ -2818,14 +2858,16 @@ void log_to_terminal(String text) {
 }
 
 void clearTerminal() {
+  isMatrixRain = false;
   termSt.count = 0;
   termSt.totalLogged = 0;
-  log_to_terminal("CYD CYBER DECK OS v4.0 [ESP32-2432S028R]");
-  log_to_terminal("Console pronto. Comandos: ping, fetch, docker, wifi scan");
+  log_to_terminal("CYD CYBER DECK OS v4.2 [ESP32-2432S028R]");
+  log_to_terminal("Console pronto. Comandos: help | ping | docker | esp info");
   termSt.dirty = true;
 }
 
 void screenTerminalStatic() {
+  isMatrixRain = false;
   if (isGifPlaying) {
     gif.close();
     isGifPlaying = false;
@@ -2855,7 +2897,88 @@ void screenTerminalStatic() {
   termSt.dirty = true;
 }
 
+// ======================================= Easter Egg: Matrix Rain (SCR_TERMINAL) ===
+static uint32_t lastMatrixTick = 0;
+#define MATRIX_COLS 25
+static int16_t matrixHeadY[MATRIX_COLS];
+static uint8_t matrixSpeed[MATRIX_COLS];
+static uint8_t matrixLen[MATRIX_COLS];
+static uint8_t matrixTickCount[MATRIX_COLS];
+
+static void initMatrixRain() {
+  isMatrixRain = true;
+  strlcpy(termSt.lastCmd, "cmatrix", sizeof(termSt.lastCmd));
+  tft.fillRect(4, 26, 312, 193, 0x0000);
+  tft.drawRect(4, 26, 312, 193, 0x07E0);
+  tft.fillRect(5, 27, 310, 13, 0x0120);
+  tft.drawFastHLine(5, 40, 310, 0x03E0);
+  tft.setTextDatum(ML_DATUM);
+  tft.setTextColor(0x07E0, 0x0120);
+  tft.drawString("matrix@cyd-deck:~# running [qualquer tecla p/ sair]", 10, 33, 1);
+
+  for (int i = 0; i < MATRIX_COLS; i++) {
+    matrixHeadY[i] = random(44, 120);
+    matrixSpeed[i] = random(1, 4);
+    matrixLen[i]   = random(5, 14);
+    matrixTickCount[i] = 0;
+  }
+  Serial.println("TERM_LOG:[MATRIX] Easter egg Matrix Rain iniciado na CYD!");
+}
+
+static void updateMatrixRain() {
+  if (!isMatrixRain) return;
+  uint32_t now = millis();
+  if (now - lastMatrixTick < 40) return;
+  lastMatrixTick = now;
+
+  const int topY = 44;
+  const int botY = 205;
+  const int tx = 8;
+  const int colW = 12;
+
+  for (int i = 0; i < MATRIX_COLS; i++) {
+    matrixTickCount[i]++;
+    if (matrixTickCount[i] < matrixSpeed[i]) continue;
+    matrixTickCount[i] = 0;
+
+    int x = tx + i * colW;
+    int y = matrixHeadY[i];
+
+    // Ponta brilhante em branco
+    if (y >= topY && y < botY) {
+      char ch = (char)random(33, 126);
+      tft.setTextColor(0xFFFF, 0x0000);
+      tft.drawChar(ch, x, y, 1);
+    }
+
+    // Corpo em verde fosforo 0x07E0
+    int prevY = y - 8;
+    if (prevY >= topY && prevY < botY) {
+      char prevCh = (char)random(33, 126);
+      tft.setTextColor(0x07E0, 0x0000);
+      tft.drawChar(prevCh, x, prevY, 1);
+    }
+
+    // Apaga cauda anterior
+    int tailY = y - (matrixLen[i] * 8);
+    if (tailY >= topY && tailY < botY) {
+      tft.fillRect(x, tailY, 7, 8, 0x0000);
+    }
+
+    matrixHeadY[i] += 8;
+    if (matrixHeadY[i] > botY + (matrixLen[i] * 8)) {
+      matrixHeadY[i] = topY;
+      matrixSpeed[i] = random(1, 4);
+      matrixLen[i] = random(5, 14);
+    }
+  }
+}
+
 void screenTerminalDynamic() {
+  if (isMatrixRain) {
+    updateMatrixRain();
+    return;
+  }
   const int tx = 4, ty = 26, tw = 312, th = 193;
 
   // Redesenha o buffer de linhas rolantes apenas quando novas linhas chegam
@@ -2916,21 +3039,22 @@ void runWifiScanOnTerminal() {
   log_to_terminal("$ wifi scan");
   log_to_terminal("[WIFI] Escaneando redes 2.4GHz no ESP32...");
   screenTerminalDynamic(); // Exibe mensagem imediatamente antes do bloqueio do radio
-  Serial.println("TERM_LOG:[WIFI] Escaneando redes 2.4GHz no hardware ESP32...");
+  sendReplyLine("TERM_LOG:[WIFI] Escaneando redes 2.4GHz no hardware ESP32...");
 
   WiFi.mode(WIFI_STA);
-  WiFi.disconnect(true);
-  delay(40);
+  delay(20);
 
   int n = WiFi.scanNetworks(false, false);
   if (n <= 0) {
     log_to_terminal("[WIFI] Nenhuma rede Wi-Fi encontrada (0 APs).");
-    Serial.println("TERM_LOG:[WIFI] Nenhuma rede Wi-Fi encontrada (0 APs).");
+    sendReplyLine("TERM_LOG:[WIFI] Nenhuma rede Wi-Fi encontrada (0 APs).");
   } else {
     char hdr[48];
     snprintf(hdr, sizeof(hdr), "[WIFI] %d redes encontradas (SSID / RSSI):", n);
     log_to_terminal(hdr);
-    Serial.printf("TERM_LOG:%s\n", hdr);
+    char lHdr[64];
+    snprintf(lHdr, sizeof(lHdr), "TERM_LOG:%s", hdr);
+    sendReplyLine(lHdr);
 
     int maxShow = min(n, 11);
     for (int i = 0; i < maxShow; i++) {
@@ -2947,25 +3071,68 @@ void runWifiScanOnTerminal() {
       snprintf(row, sizeof(row), "%02d) %-18.18s %4lddBm CH%02ld %s",
                i + 1, cleanSsid, (long)rssi, (long)ch, openNet ? "OPEN" : "WPA");
       log_to_terminal(row);
-      Serial.printf("TERM_LOG:%s\n", row);
+      char lRow[68];
+      snprintf(lRow, sizeof(lRow), "TERM_LOG:%s", row);
+      sendReplyLine(lRow);
     }
     if (n > maxShow) {
       char more[44];
       snprintf(more, sizeof(more), "... +%d redes adicionais omitidas", n - maxShow);
       log_to_terminal(more);
-      Serial.printf("TERM_LOG:%s\n", more);
+      char lMore[60];
+      snprintf(lMore, sizeof(lMore), "TERM_LOG:%s", more);
+      sendReplyLine(lMore);
     }
   }
 
   WiFi.scanDelete();
-  WiFi.mode(WIFI_OFF);
+  // Mantem Wi-Fi STA conectado para Telemetria UDP (nao desliga o radio!)
+  if (WiFi.status() != WL_CONNECTED && wifiSsid[0] != '\0' && strcmp(wifiSsid, "SUA_REDE_WIFI") != 0) {
+    WiFi.begin(wifiSsid, wifiPass);
+  }
   screenTerminalDynamic();
 }
 
-// ================================================= Serial / Protocolo JSON =
+// ================================================= Serial & UDP / Protocolo JSON =
 void applyJson(const char *json) {
   JsonDocument doc;
   if (deserializeJson(doc, json)) return;
+
+  // 00) Heartbeat UDP do agente: responde uptime + IP (nao conta como pacote de telemetria)
+  if (doc["cmd"] == "udp_ping") {
+    char pong[48];
+    snprintf(pong, sizeof(pong), "UDP_PONG:%lu:%s",
+             (unsigned long)(millis() / 1000UL), WiFi.localIP().toString().c_str());
+    sendReplyLine(pong);
+    return;
+  }
+
+  // 0) Provisionamento dinamico de Wi-Fi via JSON: {"wifi_cfg": {"ssid": "...", "pass": "..."}}
+  JsonVariant wcfg = doc["wifi_cfg"];
+  if (!wcfg.isNull()) {
+    const char* newSsid = wcfg["ssid"] | "";
+    const char* newPass = wcfg["pass"] | "";
+    if (newSsid[0] != '\0') {
+      strlcpy(wifiSsid, newSsid, sizeof(wifiSsid));
+      strlcpy(wifiPass, newPass, sizeof(wifiPass));
+      prefs.putString("wifi_ssid", wifiSsid);
+      prefs.putString("wifi_pass", wifiPass);
+      WiFi.disconnect(false);
+      delay(20);
+      WiFi.mode(WIFI_STA);
+      WiFi.setSleep(false);
+      WiFi.begin(wifiSsid, wifiPass);
+      wifiWasConnected = false;
+      lastWifiCheckMs  = millis();
+      char wMsg[64];
+      snprintf(wMsg, sizeof(wMsg), "[WIFI] Conectando a '%s' (UDP :%d)...", wifiSsid, UDP_PORT);
+      log_to_terminal(wMsg);
+      char lW[80];
+      snprintf(lW, sizeof(lW), "TERM_LOG:%s", wMsg);
+      sendReplyLine(lW);
+    }
+    if (doc.size() == 1) return;
+  }
 
   // 1) Comandos nativos delegados para o ESP32 ("cmd")
   if (doc["cmd"] == "list_sd") {
@@ -2973,14 +3140,16 @@ void applyJson(const char *json) {
     return;
   }
   if (doc["cmd"] == "wifi_scan") {
+    isMatrixRain = false;
     runWifiScanOnTerminal();
     return;
   }
   if (doc["cmd"] == "term_clear") {
+    isMatrixRain = false;
     clearTerminal();
     return;
   }
-  if (doc["cmd"] == "esp_info") {
+  if (doc["cmd"] == "cmatrix") {
     if (currentScreen != SCR_TERMINAL) {
       currentScreen = SCR_TERMINAL;
       prefs.putUChar("screen", currentScreen);
@@ -2988,26 +3157,105 @@ void applyJson(const char *json) {
       screenTerminalStatic();
       needFullDraw = false;
     }
-    strlcpy(termSt.lastCmd, "esp_info", sizeof(termSt.lastCmd));
-    log_to_terminal("$ esp_info");
-    char b1[48], b2[48];
-    snprintf(b1, sizeof(b1), "[ESP32] Heap Livre: %lu B | Freq: %lu MHz",
-             (unsigned long)ESP.getFreeHeap(), (unsigned long)ESP.getCpuFreqMHz());
-    snprintf(b2, sizeof(b2), "[ESP32] Uptime: %lu s | SD: %s | Pkts: %lu",
-             (unsigned long)(millis() / 1000UL), hasSD ? "OK" : "AUSENTE", (unsigned long)packets);
+    initMatrixRain();
+    return;
+  }
+  if (doc["cmd"] == "esp_reboot") {
+    isMatrixRain = false;
+    if (currentScreen != SCR_TERMINAL) {
+      currentScreen = SCR_TERMINAL;
+      prefs.putUChar("screen", currentScreen);
+      resetDrawCache();
+      screenTerminalStatic();
+      needFullDraw = false;
+    }
+    strlcpy(termSt.lastCmd, "esp reboot", sizeof(termSt.lastCmd));
+    log_to_terminal("$ esp reboot");
+    log_to_terminal("[ESP32] REINICIANDO PLACA CYD EM 1.5S...");
+    Serial.println("TERM_LOG:[ESP32] Reiniciando placa CYD em 1.5s...");
+    screenTerminalDynamic();
+    delay(1500);
+    ESP.restart();
+    return;
+  }
+  if (doc["cmd"] == "esp_mem") {
+    isMatrixRain = false;
+    if (currentScreen != SCR_TERMINAL) {
+      currentScreen = SCR_TERMINAL;
+      prefs.putUChar("screen", currentScreen);
+      resetDrawCache();
+      screenTerminalStatic();
+      needFullDraw = false;
+    }
+    strlcpy(termSt.lastCmd, "esp mem", sizeof(termSt.lastCmd));
+    log_to_terminal("$ esp mem");
+    char m1[54], m2[54], m3[54];
+    uint32_t freeH = ESP.getFreeHeap();
+    uint32_t totH  = ESP.getHeapSize();
+    uint32_t minH  = ESP.getMinFreeHeap();
+    uint32_t maxA  = ESP.getMaxAllocHeap();
+    float pctF     = totH > 0 ? ((float)freeH * 100.0f / (float)totH) : 0.0f;
+    snprintf(m1, sizeof(m1), "[HEAP] Livre: %lu B / %lu B (%.1f%%)", (unsigned long)freeH, (unsigned long)totH, pctF);
+    snprintf(m2, sizeof(m2), "[HEAP] Minimo: %lu B | Max Bloco: %lu B", (unsigned long)minH, (unsigned long)maxA);
+    snprintf(m3, sizeof(m3), "[HEAP] PSRAM: %s | Uptime: %lu s", psramFound() ? "PRESENTE" : "N/A", (unsigned long)(millis() / 1000UL));
+    log_to_terminal(m1);
+    log_to_terminal(m2);
+    log_to_terminal(m3);
+    char lm1[70], lm2[70], lm3[70];
+    snprintf(lm1, sizeof(lm1), "TERM_LOG:%s", m1);
+    snprintf(lm2, sizeof(lm2), "TERM_LOG:%s", m2);
+    snprintf(lm3, sizeof(lm3), "TERM_LOG:%s", m3);
+    sendReplyLine(lm1);
+    sendReplyLine(lm2);
+    sendReplyLine(lm3);
+    return;
+  }
+  if (doc["cmd"] == "esp_info") {
+    isMatrixRain = false;
+    if (currentScreen != SCR_TERMINAL) {
+      currentScreen = SCR_TERMINAL;
+      prefs.putUChar("screen", currentScreen);
+      resetDrawCache();
+      screenTerminalStatic();
+      needFullDraw = false;
+    }
+    strlcpy(termSt.lastCmd, "esp info", sizeof(termSt.lastCmd));
+    log_to_terminal("$ esp info");
+    char b1[54], b2[54], b3[54], b4[54];
+    String ipStr = (WiFi.status() == WL_CONNECTED) ? WiFi.localIP().toString() : "OFFLINE (USB Serial)";
+    int rssiVal = (WiFi.status() == WL_CONNECTED) ? WiFi.RSSI() : 0;
+    snprintf(b1, sizeof(b1), "[ESP32] IP: %s:%d | RSSI: %d dBm", ipStr.c_str(), UDP_PORT, rssiVal);
+    snprintf(b2, sizeof(b2), "[ESP32] MAC: %s", WiFi.macAddress().c_str());
+    snprintf(b3, sizeof(b3), "[ESP32] Firmware: v4.3 Cyber Deck [UDP + USB]");
+    snprintf(b4, sizeof(b4), "[ESP32] Chip: %s Rev %d @ %lu MHz | SD: %s",
+             ESP.getChipModel(), ESP.getChipRevision(), (unsigned long)ESP.getCpuFreqMHz(), hasSD ? "OK" : "AUSENTE");
     log_to_terminal(b1);
     log_to_terminal(b2);
-    Serial.printf("TERM_LOG:%s\n", b1);
-    Serial.printf("TERM_LOG:%s\n", b2);
+    log_to_terminal(b3);
+    log_to_terminal(b4);
+    char lb1[70], lb2[70], lb3[70], lb4[70];
+    snprintf(lb1, sizeof(lb1), "TERM_LOG:%s", b1);
+    snprintf(lb2, sizeof(lb2), "TERM_LOG:%s", b2);
+    snprintf(lb3, sizeof(lb3), "TERM_LOG:%s", b3);
+    snprintf(lb4, sizeof(lb4), "TERM_LOG:%s", b4);
+    sendReplyLine(lb1);
+    sendReplyLine(lb2);
+    sendReplyLine(lb3);
+    sendReplyLine(lb4);
+    if (WiFi.status() == WL_CONNECTED) {
+      char wip[48];
+      snprintf(wip, sizeof(wip), "WIFI_IP:%s", ipStr.c_str());
+      sendReplyLine(wip);
+    }
     return;
   }
 
-  // 2) Transferencia de arquivos via Serial (Chunked Base64 para o Cartao SD)
+  // 2) Transferencia de arquivos via Serial / UDP (Chunked Base64 para o Cartao SD)
   JsonVariant vFile = doc["file_name"];
   JsonVariant vMode = doc["file_mode"];
   if (!vFile.isNull() && !vMode.isNull()) {
     if (!initOrVerifySD()) {
-      Serial.println("ERR_NO_SD");
+      sendReplyLine("ERR_NO_SD");
       return;
     }
     String fName = String(vFile.as<const char*>());
@@ -3020,10 +3268,10 @@ void applyJson(const char *json) {
       if (SD.exists(fName)) SD.remove(fName);
       uploadFile = SD.open(fName, FILE_WRITE);
       if (!uploadFile) {
-        Serial.println("ERR_OPEN");
+        sendReplyLine("ERR_OPEN");
         return;
       }
-      Serial.println("ACK_START");
+      sendReplyLine("ACK_START");
       return;
     }
 
@@ -3032,7 +3280,7 @@ void applyJson(const char *json) {
         uploadFile = SD.open(fName, FILE_APPEND);
       }
       if (!uploadFile) {
-        Serial.println("ERR_OPEN");
+        sendReplyLine("ERR_OPEN");
         return;
       }
       JsonVariant vData = doc["file_data"];
@@ -3052,7 +3300,9 @@ void applyJson(const char *json) {
         }
       }
       int seq = doc["seq"] | 0;
-      Serial.printf("ACK_CHUNK:%d\n", seq);
+      char ackBuf[28];
+      snprintf(ackBuf, sizeof(ackBuf), "ACK_CHUNK:%d", seq);
+      sendReplyLine(ackBuf);
       return;
     }
 
@@ -3074,13 +3324,13 @@ void applyJson(const char *json) {
         }
         mediaSt.hasCover = true;
         gLastMediaSig[0] = '\0'; // Forca redesenho imediato da nova capa na SCR_MEDIA
-        Serial.println("ACK_EOF");
+        sendReplyLine("ACK_EOF");
         return;
       }
       strlcpy(bgImage, cleanName.c_str(), sizeof(bgImage));
       prefs.putString("bg", bgImage);
       needFullDraw = true;
-      Serial.println("ACK_EOF");
+      sendReplyLine("ACK_EOF");
       listSdFilesToSerial();
       return;
     }
@@ -3479,6 +3729,91 @@ void pumpSerial() {
   }
 }
 
+// ======================================= Listener UDP Nao-Bloqueante (Wi-Fi) ==
+void initWiFiAndUDP() {
+  String savedSsid = prefs.getString("wifi_ssid", "");
+  String savedPass = prefs.getString("wifi_pass", "");
+  if (savedSsid.length() > 0) {
+    strlcpy(wifiSsid, savedSsid.c_str(), sizeof(wifiSsid));
+    strlcpy(wifiPass, savedPass.c_str(), sizeof(wifiPass));
+  }
+
+  WiFi.mode(WIFI_STA);
+  WiFi.setSleep(false); // Desativa modem-sleep para latencia UDP minima e zero perda de pacotes
+
+  if (wifiSsid[0] != '\0' && strcmp(wifiSsid, "SUA_REDE_WIFI") != 0) {
+    WiFi.begin(wifiSsid, wifiPass);
+    // Aguarda ate ~3.0s na tela de boot (em passos curtos de 100ms) sem travar caso o roteador demore
+    uint32_t t0 = millis();
+    while (WiFi.status() != WL_CONNECTED && (millis() - t0) < 3000) {
+      pumpSerial();
+      delay(100);
+    }
+    if (WiFi.status() == WL_CONNECTED) {
+      wifiWasConnected = true;
+      udp.begin(UDP_PORT);
+      udpListening = true;
+      String ipStr = WiFi.localIP().toString();
+      Serial.printf("WIFI_IP:%s\n", ipStr.c_str());
+      char uLog[64];
+      snprintf(uLog, sizeof(uLog), "[UDP] Online em %s:%d", ipStr.c_str(), UDP_PORT);
+      log_to_terminal(uLog);
+    }
+  }
+}
+
+void pumpUDP() {
+  if (WiFi.status() == WL_CONNECTED) {
+    if (!wifiWasConnected) {
+      wifiWasConnected = true;
+      if (!udpListening) {
+        udp.begin(UDP_PORT);
+        udpListening = true;
+      }
+      String ipStr = WiFi.localIP().toString();
+      char wip[48];
+      snprintf(wip, sizeof(wip), "WIFI_IP:%s", ipStr.c_str());
+      sendReplyLine(wip);
+      char uLog[64];
+      snprintf(uLog, sizeof(uLog), "[UDP] Wi-Fi Conectado! IP: %s:%d", ipStr.c_str(), UDP_PORT);
+      log_to_terminal(uLog);
+      char lU[80];
+      snprintf(lU, sizeof(lU), "TERM_LOG:%s", uLog);
+      sendReplyLine(lU);
+    }
+
+    // Drena todos os pacotes UDP pendentes na porta 8888 sem bloquear o loop de 28 FPS
+    int packetSize = udp.parsePacket();
+    while (packetSize > 0) {
+      lastUdpRemoteIP   = udp.remoteIP();
+      lastUdpRemotePort = udp.remotePort();
+      int len = udp.read(udpBuf, sizeof(udpBuf) - 1);
+      if (len > 2) {
+        udpBuf[len] = '\0';
+        // Remove quebras de linha finais opcionais e roteia para o mesmo parser da Serial
+        while (len > 0 && (udpBuf[len - 1] == '\n' || udpBuf[len - 1] == '\r')) {
+          udpBuf[--len] = '\0';
+        }
+        replyViaUdp = true;
+        applyJson(udpBuf);
+        replyViaUdp = false;
+      }
+      packetSize = udp.parsePacket();
+    }
+  } else {
+    if (wifiWasConnected) {
+      wifiWasConnected = false;
+    }
+    // Reconexao automatica nao-bloqueante a cada 12 segundos se houver SSID configurado
+    if (wifiSsid[0] != '\0' && strcmp(wifiSsid, "SUA_REDE_WIFI") != 0) {
+      if (millis() - lastWifiCheckMs >= 12000) {
+        lastWifiCheckMs = millis();
+        WiFi.reconnect();
+      }
+    }
+  }
+}
+
 // Botao BOOT fisico na placa (opcional para alternar telas manualmente)
 void pumpBootButton() {
   static uint32_t bootDown = 0;
@@ -3551,26 +3886,42 @@ void setup() {
   memset(hTmp, 0, sizeof(hTmp));
   memset(mkt.hBtc, 50, sizeof(mkt.hBtc));
 
-  // Splash Screen Moderna
+  // Splash Screen Moderna + Inicializacao Wi-Fi UDP (Porta 8888)
   tft.fillScreen(C_BG);
-  drawModernCard(24, 36, SCR_W - 48, SCR_H - 72, "SYSTEM BOOT");
+  drawModernCard(24, 28, SCR_W - 48, SCR_H - 56, "SYSTEM BOOT • HYBRID UDP/USB");
   tft.setTextDatum(MC_DATUM);
   tft.setTextColor(C_ACCENT, C_CARD);
-  tft.drawString("CYD HARDWARE", SCR_W / 2, 78, 4);
-  tft.drawString("& MARKET v4.0", SCR_W / 2, 108, 4);
+  tft.drawString("CYD CYBER DECK", SCR_W / 2, 70, 4);
+  tft.drawString("v4.3 WI-FI UDP", SCR_W / 2, 98, 4);
   tft.setTextColor(C_TEXT, C_CARD);
-  tft.drawString("Hardware + Bolsa & Cripto em Tempo Real", SCR_W / 2, 142, 2);
+  tft.drawString("Iniciando Wi-Fi & Listener UDP :8888...", SCR_W / 2, 130, 2);
   tft.setTextColor(hasSD ? C_OK : C_WARN, C_CARD);
-  tft.drawString(hasSD ? "SD Card: OK (JPG/BMP/GIF Prontos)" : "SD Card: Nao Detectado (FAT32)", SCR_W / 2, 166, 2);
-  delay(900);
+  tft.drawString(hasSD ? "SD Card: OK (JPG/BMP/GIF Prontos)" : "SD Card: Nao Detectado (FAT32)", SCR_W / 2, 152, 2);
+
+  initWiFiAndUDP();
+
+  if (WiFi.status() == WL_CONNECTED) {
+    char ipSplash[48];
+    snprintf(ipSplash, sizeof(ipSplash), "Wi-Fi OK! UDP -> %s:%d", WiFi.localIP().toString().c_str(), UDP_PORT);
+    tft.setTextColor(C_OK, C_CARD);
+    tft.drawString(ipSplash, SCR_W / 2, 174, 2);
+  } else {
+    tft.setTextColor(C_DIM, C_CARD);
+    tft.drawString("USB Serial 115200 Ativo (Wi-Fi em standby)", SCR_W / 2, 174, 2);
+  }
+  delay(750);
 
   Serial.println("MONITOR_READY");
+  if (WiFi.status() == WL_CONNECTED) {
+    Serial.printf("WIFI_IP:%s\n", WiFi.localIP().toString().c_str());
+  }
   listSdFilesToSerial();
 }
 
 // ================================================================= loop ====
 void loop() {
   pumpSerial();
+  pumpUDP();
   pumpBootButton();
   pumpAlerts(); // Execucao de bipes e flashes do alerta sem bloquear a CPU
 

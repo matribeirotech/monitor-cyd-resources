@@ -10,7 +10,7 @@ a = Analysis(
         ('../imgs/icone-cyd-resource-monitor.png', 'imgs'),
         ('../imgs/imgsCYD.ico', 'imgs'),
     ],
-    hiddenimports=['serial', 'serial.tools.list_ports', 'psutil', 'wmi', 'win32com.client', 'PIL', 'pystray', 'pystray._win32', 'qrcode', 'mobile_web', 'winrt', 'winrt.windows.media.control', 'winrt.windows.storage.streams', 'winrt.windows.foundation', 'winrt.windows.foundation.collections'],
+    hiddenimports=['serial', 'serial.tools.list_ports', 'psutil', 'wmi', 'win32com.client', 'PIL', 'pystray', 'pystray._win32', 'qrcode', 'mobile_web', 'winrt', 'winrt.windows.media.control', 'winrt.windows.storage.streams', 'winrt.windows.foundation', 'winrt.windows.foundation.collections', 'paramiko'],
     hookspath=[],
     hooksconfig={},
     runtime_hooks=[],

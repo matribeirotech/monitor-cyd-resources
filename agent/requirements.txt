@@ -1,4 +1,4 @@
-﻿altgraph==0.17.5
+altgraph==0.17.5
 anyio==4.15.1
 arrow==1.4.0
 binaryornot==0.4.4
@@ -48,6 +48,7 @@ tzdata==2026.5
 urllib3==2.8.0
 watchdog==6.0.0
 winrt-runtime==4.0.3
+paramiko>=3.4.0
 winrt-Windows.Foundation==4!10.0.28000.2705
 winrt-Windows.Foundation.Collections==4!10.0.28000.2705
 winrt-Windows.Media.Control==4!10.0.28000.2705
