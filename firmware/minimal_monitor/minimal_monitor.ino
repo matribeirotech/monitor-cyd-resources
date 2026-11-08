@@ -23,6 +23,7 @@
 #include <Preferences.h>
 #include <AnimatedGIF.h>
 #include <TJpg_Decoder.h>
+#include <WiFi.h>
 #include "mbedtls/base64.h"
 
 #include "ui_theme.h"
@@ -599,13 +600,51 @@ struct WeatherGemsStats {
   char     cond[24]     = "Sincronizando...";
   bool     alert        = false;         // Alerta de tempestade / clima severo ativo
   char     alertMsg[56] = "TEMPESTADE / CHUVA FORTE EM VOTUPORANGA!";
-  // Gemini Gems (Automacoes Diarias via IA / RSS)
+  // Retrocompatibilidade (Gems / Resumo)
   bool     gemValid     = false;
-  char     gemTitle[34] = "Gem: Embarcados & IoT";
-  char     gemText[420] = "Conecte o Gemini ou execute uma Gem na aba Clima & Gemini IA do PC para receber resumos diarios aqui.";
+  char     gemTitle[34] = "News Feed";
+  char     gemText[420] = "Aguardando manchetes do Cyber Deck News Feed...";
   char     gemTime[10]  = "--:--";
-  char     gemModel[20] = "gemini-3.8-flash";
+  char     gemModel[20] = "RSS-LIVE";
 } wth;
+
+// ======================================= Modulo 1: Feed de Noticias (SCR_NEWS) =
+#define NEWS_QUEUE_MAX  8
+#define NEWS_ROTATE_MS  15000UL
+#define NEWS_SPR_W      296
+#define NEWS_SPR_H      26
+
+struct NewsItem {
+  char topic[28];
+  char headline[220];
+  char source[24];
+  char tm[10];
+};
+
+struct NewsFeedState {
+  bool     valid                  = false;
+  NewsItem queue[NEWS_QUEUE_MAX];
+  uint8_t  count                  = 0;
+  uint8_t  activeIdx              = 0;
+  uint32_t lastRotateMs           = 0;
+  int16_t  scrollX                = 0;
+  int16_t  headlinePxW            = 0;
+} newsSt;
+
+TFT_eSprite newsSpr      = TFT_eSprite(&tft);
+bool        newsSprReady = false;
+
+// ======================================= Modulo 2: O Terminal CYD (SCR_TERMINAL)
+#define TERM_MAX_LINES 14
+#define TERM_COLS      48
+
+struct TerminalState {
+  char     lines[TERM_MAX_LINES][TERM_COLS + 4];
+  uint8_t  count       = 0;
+  uint32_t totalLogged = 0;
+  bool     dirty       = true;
+  char     lastCmd[40] = "ready";
+} termSt;
 
 // Sanitiza strings UTF-8 caso algum caractere acentuado escape para o TFT_eSPI
 static void sanitizeAscii(char* dst, const char* src, size_t maxLen) {
@@ -672,7 +711,9 @@ bool     gLastMediaPlay = false;
 int32_t  gLastMediaFillW = -1;
 char     gLastWthSig[96] = "";
 char     gLastGemSig[160] = "";
+char     gLastNewsSig[240] = "";
 int8_t   gLastGemPage = -1;
+int8_t   gLastNewsRemainS = -1;
 bool     gLastStormAlert = false;
 uint8_t  gLastStormFlash = 255;
 
@@ -685,8 +726,11 @@ void resetDrawCache() {
   gLastMediaFillW = -1;
   gLastWthSig[0] = '\0';
   gLastGemSig[0] = '\0';
+  gLastNewsSig[0] = '\0';
   gLastGemPage = -1;
+  gLastNewsRemainS = -1;
   gLastStormFlash = 255;
+  termSt.dirty = true;
 }
 
 static void setLed(uint8_t r, uint8_t g, uint8_t b) {
@@ -956,7 +1000,8 @@ void drawHeader() {
   else if (currentScreen == SCR_PORTFOLIO)    scrTitle = "PORTFOLIO";
   else if (currentScreen == SCR_POMODORO)     scrTitle = "POMODORO";
   else if (currentScreen == SCR_MEDIA)        scrTitle = "PLAYER";
-  else if (currentScreen == SCR_WEATHER_GEMS) scrTitle = "CLIMA & IA";
+  else if (currentScreen == SCR_NEWS)         scrTitle = "NEWS FEED";
+  else if (currentScreen == SCR_TERMINAL)     scrTitle = "CYBER TERM";
 
   tft.setTextDatum(ML_DATUM);
   tft.setTextColor(C_ACCENT, C_ACCENT_DK);
@@ -2461,7 +2506,120 @@ static int wrapGemLines(const char* txt, char lines[][40], int maxLines, int max
   return lineCount;
 }
 
-void screenWeatherGemsStatic() {
+// ======================================= Modulo 1: SCR_NEWS (Tela 10) ======
+// Adiciona ou atualiza uma manchete na fila local do ESP32 (ate 8 manchetes)
+static void pushNewsToQueue(const char* topic, const char* headline, const char* src, const char* tm, bool makeActive) {
+  if (!headline || !headline[0]) return;
+
+  char cleanTopic[28], cleanHead[220], cleanSrc[24], cleanTm[10];
+  sanitizeAscii(cleanTopic, topic && topic[0] ? topic : "Noticias", sizeof(cleanTopic));
+  sanitizeAscii(cleanHead,  headline, sizeof(cleanHead));
+  sanitizeAscii(cleanSrc,   src && src[0] ? src : "RSS Live", sizeof(cleanSrc));
+  sanitizeAscii(cleanTm,    tm && tm[0] ? tm : "--:--", sizeof(cleanTm));
+
+  // Verifica se a manchete ja existe na fila para evitar duplicatas
+  for (uint8_t i = 0; i < newsSt.count; i++) {
+    if (strcmp(newsSt.queue[i].headline, cleanHead) == 0) {
+      strlcpy(newsSt.queue[i].topic,  cleanTopic, sizeof(newsSt.queue[i].topic));
+      strlcpy(newsSt.queue[i].source, cleanSrc,   sizeof(newsSt.queue[i].source));
+      strlcpy(newsSt.queue[i].tm,     cleanTm,    sizeof(newsSt.queue[i].tm));
+      if (makeActive && newsSt.activeIdx != i) {
+        newsSt.activeIdx    = i;
+        newsSt.lastRotateMs = millis();
+        newsSt.scrollX      = -20; // Pequena pausa inicial antes de deslizar
+      }
+      newsSt.valid = true;
+      return;
+    }
+  }
+
+  uint8_t slot = 0;
+  if (newsSt.count < NEWS_QUEUE_MAX) {
+    slot = newsSt.count++;
+  } else {
+    // Desloca fila e insere no fim
+    for (uint8_t i = 1; i < NEWS_QUEUE_MAX; i++) {
+      newsSt.queue[i - 1] = newsSt.queue[i];
+    }
+    slot = NEWS_QUEUE_MAX - 1;
+  }
+
+  strlcpy(newsSt.queue[slot].topic,    cleanTopic, sizeof(newsSt.queue[slot].topic));
+  strlcpy(newsSt.queue[slot].headline, cleanHead,  sizeof(newsSt.queue[slot].headline));
+  strlcpy(newsSt.queue[slot].source,   cleanSrc,   sizeof(newsSt.queue[slot].source));
+  strlcpy(newsSt.queue[slot].tm,       cleanTm,    sizeof(newsSt.queue[slot].tm));
+
+  if (makeActive || !newsSt.valid) {
+    newsSt.activeIdx    = slot;
+    newsSt.lastRotateMs = millis();
+    newsSt.scrollX      = -20;
+  }
+  newsSt.valid = true;
+}
+
+static const NewsItem* getActiveNewsItem() {
+  static const NewsItem defaultItem = {
+    "TECNOLOGIA",
+    "Sincronizando feed de manchetes em tempo real pelo Cyber Deck Agent...",
+    "CYD RSS",
+    "--:--"
+  };
+  if (!newsSt.valid || newsSt.count == 0) return &defaultItem;
+  if (newsSt.activeIdx >= newsSt.count) newsSt.activeIdx = 0;
+  return &newsSt.queue[newsSt.activeIdx];
+}
+
+// Desliza suavemente a manchete atual usando TFT_eSprite (28 FPS) e rotaciona a cada 15s
+void updateNewsHeadlineSprite() {
+  if (currentScreen != SCR_NEWS || !newsSprReady) return;
+
+  uint32_t now = millis();
+  if (newsSt.lastRotateMs == 0) newsSt.lastRotateMs = now;
+
+  // Troca de manchete automaticamente a cada 15 segundos (NEWS_ROTATE_MS)
+  if (newsSt.count > 1 && (now - newsSt.lastRotateMs >= NEWS_ROTATE_MS)) {
+    newsSt.activeIdx    = (newsSt.activeIdx + 1) % newsSt.count;
+    newsSt.lastRotateMs = now;
+    newsSt.scrollX      = -24;
+    gLastNewsSig[0]     = '\0'; // Forca atualizacao dos metadados e resumo
+  }
+
+  const NewsItem* item = getActiveNewsItem();
+
+  newsSpr.fillSprite(0x0421);
+  newsSpr.drawRect(0, 0, NEWS_SPR_W, NEWS_SPR_H, C_ACCENT_DK);
+  newsSpr.drawFastVLine(0, 0, NEWS_SPR_H, C_ACCENT);
+  newsSpr.drawFastVLine(1, 0, NEWS_SPR_H, C_ACCENT);
+
+  newsSpr.setTextDatum(ML_DATUM);
+  newsSpr.setTextColor(0xFFFF, 0x0421);
+
+  int drawX = 8 - max((int16_t)0, newsSt.scrollX);
+  int pxW = newsSpr.drawString(item->headline, drawX, NEWS_SPR_H / 2 + 1, 4);
+  newsSt.headlinePxW = pxW;
+
+  // Se o titulo for longo, faz loop continuo suave com separador ciano
+  int loopGap = 54;
+  if (pxW > (NEWS_SPR_W - 16)) {
+    int secondX = drawX + pxW + loopGap;
+    newsSpr.setTextColor(C_ACCENT, 0x0421);
+    newsSpr.drawString("///", drawX + pxW + 16, NEWS_SPR_H / 2 + 1, 2);
+    newsSpr.setTextColor(0xFFFF, 0x0421);
+    if (secondX < NEWS_SPR_W) {
+      newsSpr.drawString(item->headline, secondX, NEWS_SPR_H / 2 + 1, 4);
+    }
+    newsSt.scrollX += 2;
+    if (newsSt.scrollX >= (pxW + loopGap)) {
+      newsSt.scrollX = 0;
+    }
+  } else {
+    newsSt.scrollX = 0;
+  }
+
+  newsSpr.pushSprite(12, 130);
+}
+
+void screenNewsStatic() {
   renderBackground();
   drawHeader();
   drawClock();
@@ -2469,21 +2627,20 @@ void screenWeatherGemsStatic() {
   // Card Superior: Data Atual, Localizacao (Votuporanga) & Temperatura Regional
   drawModernCard(6, 27, 308, 76, "CLIMA REGIONAL & DATA ATUAL");
 
-  // Card Inferior: Gemini Gems (Automacoes Diarias via IA)
+  // Card Inferior: Feed de Noticias Customizavel (SCR_NEWS)
   drawModernCard(6, 106, 308, 112, "");
-  // Destaque especial Gemini IA no topo do card inferior
-  tft.fillRoundRect(12, 110, 16, 12, 3, 0x07FF);
+  tft.fillRoundRect(12, 110, 32, 13, 3, C_ACCENT);
   tft.setTextDatum(MC_DATUM);
-  tft.setTextColor(0x0000, 0x07FF);
-  tft.drawString("IA", 20, 116, 1);
+  tft.setTextColor(0x0000, C_ACCENT);
+  tft.drawString("NEWS", 28, 116, 1);
 
-  gLastWthSig[0] = '\0';
-  gLastGemSig[0] = '\0';
-  gLastGemPage   = -1;
+  gLastWthSig[0]  = '\0';
+  gLastNewsSig[0] = '\0';
+  gLastNewsRemainS = -1;
 }
 
-void screenWeatherGemsDynamic() {
-  // 1) Atualiza Card Superior (Clima, Data e Localidade) apenas quando mudam os dados
+void screenNewsDynamic() {
+  // 1) Atualiza Card Superior (Clima Regional, Data e Localidade)
   char wSig[96];
   snprintf(wSig, sizeof(wSig), "%s|%s|%s|%.1f|%.1f|%u|%.0f|%u|%u|%d|%s",
            wth.city, wth.dateFull, wth.dow, wth.temp, wth.feels,
@@ -2493,7 +2650,6 @@ void screenWeatherGemsDynamic() {
   if (strcmp(wSig, gLastWthSig) != 0) {
     strlcpy(gLastWthSig, wSig, sizeof(gLastWthSig));
 
-    // Pill de Data Completa + Dia da Semana no canto superior direito do Card 1
     char dtBadge[28];
     if (wth.dow[0] && wth.dow[0] != '-') {
       snprintf(dtBadge, sizeof(dtBadge), "%s %s", wth.dow, wth.dateFull);
@@ -2505,13 +2661,9 @@ void screenWeatherGemsDynamic() {
     tft.setTextColor(0xFFFF, scale565(C_ACCENT, 1, 5));
     tft.drawString(dtBadge, 246, 35, 1);
 
-    // Icone vetorial de clima a esquerda
     drawWeatherIcon(34, 68, wth.icon, wth.alert);
-
-    // Limpa miolo central do Card 1 (x = 62..202, y = 42..99)
     tft.fillRect(62, 42, 140, 58, C_CARD);
 
-    // Cidade / Localidade em destaque
     char cityLine[28];
     snprintf(cityLine, sizeof(cityLine), "LOCAL: %s", wth.city);
     for (int i = 0; cityLine[i]; i++) cityLine[i] = toupper((unsigned char)cityLine[i]);
@@ -2519,7 +2671,6 @@ void screenWeatherGemsDynamic() {
     tft.setTextColor(C_ACCENT, C_CARD);
     tft.drawString(cityLine, 64, 42, 1);
 
-    // Temperatura grande ao lado do icone
     uint16_t tCol = 0x07E0;
     if      (wth.alert || wth.temp >= 35.0f) tCol = 0xF800;
     else if (wth.temp >= 30.0f)              tCol = 0xFD20;
@@ -2533,7 +2684,6 @@ void screenWeatherGemsDynamic() {
     tft.drawCircle(64 + wT + 4, 57, 2, tCol);
     tft.drawString("C", 64 + wT + 9, 54, 2);
 
-    // Condicao + Min/Max
     char condLine[36];
     if (wth.valid) {
       snprintf(condLine, sizeof(condLine), "%.13s | %.0f/%.0fC", wth.cond, wth.tmin, wth.tmax);
@@ -2543,7 +2693,6 @@ void screenWeatherGemsDynamic() {
     tft.setTextColor(C_TEXT, C_CARD);
     tft.drawString(condLine, 64, 83, 2);
 
-    // Coluna Direita do Card 1: 3 Pílulas de Telemetria Climatica (x = 204..308)
     char p1[22], p2[22], p3[22];
     snprintf(p1, sizeof(p1), "SENSACAO: %.1fC", wth.feels);
     snprintf(p2, sizeof(p2), "UMID:%u%% CHV:%u%%", (unsigned)wth.hum, (unsigned)wth.rainProb);
@@ -2553,18 +2702,15 @@ void screenWeatherGemsDynamic() {
       snprintf(p3, sizeof(p3), "VENTO: %.0f km/h", wth.wind);
     }
 
-    // Pill 1
     tft.fillRoundRect(204, 44, 102, 16, 3, 0x1082);
     tft.setTextDatum(MC_DATUM);
     tft.setTextColor(C_TEXT, 0x1082);
     tft.drawString(p1, 255, 52, 1);
 
-    // Pill 2
     tft.fillRoundRect(204, 63, 102, 16, 3, 0x1082);
     tft.setTextColor(0x07FF, 0x1082);
     tft.drawString(p2, 255, 71, 1);
 
-    // Pill 3 (Alerta ou Vento)
     uint16_t p3Bg = wth.alert ? 0xF800 : 0x1082;
     uint16_t p3Fg = wth.alert ? 0xFFFF : C_DIM;
     tft.fillRoundRect(204, 82, 102, 16, 3, p3Bg);
@@ -2572,57 +2718,248 @@ void screenWeatherGemsDynamic() {
     tft.drawString(p3, 255, 90, 1);
   }
 
-  // 2) Atualiza Card Inferior (Gemini Gems — Automacao Diaria) com paginacao automatica
-  char gLines[12][40];
-  int totalLines = wrapGemLines(wth.gemText, gLines, 12, 36);
-  if (totalLines <= 0) totalLines = 1;
-  int totalPages = (totalLines + 3) / 4; // 4 linhas por pagina em Fonte 2
-  if (totalPages < 1) totalPages = 1;
-  int curPage = (totalPages > 1) ? (int)((millis() / 6000) % totalPages) : 0;
+  // 2) Atualiza Card Inferior: Feed de Noticias Customizavel (SCR_NEWS)
+  const NewsItem* item = getActiveNewsItem();
+  char nSig[240];
+  snprintf(nSig, sizeof(nSig), "%u|%u|%s|%s|%s",
+           (unsigned)newsSt.activeIdx, (unsigned)newsSt.count,
+           item->topic, item->source, item->headline);
 
-  char gSig[160];
-  snprintf(gSig, sizeof(gSig), "%s|%s|%.80s", wth.gemTitle, wth.gemTime, wth.gemText);
+  uint32_t elapsed = (newsSt.lastRotateMs > 0) ? (millis() - newsSt.lastRotateMs) : 0;
+  uint32_t clampedElapsed = (elapsed > (uint32_t)NEWS_ROTATE_MS) ? (uint32_t)NEWS_ROTATE_MS : elapsed;
+  int8_t remSec = (int8_t)constrain((int)(((uint32_t)NEWS_ROTATE_MS - clampedElapsed) / 1000U), 0, 15);
 
-  if (strcmp(gSig, gLastGemSig) != 0 || curPage != gLastGemPage) {
-    strlcpy(gLastGemSig, gSig, sizeof(gLastGemSig));
-    gLastGemPage = curPage;
+  if (strcmp(nSig, gLastNewsSig) != 0) {
+    strlcpy(gLastNewsSig, nSig, sizeof(gLastNewsSig));
 
-    // Cabecalho da Gem ativa
-    tft.fillRect(32, 109, 276, 15, C_CARD);
+    // Cabecalho do topico ativo (ex: [POLITICA] • Fonte)
+    tft.fillRect(48, 109, 196, 15, C_CARD);
+    char topBuf[44];
+    snprintf(topBuf, sizeof(topBuf), "[%s] %s", item->topic, item->source);
+    for (int i = 0; topBuf[i]; i++) topBuf[i] = toupper((unsigned char)topBuf[i]);
     tft.setTextDatum(ML_DATUM);
     tft.setTextColor(0x07FF, C_CARD);
-    char titBuf[34];
-    snprintf(titBuf, sizeof(titBuf), "%.28s", wth.gemTitle);
-    for (int i = 0; titBuf[i]; i++) titBuf[i] = toupper((unsigned char)titBuf[i]);
-    tft.drawString(titBuf, 32, 116, 1);
+    tft.drawString(topBuf, 48, 116, 1);
 
-    // Horario da Gem + Indicador de Pagina (ex: 14:10 [1/2])
-    char pgBuf[20];
-    snprintf(pgBuf, sizeof(pgBuf), "%s [%d/%d]", wth.gemTime, curPage + 1, totalPages);
-    tft.setTextDatum(MR_DATUM);
-    tft.setTextColor(C_DIM, C_CARD);
-    tft.drawString(pgBuf, 306, 116, 1);
-
-    // Linha divisoria sutil abaixo do titulo da Gem
     tft.drawFastHLine(12, 125, 296, C_CARD_HI);
 
-    // Corpo do texto da Gem (4 linhas em Fonte 2 para leitura nitida a distancia)
-    tft.fillRect(12, 127, 296, 86, C_CARD);
+    // Resumo em 2 linhas estaticas abaixo do Sprite deslizante para leitura confortavel
+    char wrapped[4][40];
+    int nLines = wrapGemLines(item->headline, wrapped, 4, 37);
+    tft.fillRect(12, 160, 296, 52, C_CARD);
     tft.setTextDatum(TL_DATUM);
-    int startLine = curPage * 4;
-    for (int row = 0; row < 4; row++) {
-      int idx = startLine + row;
-      if (idx >= totalLines) break;
-      const char* ln = gLines[idx];
-      // Destaca topicos iniciados por '-' ou '*' ou numeros com a cor de destaque
-      if (ln[0] == '-' || ln[0] == '*' || (ln[0] >= '1' && ln[0] <= '9' && ln[1] == '.')) {
-        tft.setTextColor(0xFFFF, C_CARD);
-      } else {
-        tft.setTextColor(0xDEFB, C_CARD);
-      }
-      tft.drawString(ln, 14, 129 + row * 20, 2);
+    for (int r = 0; r < min(nLines, 3); r++) {
+      tft.setTextColor(r == 0 ? 0xDEFB : C_DIM, C_CARD);
+      tft.drawString(wrapped[r], 14, 161 + r * 16, 2);
     }
   }
+
+  // Contador regressivo de 15s + posicao da fila no canto superior direito do Card News
+  if (remSec != gLastNewsRemainS) {
+    gLastNewsRemainS = remSec;
+    char metaBuf[22];
+    uint8_t tot = max((uint8_t)1, newsSt.count);
+    uint8_t cur = (newsSt.activeIdx % tot) + 1;
+    snprintf(metaBuf, sizeof(metaBuf), "%u/%u • %02ds", (unsigned)cur, (unsigned)tot, (int)remSec);
+    tft.fillRect(244, 109, 64, 15, C_CARD);
+    tft.setTextDatum(MR_DATUM);
+    tft.setTextColor(C_WARN, C_CARD);
+    tft.drawString(metaBuf, 306, 116, 1);
+  }
+}
+
+// ======================================= Modulo 2: SCR_TERMINAL (Tela 11) ===
+static void appendRawTerminalLine(const char* s) {
+  if (termSt.count < TERM_MAX_LINES) {
+    strlcpy(termSt.lines[termSt.count], s, sizeof(termSt.lines[0]));
+    termSt.count++;
+  } else {
+    // Scroll vertical: desloca todas as linhas para cima e escreve na ultima
+    for (int i = 1; i < TERM_MAX_LINES; i++) {
+      strlcpy(termSt.lines[i - 1], termSt.lines[i], sizeof(termSt.lines[0]));
+    }
+    strlcpy(termSt.lines[TERM_MAX_LINES - 1], s, sizeof(termSt.lines[0]));
+  }
+  termSt.totalLogged++;
+  termSt.dirty = true;
+}
+
+// Funcao publica pedida na especificacao: faz o texto rolar para cima conforme novas linhas chegam
+void log_to_terminal(String text) {
+  char cleanBuf[512];
+  sanitizeAscii(cleanBuf, text.c_str(), sizeof(cleanBuf));
+  if (!cleanBuf[0]) return;
+
+  int len = strlen(cleanBuf);
+  int pos = 0;
+  while (pos < len) {
+    while (pos < len && (cleanBuf[pos] == '\r')) pos++;
+    if (pos >= len) break;
+    if (cleanBuf[pos] == '\n') {
+      pos++;
+      continue;
+    }
+
+    // Encontra o proximo '\n' ou quebra em TERM_COLS (48 colunas monospace)
+    int lineEnd = pos;
+    while (lineEnd < len && cleanBuf[lineEnd] != '\n' && cleanBuf[lineEnd] != '\r' && (lineEnd - pos) < TERM_COLS) {
+      lineEnd++;
+    }
+
+    char chunk[TERM_COLS + 4];
+    int copyLen = lineEnd - pos;
+    memcpy(chunk, cleanBuf + pos, copyLen);
+    chunk[copyLen] = '\0';
+    appendRawTerminalLine(chunk);
+
+    pos = lineEnd;
+    if (pos < len && cleanBuf[pos] == '\n') pos++;
+  }
+}
+
+void clearTerminal() {
+  termSt.count = 0;
+  termSt.totalLogged = 0;
+  log_to_terminal("CYD CYBER DECK OS v4.0 [ESP32-2432S028R]");
+  log_to_terminal("Console pronto. Comandos: ping, fetch, docker, wifi scan");
+  termSt.dirty = true;
+}
+
+void screenTerminalStatic() {
+  if (isGifPlaying) {
+    gif.close();
+    isGifPlaying = false;
+  }
+  tft.fillScreen(0x0000); // Tela preta classica de terminal
+  drawHeader();
+  drawClock();
+
+  // Moldura Cyber Deck Verde Fosforo (0x07E0)
+  const int tx = 4, ty = 26, tw = 312, th = 193;
+  tft.fillRect(tx, ty, tw, th, 0x0000);
+  tft.drawRect(tx, ty, tw, th, 0x07E0);
+
+  // Barra de titulo interna do Terminal (root@cyd-cyberdeck:~#)
+  tft.fillRect(tx + 1, ty + 1, tw - 2, 13, 0x0120);
+  tft.drawFastHLine(tx + 1, ty + 14, tw - 2, 0x03E0);
+  tft.setTextDatum(ML_DATUM);
+  tft.setTextColor(0x07E0, 0x0120);
+  tft.drawString("root@cyd-deck:~# ttyUSB0 [115200]", tx + 6, ty + 7, 1);
+
+  // Barra inferior de prompt interativo
+  tft.drawFastHLine(tx + 1, ty + th - 14, tw - 2, 0x0120);
+
+  if (termSt.count == 0) {
+    clearTerminal();
+  }
+  termSt.dirty = true;
+}
+
+void screenTerminalDynamic() {
+  const int tx = 4, ty = 26, tw = 312, th = 193;
+
+  // Redesenha o buffer de linhas rolantes apenas quando novas linhas chegam
+  if (termSt.dirty) {
+    termSt.dirty = false;
+
+    // Atualiza contador de linhas no topo direito da janela do terminal
+    char lnBuf[18];
+    snprintf(lnBuf, sizeof(lnBuf), "LN:%lu", (unsigned long)termSt.totalLogged);
+    tft.fillRect(tx + tw - 66, ty + 2, 62, 11, 0x0120);
+    tft.setTextDatum(MR_DATUM);
+    tft.setTextColor(0x07FF, 0x0120);
+    tft.drawString(lnBuf, tx + tw - 6, ty + 7, 1);
+
+    // Area util das 14 linhas: y = 42..196 (11 px por linha, Fonte 1 6x8 monospace)
+    tft.fillRect(tx + 2, ty + 16, tw - 4, th - 31, 0x0000);
+    tft.setTextDatum(TL_DATUM);
+
+    for (uint8_t i = 0; i < termSt.count; i++) {
+      const char* ln = termSt.lines[i];
+      uint16_t fg = 0x07E0; // Verde fosforo classico por padrao
+      if (ln[0] == '$' || (ln[0] == '>' && ln[1] == ' ')) {
+        fg = 0x07FF; // Ciano brilhante para comandos digitados
+      } else if (strstr(ln, "[ERR]") || strstr(ln, "FAIL") || strstr(ln, "OFFLINE") || strstr(ln, "ERRO")) {
+        fg = 0xF800; // Vermelho para erros/falhas
+      } else if (strstr(ln, "[WIFI]") || strstr(ln, "CYD CYBER DECK") || strstr(ln, "WARN")) {
+        fg = 0xFFE0; // Amarelo para cabecalhos e scan Wi-Fi
+      } else if (strstr(ln, "200 OK") || strstr(ln, "[OK]")) {
+        fg = 0x07E0; // Verde brilhante
+      }
+      tft.setTextColor(fg, 0x0000);
+      tft.drawString(ln, tx + 6, ty + 17 + i * 11, 1);
+    }
+  }
+
+  // Prompt inferior com cursor verde piscante (efeito terminal autentico)
+  bool cursorOn = ((millis() / 450) % 2 == 0);
+  char promptBuf[54];
+  snprintf(promptBuf, sizeof(promptBuf), "cyd@deck:~$ %.30s%s",
+           termSt.lastCmd, cursorOn ? "_" : " ");
+  tft.fillRect(tx + 3, ty + th - 13, tw - 6, 11, 0x0000);
+  tft.setTextDatum(ML_DATUM);
+  tft.setTextColor(0x07E0, 0x0000);
+  tft.drawString(promptBuf, tx + 6, ty + th - 7, 1);
+}
+
+// Executa Wi-Fi Scan nativo no ESP32 e imprime os resultados (SSID e RSSI) direto na SCR_TERMINAL
+void runWifiScanOnTerminal() {
+  strlcpy(termSt.lastCmd, "wifi scan", sizeof(termSt.lastCmd));
+  if (currentScreen != SCR_TERMINAL) {
+    currentScreen = SCR_TERMINAL;
+    prefs.putUChar("screen", currentScreen);
+    resetDrawCache();
+    screenTerminalStatic();
+    needFullDraw = false;
+  }
+
+  log_to_terminal("$ wifi scan");
+  log_to_terminal("[WIFI] Escaneando redes 2.4GHz no ESP32...");
+  screenTerminalDynamic(); // Exibe mensagem imediatamente antes do bloqueio do radio
+  Serial.println("TERM_LOG:[WIFI] Escaneando redes 2.4GHz no hardware ESP32...");
+
+  WiFi.mode(WIFI_STA);
+  WiFi.disconnect(true);
+  delay(40);
+
+  int n = WiFi.scanNetworks(false, false);
+  if (n <= 0) {
+    log_to_terminal("[WIFI] Nenhuma rede Wi-Fi encontrada (0 APs).");
+    Serial.println("TERM_LOG:[WIFI] Nenhuma rede Wi-Fi encontrada (0 APs).");
+  } else {
+    char hdr[48];
+    snprintf(hdr, sizeof(hdr), "[WIFI] %d redes encontradas (SSID / RSSI):", n);
+    log_to_terminal(hdr);
+    Serial.printf("TERM_LOG:%s\n", hdr);
+
+    int maxShow = min(n, 11);
+    for (int i = 0; i < maxShow; i++) {
+      String ssidStr = WiFi.SSID(i);
+      char cleanSsid[24];
+      sanitizeAscii(cleanSsid, ssidStr.c_str(), sizeof(cleanSsid));
+      if (!cleanSsid[0]) strlcpy(cleanSsid, "<OCULTA>", sizeof(cleanSsid));
+
+      int32_t rssi = WiFi.RSSI(i);
+      int32_t ch   = WiFi.channel(i);
+      bool openNet = (WiFi.encryptionType(i) == WIFI_AUTH_OPEN);
+
+      char row[52];
+      snprintf(row, sizeof(row), "%02d) %-18.18s %4lddBm CH%02ld %s",
+               i + 1, cleanSsid, (long)rssi, (long)ch, openNet ? "OPEN" : "WPA");
+      log_to_terminal(row);
+      Serial.printf("TERM_LOG:%s\n", row);
+    }
+    if (n > maxShow) {
+      char more[44];
+      snprintf(more, sizeof(more), "... +%d redes adicionais omitidas", n - maxShow);
+      log_to_terminal(more);
+      Serial.printf("TERM_LOG:%s\n", more);
+    }
+  }
+
+  WiFi.scanDelete();
+  WiFi.mode(WIFI_OFF);
+  screenTerminalDynamic();
 }
 
 // ================================================= Serial / Protocolo JSON =
@@ -2630,9 +2967,38 @@ void applyJson(const char *json) {
   JsonDocument doc;
   if (deserializeJson(doc, json)) return;
 
-  // 1) Comando para listar arquivos do Cartao SD
+  // 1) Comandos nativos delegados para o ESP32 ("cmd")
   if (doc["cmd"] == "list_sd") {
     listSdFilesToSerial();
+    return;
+  }
+  if (doc["cmd"] == "wifi_scan") {
+    runWifiScanOnTerminal();
+    return;
+  }
+  if (doc["cmd"] == "term_clear") {
+    clearTerminal();
+    return;
+  }
+  if (doc["cmd"] == "esp_info") {
+    if (currentScreen != SCR_TERMINAL) {
+      currentScreen = SCR_TERMINAL;
+      prefs.putUChar("screen", currentScreen);
+      resetDrawCache();
+      screenTerminalStatic();
+      needFullDraw = false;
+    }
+    strlcpy(termSt.lastCmd, "esp_info", sizeof(termSt.lastCmd));
+    log_to_terminal("$ esp_info");
+    char b1[48], b2[48];
+    snprintf(b1, sizeof(b1), "[ESP32] Heap Livre: %lu B | Freq: %lu MHz",
+             (unsigned long)ESP.getFreeHeap(), (unsigned long)ESP.getCpuFreqMHz());
+    snprintf(b2, sizeof(b2), "[ESP32] Uptime: %lu s | SD: %s | Pkts: %lu",
+             (unsigned long)(millis() / 1000UL), hasSD ? "OK" : "AUSENTE", (unsigned long)packets);
+    log_to_terminal(b1);
+    log_to_terminal(b2);
+    Serial.printf("TERM_LOG:%s\n", b1);
+    Serial.printf("TERM_LOG:%s\n", b2);
     return;
   }
 
@@ -2735,7 +3101,8 @@ void applyJson(const char *json) {
     } else if (vScr.is<const char*>()) {
       String s = String(vScr.as<const char*>());
       s.toLowerCase();
-      if (s.indexOf("wth") >= 0 || s.indexOf("clim") >= 0 || s.indexOf("gem") >= 0 || s.indexOf("ia") >= 0 || s.indexOf("vot") >= 0) newScr = SCR_WEATHER_GEMS;
+      if (s.indexOf("term") >= 0 || s.indexOf("deck") >= 0 || s.indexOf("cmd") >= 0 || s.indexOf("sh") >= 0) newScr = SCR_TERMINAL;
+      else if (s.indexOf("news") >= 0 || s.indexOf("notic") >= 0 || s.indexOf("wth") >= 0 || s.indexOf("clim") >= 0 || s.indexOf("gem") >= 0 || s.indexOf("vot") >= 0) newScr = SCR_NEWS;
       else if (s.indexOf("pomo") >= 0 || s.indexOf("foco") >= 0) newScr = SCR_POMODORO;
       else if (s.indexOf("med") >= 0 || s.indexOf("spot") >= 0 || s.indexOf("yt") >= 0 || s.indexOf("mus") >= 0) newScr = SCR_MEDIA;
       else if (s.indexOf("port") >= 0 || s.indexOf("cart") >= 0 || s.indexOf("patr") >= 0) newScr = SCR_PORTFOLIO;
@@ -3017,11 +3384,69 @@ void applyJson(const char *json) {
 
   JsonVariant jg = root["gem"];
   if (!jg.isNull()) {
-    if (!jg["tit"].isNull()) sanitizeAscii(wth.gemTitle, jg["tit"] | "Gem: Embarcados & IoT", sizeof(wth.gemTitle));
+    if (!jg["tit"].isNull()) sanitizeAscii(wth.gemTitle, jg["tit"] | "News Feed", sizeof(wth.gemTitle));
     if (!jg["txt"].isNull()) sanitizeAscii(wth.gemText,  jg["txt"] | "", sizeof(wth.gemText));
     if (!jg["tm"].isNull())  sanitizeAscii(wth.gemTime,  jg["tm"]  | "--:--", sizeof(wth.gemTime));
-    if (!jg["mdl"].isNull()) sanitizeAscii(wth.gemModel, jg["mdl"] | "gemini-3.8-flash", sizeof(wth.gemModel));
+    if (!jg["mdl"].isNull()) sanitizeAscii(wth.gemModel, jg["mdl"] | "RSS-LIVE", sizeof(wth.gemModel));
     wth.gemValid = true;
+    // Se nenhuma noticia dedicada foi recebida ainda, popula a fila a partir do resumo
+    if (!newsSt.valid && wth.gemText[0]) {
+      pushNewsToQueue(wth.gemTitle, wth.gemText, wth.gemModel, wth.gemTime, true);
+    }
+  }
+
+  // 7.6) Processa Modulo 1: Feed de Noticias Customizavel ("news")
+  JsonVariant jn = root["news"];
+  if (!jn.isNull()) {
+    // Se enviou uma fila completa de manchetes ("queue")
+    if (jn["queue"].is<JsonArray>()) {
+      JsonArray qArr = jn["queue"].as<JsonArray>();
+      for (JsonVariant item : qArr) {
+        const char* tp = item["topic"]    | (jn["topic"] | "Noticias");
+        const char* hl = item["headline"] | "";
+        const char* sr = item["src"]      | "News RSS";
+        const char* tm = item["tm"]       | "--:--";
+        if (hl && hl[0]) {
+          pushNewsToQueue(tp, hl, sr, tm, false);
+        }
+      }
+    }
+    // Manchete principal em destaque {"news": {"topic": "Politica", "headline": "Titulo da noticia aqui..."}}
+    const char* topic    = jn["topic"]    | "Noticias";
+    const char* headline = jn["headline"] | "";
+    const char* src      = jn["src"]      | "News API";
+    const char* tm       = jn["tm"]       | "--:--";
+    bool forceActive     = jn["force"]    | true;
+    if (headline && headline[0]) {
+      pushNewsToQueue(topic, headline, src, tm, forceActive);
+    }
+  }
+
+  // 7.7) Processa Modulo 2: O Terminal CYD ("term")
+  JsonVariant jt = root["term"];
+  if (!jt.isNull()) {
+    if (jt["clear"] | false) {
+      clearTerminal();
+    }
+    if (!jt["cmd"].isNull()) {
+      sanitizeAscii(termSt.lastCmd, jt["cmd"] | "cmd", sizeof(termSt.lastCmd));
+    }
+    if ((jt["auto_scr"] | false) && currentScreen != SCR_TERMINAL) {
+      currentScreen = SCR_TERMINAL;
+      prefs.putUChar("screen", currentScreen);
+      needFullDraw = true;
+    }
+    if (!jt["line"].isNull()) {
+      const char* ln = jt["line"] | "";
+      if (ln && ln[0]) log_to_terminal(String(ln));
+    }
+    if (jt["lines"].is<JsonArray>()) {
+      JsonArray lArr = jt["lines"].as<JsonArray>();
+      for (JsonVariant v : lArr) {
+        const char* ln = v.as<const char*>();
+        if (ln && ln[0]) log_to_terminal(String(ln));
+      }
+    }
   }
 
   // 8) Processa Bloco de Alertas Fisicos ("alrt") - Buzzer e LED RGB
@@ -3102,6 +3527,16 @@ void setup() {
     tickerSpr.setTextWrap(false, false);
   }
 
+  // Inicializa Sprite de 296x26 para o Feed de Noticias Deslizante (SCR_NEWS)
+  newsSpr.setColorDepth(16);
+  if (newsSpr.createSprite(NEWS_SPR_W, NEWS_SPR_H) != nullptr) {
+    newsSprReady = true;
+    newsSpr.setTextWrap(false, false);
+  }
+
+  // Inicializa buffer do Terminal Cyber Deck (SCR_TERMINAL)
+  clearTerminal();
+
   // Inicializa decodificador JPEG para imagens estaticas do Cartao SD
   TJpgDec.setJpgScale(1);
   TJpgDec.setCallback(tft_output);
@@ -3167,7 +3602,8 @@ void loop() {
     else if (currentScreen == SCR_PORTFOLIO)    screenPortfolioStatic();
     else if (currentScreen == SCR_POMODORO)     screenPomodoroStatic();
     else if (currentScreen == SCR_MEDIA)        screenMediaStatic();
-    else if (currentScreen == SCR_WEATHER_GEMS) screenWeatherGemsStatic();
+    else if (currentScreen == SCR_NEWS)         screenNewsStatic();
+    else if (currentScreen == SCR_TERMINAL)     screenTerminalStatic();
     needFullDraw = false;
   }
 
@@ -3178,11 +3614,14 @@ void loop() {
     }
   }
 
-  // Atualizacao fluida do Letreiro Infinito da Bolsa (Ticker Tape ~28 FPS)
+  // Atualizacao fluida do Letreiro Infinito da Bolsa e do Sprite de Noticias (~28 FPS)
   static uint32_t lastTicker = 0;
   if (millis() - lastTicker >= 35) {
     lastTicker = millis();
     updateTickerTape();
+    if (currentScreen == SCR_NEWS) {
+      updateNewsHeadlineSprite();
+    }
   }
 
   // Atualizacao dinamica das metricas (sem piscar o fundo!)
@@ -3199,7 +3638,8 @@ void loop() {
     else if (currentScreen == SCR_PORTFOLIO)    screenPortfolioDynamic();
     else if (currentScreen == SCR_POMODORO)     screenPomodoroDynamic();
     else if (currentScreen == SCR_MEDIA)        screenMediaDynamic();
-    else if (currentScreen == SCR_WEATHER_GEMS) screenWeatherGemsDynamic();
+    else if (currentScreen == SCR_NEWS)         screenNewsDynamic();
+    else if (currentScreen == SCR_TERMINAL)     screenTerminalDynamic();
 
     drawClock();
     drawStormAlertBanner();

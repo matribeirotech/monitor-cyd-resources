@@ -85,6 +85,36 @@ def get_resource_path(relative_path: str) -> str:
         return p2
     return p
 
+
+def get_app_icon_paths() -> tuple[str, str]:
+    """
+    Resolve os caminhos absolutos da nova identidade visual do projeto:
+      - `icone-cyd-resource-monitor.ico` (Ícone nativo da janela Windows / PyInstaller / System Tray)
+      - `icone-cyd-resource-monitor.png` (Logotipo PNG de alta resolução para AppBar e NavigationRail)
+    """
+    ico_candidates = [
+        os.path.join("imgs", "icone-cyd-resource-monitor.ico"),
+        os.path.join("preview", "5.0", "icone-cyd-resource-monitor.ico"),
+        os.path.join("imgs", "imgsCYD.ico"),
+    ]
+    png_candidates = [
+        os.path.join("imgs", "icone-cyd-resource-monitor.png"),
+        os.path.join("preview", "5.0", "icone-cyd-resource-monitor.png"),
+    ]
+    ico_resolved = ""
+    for rel in ico_candidates:
+        cand = get_resource_path(rel)
+        if os.path.exists(cand):
+            ico_resolved = os.path.abspath(cand)
+            break
+    png_resolved = ""
+    for rel in png_candidates:
+        cand = get_resource_path(rel)
+        if os.path.exists(cand):
+            png_resolved = os.path.abspath(cand)
+            break
+    return ico_resolved, png_resolved
+
 # Fuso horario de Brasilia (UTC-3)
 try:
     from zoneinfo import ZoneInfo
@@ -147,7 +177,14 @@ def _is_steam_game(exe_path):
 # --------------------------------------------------------------- helpers ----
 def run(cmd, timeout=2):
     try:
-        out = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout)
+        cflags = getattr(subprocess, "CREATE_NO_WINDOW", 0) if IS_WINDOWS else 0
+        out = subprocess.run(
+            cmd,
+            capture_output=True,
+            text=True,
+            timeout=timeout,
+            creationflags=cflags,
+        )
         return out.stdout.strip() if out.returncode == 0 else None
     except Exception:
         return None
@@ -248,12 +285,37 @@ CPU_TEMP_KEYS = ("k10temp", "zenpower", "coretemp", "cpu_thermal",
 CPU_LABEL_HINTS = ("tctl", "tdie", "package", "cpu", "core 0", "composite")
 
 
+_lhm_web_cache_data = None
+_lhm_web_cache_ts = 0.0
+_lhm_web_backoff_until = 0.0
+_lhm_web_lock = threading.Lock()
+
+
 def _get_lhm_web_data():
-    """Consulta o servidor web do LibreHardwareMonitor na porta 8085."""
+    """
+    Consulta o servidor web do LibreHardwareMonitor na porta 8085 com cache de 1.5s
+    e backoff inteligente de 30s caso a porta esteja fechada (evita delay de 800ms de SYN no Windows!).
+    """
+    global _lhm_web_cache_data, _lhm_web_cache_ts, _lhm_web_backoff_until
+    now = time.monotonic()
+    with _lhm_web_lock:
+        if now < _lhm_web_backoff_until:
+            return None
+        if _lhm_web_cache_data is not None and (now - _lhm_web_cache_ts) < 1.5:
+            return _lhm_web_cache_data
+
     try:
-        with urllib.request.urlopen("http://localhost:8085/data.json", timeout=0.8) as url:
-            return json.loads(url.read().decode("utf-8", errors="ignore"))
+        with urllib.request.urlopen("http://127.0.0.1:8085/data.json", timeout=0.25) as url:
+            data = json.loads(url.read().decode("utf-8", errors="ignore"))
+            with _lhm_web_lock:
+                _lhm_web_cache_data = data
+                _lhm_web_cache_ts = time.monotonic()
+                _lhm_web_backoff_until = 0.0
+            return data
     except Exception:
+        with _lhm_web_lock:
+            _lhm_web_cache_data = None
+            _lhm_web_backoff_until = time.monotonic() + 30.0
         return None
 
 
@@ -518,34 +580,59 @@ def gpu_stats(web_data=None):
 
 # --------------------------------------------------------------- coletor ----
 class Collector:
-    def __init__(self, game_processes=()):
+    """
+    Coletor de Telemetria de Hardware Otimizado com Cache & Background Worker:
+      - Isola leituras pesadas (WMI, LibreHardwareMonitor, nvidia-smi e varredura de processos)
+        em uma thread daemon dedicada com cache multinível:
+          * Contadores leves (CPU%, RAM%, Disco%, Rede RX/TX): 1.0s
+          * Sensores térmicos / GPU (WMI / LHM / nvidia-smi): 2.0s
+          * Top processos & detecção de jogos/RTSS: 6.0s
+      - `sample_sys()` retorna o snapshot em cache instantaneamente (< 0.02 ms, O(1)),
+        eliminando picos de CPU/RAM no agente e impedindo qualquer travamento na UI ou Serial.
+    """
+
+    def __init__(self, game_processes=(), poll_interval: float = 1.0):
         psutil.cpu_percent(interval=None)
+        self._lock = threading.Lock()
+        self.poll_interval = max(0.5, float(poll_interval))
         self.host = socket.gethostname()[:14]
         self.prev_net = psutil.net_io_counters()
         self.prev_disk = psutil.disk_io_counters()
         self.prev_t = time.time()
+        self.boot_t = psutil.boot_time()
         self.cores = psutil.cpu_count(logical=True)
         self.game_processes = tuple(g.lower() for g in DEFAULT_GAME_PROCESSES + tuple(game_processes))
+
+        self._last_heavy_scan = 0.0
         self._last_proc_scan = 0.0
+        self._cached_cput = None
+        self._cached_fan = None
+        self._cached_gpu = {"gpu": 0.0, "gpuname": None}
         self._cached_top = ""
         self._cached_gaming = False
+        self._cached_sys: dict = {}
+        self._running = True
 
-    def sample_sys(self):
-        """Coleta todas as metricas do sistema para o objeto 'sys' do JSON."""
+        # Popula o primeiro snapshot imediatamente (modo rápido) e inicia o worker em background
+        self._collect_once_internal(include_heavy=True)
+        threading.Thread(target=self._bg_worker, daemon=True, name="HardwareCollectorWorker").start()
+
+    def stop(self):
+        self._running = False
+
+    def _collect_once_internal(self, include_heavy: bool = False):
         now = time.time()
         dt = max(now - self.prev_t, 0.1)
 
-        web_data = _get_lhm_web_data()
         cpu = psutil.cpu_percent(interval=None)
-        cput = cpu_temperature(web_data)
         freq = psutil.cpu_freq()
         vm = psutil.virtual_memory()
         sw = psutil.swap_memory()
         du = psutil.disk_usage(SYSTEM_ROOT)
 
         net = psutil.net_io_counters()
-        rx = (net.bytes_recv - self.prev_net.bytes_recv) / dt / 1048576.0
-        tx = (net.bytes_sent - self.prev_net.bytes_sent) / dt / 1048576.0
+        rx = (net.bytes_recv - self.prev_net.bytes_recv) / dt / 1048576.0 if net and self.prev_net else 0.0
+        tx = (net.bytes_sent - self.prev_net.bytes_sent) / dt / 1048576.0 if net and self.prev_net else 0.0
         self.prev_net = net
 
         dio = psutil.disk_io_counters()
@@ -557,8 +644,19 @@ class Collector:
         self.prev_disk = dio
         self.prev_t = now
 
-        # Varredura de processos com cache de 5s para manter uso de CPU quase zero
-        if now - self._last_proc_scan >= 5.0:
+        # Camada 2: Sensores pesados (WMI / LHM / GPU / Temperatura) em cache de 2.0s
+        if include_heavy or (now - self._last_heavy_scan >= 2.0):
+            self._last_heavy_scan = now
+            try:
+                web_data = _get_lhm_web_data()
+                self._cached_cput = cpu_temperature(web_data)
+                self._cached_gpu = gpu_stats(web_data) or {"gpu": 0.0, "gpuname": None}
+                self._cached_fan = fan_rpm() if not web_data else None
+            except Exception:
+                pass
+
+        # Camada 3: Varredura de processos e jogos em cache de 6.0s
+        if now - self._last_proc_scan >= 6.0:
             self._last_proc_scan = now
             top = ""
             gaming = False
@@ -570,8 +668,10 @@ class Collector:
                         procs.append((p.info["cpu_percent"], name))
                     if not gaming:
                         low = name.lower()
-                        gaming = (any(g in low for g in self.game_processes)
-                                  or _is_steam_game(p.info.get("exe")))
+                        gaming = (
+                            any(g in low for g in self.game_processes)
+                            or _is_steam_game(p.info.get("exe"))
+                        )
                 if procs:
                     top = max(procs)[1][:12]
             except Exception:
@@ -582,8 +682,8 @@ class Collector:
         br = brasilia_now()
         sys_data = {
             "cpu": round(cpu, 1),
-            "temp": cput,
-            "cput": cput,
+            "temp": self._cached_cput,
+            "cput": self._cached_cput,
             "cpuf": int(freq.current) if freq and freq.current else None,
             "cores": self.cores,
             "load": load_average(),
@@ -595,19 +695,53 @@ class Collector:
             "swap": round(sw.percent, 1),
             "dsk": round(du.percent, 1),
             "dskf": round(du.free / 1073741824.0, 1),
-            "dr": round(dr, 2),
-            "dw": round(dw, 2),
-            "rx": round(rx, 2),
-            "tx": round(tx, 2),
-            "up": int(now - psutil.boot_time()),
-            "fan": fan_rpm() if not web_data else None,
+            "dr": round(max(0.0, dr), 2),
+            "dw": round(max(0.0, dw), 2),
+            "rx": round(max(0.0, rx), 2),
+            "tx": round(max(0.0, tx), 2),
+            "up": int(now - self.boot_t),
+            "fan": self._cached_fan,
             "host": self.host,
             "top": self._cached_top,
             "game": self._cached_gaming,
             "fps": get_rtss_fps() if self._cached_gaming else None,
         }
-        sys_data.update(gpu_stats(web_data))
-        return {k: v for k, v in sys_data.items() if v is not None}
+        sys_data.update(self._cached_gpu)
+        cleaned = {k: v for k, v in sys_data.items() if v is not None}
+        with self._lock:
+            self._cached_sys = cleaned
+
+    def _bg_worker(self):
+        # Inicializa COM para esta thread caso o WMI seja consultado no Windows
+        if IS_WINDOWS:
+            try:
+                import pythoncom
+                pythoncom.CoInitialize()
+            except Exception:
+                pass
+        while self._running:
+            t0 = time.monotonic()
+            try:
+                self._collect_once_internal(include_heavy=False)
+            except Exception:
+                pass
+            elapsed = time.monotonic() - t0
+            time.sleep(max(0.25, self.poll_interval - elapsed))
+
+    def sample_sys(self) -> dict:
+        """Retorna instantaneamente (< 0.02ms) o snapshot de telemetria em cache sem bloquear I/O."""
+        with self._lock:
+            if not self._cached_sys:
+                pass
+            else:
+                snap = dict(self._cached_sys)
+                br = brasilia_now()
+                snap["hh"] = br.hour
+                snap["mm"] = br.minute
+                return snap
+        self._collect_once_internal(include_heavy=True)
+        with self._lock:
+            return dict(self._cached_sys)
 
 
 # ---------------------------------------------------------------- serial ----
@@ -624,6 +758,303 @@ def find_port():
         if re.search(r"ttyUSB|ttyACM|^COM\d+$", p.device):
             return p.device
     return None
+
+
+class SerialManager:
+    """
+    Gerenciador Dedicado de Comunicação Serial Assíncrona (115200 bps):
+      - Isola 100% do I/O de porta COM (`pyserial`) em uma thread exclusiva (`SerialManagerThread`).
+      - O loop principal do Flet NUNCA espera a resposta da CYD nem bloqueia em `ser.write()`.
+      - Faz o flush explícito de buffers (`reset_input_buffer`, `reset_output_buffer`, `flush`)
+        e opera com 3 canais de prioridade:
+          1. `transfer_queue`: Blocos de imagem/capa para o Cartão SD (controle por ACK).
+          2. `event_queue`: Mudanças de tela, cor, brilho, alertas e comandos de Terminal (< 20ms).
+          3. `_latest_telemetry`: Slot atômico de último valor para telemetria (descarta frames velhos
+             automaticamente caso a porta esteja ocupada, eliminando lag acumulado!).
+    """
+
+    def __init__(
+        self,
+        preferred_port: str = None,
+        baud: int = BAUD,
+        on_rx_line=None,
+        on_status_change=None,
+        on_log=None,
+        auto_start: bool = True,
+    ):
+        self.preferred_port = preferred_port
+        self.baud = int(baud)
+        self.on_rx_line = on_rx_line
+        self.on_status_change = on_status_change
+        self.on_log = on_log
+
+        self.event_queue: queue.Queue = queue.Queue()
+        self.transfer_queue: queue.Queue = queue.Queue()
+        self.ack_event = threading.Event()
+        self.last_ack = {"val": None}
+
+        self._telemetry_lock = threading.Lock()
+        self._latest_telemetry: dict | None = None
+
+        self._status_lock = threading.Lock()
+        self._status = {
+            "connected": False,
+            "state": "SEARCHING",
+            "port": "",
+            "baud": self.baud,
+            "tx_packets": 0,
+            "rx_packets": 0,
+            "tx_bytes_sec": 0,
+            "last_error": "",
+        }
+        self._running = False
+        self._reconnect_flag = threading.Event()
+        self._thread: threading.Thread | None = None
+
+        if auto_start:
+            self.start()
+
+    def set_callbacks(self, on_rx_line=None, on_status_change=None, on_log=None):
+        """Define ou atualiza callbacks assíncronos de linha recebida e status."""
+        if on_rx_line is not None:
+            self.on_rx_line = on_rx_line
+        if on_status_change is not None:
+            self.on_status_change = on_status_change
+        if on_log is not None:
+            self.on_log = on_log
+        if not self._running:
+            self.start()
+
+    def get_status_snapshot(self) -> dict:
+        """Alias para get_status(). Retorna uma cópia thread-safe do estado da conexão."""
+        return self.get_status()
+
+    def start(self):
+        if self._running:
+            return
+        self._running = True
+        self._thread = threading.Thread(target=self._io_worker, daemon=True, name="SerialManagerThread")
+        self._thread.start()
+
+    def stop(self):
+        self._running = False
+        self._reconnect_flag.set()
+
+    def request_reconnect(self, new_port: str = None):
+        if new_port is not None:
+            self.preferred_port = new_port.strip() or None
+        self._reconnect_flag.set()
+
+    def clear_pending_events(self):
+        while not self.event_queue.empty():
+            try:
+                self.event_queue.get_nowait()
+            except Exception:
+                break
+
+    def send_event(self, pkt: dict, coalesce: bool = False):
+        """Enfileira um comando/evento de alta prioridade para envio imediato (< 20ms) sem bloquear a UI."""
+        if not pkt:
+            return
+        if coalesce:
+            self.clear_pending_events()
+        self.event_queue.put(pkt)
+
+    def send_transfer(self, pkt: dict):
+        """Enfileira um bloco de transferência para o Cartão SD."""
+        if pkt:
+            self.transfer_queue.put(pkt)
+
+    def send_telemetry(self, payload: dict):
+        """Atualiza o slot atômico de telemetria (sempre envia o pacote mais fresco a 115200 bps)."""
+        with self._telemetry_lock:
+            self._latest_telemetry = payload
+
+    def wait_for_ack(self, expected_prefix: str, timeout: float = 4.0) -> tuple[bool, str]:
+        """Aguarda resposta ACK_/ERR_ da placa CYD (usado por background workers de upload SD)."""
+        t0 = time.monotonic()
+        while (time.monotonic() - t0) < timeout:
+            if self.ack_event.wait(timeout=0.06):
+                self.ack_event.clear()
+                val = self.last_ack.get("val") or ""
+                if val.startswith("ERR_NO_SD"):
+                    return False, "ERR_NO_SD"
+                if val.startswith("ERR_OPEN"):
+                    return False, "ERR_OPEN"
+                if val.startswith(expected_prefix):
+                    return True, val
+        return False, "TIMEOUT"
+
+    def get_status(self) -> dict:
+        with self._status_lock:
+            return dict(self._status)
+
+    def _update_status(self, **kwargs):
+        changed = False
+        with self._status_lock:
+            for k, v in kwargs.items():
+                if self._status.get(k) != v:
+                    self._status[k] = v
+                    changed = True
+            snap = dict(self._status)
+        if changed and self.on_status_change:
+            try:
+                self.on_status_change(snap)
+            except Exception:
+                pass
+
+    def _write_json_line(self, ser, pkt: dict) -> int:
+        raw_bytes = (json.dumps(pkt, separators=(",", ":"), ensure_ascii=True) + "\n").encode("utf-8")
+        # Se o buffer de saída do driver estiver congestionado, faz flush preventivo
+        try:
+            out_w = getattr(ser, "out_waiting", 0)
+            if out_w and out_w > 4096:
+                ser.reset_output_buffer()
+        except Exception:
+            pass
+        ser.write(raw_bytes)
+        ser.flush()
+        with self._status_lock:
+            self._status["tx_packets"] += 1
+        return len(raw_bytes)
+
+    def _read_available_lines(self, ser):
+        lines_read = 0
+        while lines_read < 32:
+            try:
+                waiting = ser.in_waiting
+            except Exception:
+                break
+            if waiting <= 0:
+                break
+            if waiting > 8192:
+                try:
+                    ser.reset_input_buffer()
+                except Exception:
+                    pass
+                break
+            try:
+                raw = ser.readline().decode("utf-8", errors="ignore").strip()
+            except Exception:
+                break
+            lines_read += 1
+            if not raw:
+                continue
+            with self._status_lock:
+                self._status["rx_packets"] += 1
+            if raw.startswith("ACK_") or raw.startswith("ERR_"):
+                self.last_ack["val"] = raw
+                self.ack_event.set()
+            elif self.on_rx_line:
+                try:
+                    self.on_rx_line(raw)
+                except Exception:
+                    pass
+
+    def _io_worker(self):
+        import serial
+
+        ser = None
+        bytes_window = 0
+        window_t0 = time.monotonic()
+
+        while self._running:
+            try:
+                if self._reconnect_flag.is_set():
+                    self._reconnect_flag.clear()
+                    if ser is not None:
+                        try:
+                            ser.reset_input_buffer()
+                            ser.reset_output_buffer()
+                            ser.close()
+                        except Exception:
+                            pass
+                        ser = None
+                    self._update_status(connected=False, state="RECONNECTING", port="", tx_bytes_sec=0)
+
+                if ser is None:
+                    port = self.preferred_port or find_port()
+                    if not port:
+                        self._update_status(connected=False, state="SEARCHING", port="", tx_bytes_sec=0)
+                        time.sleep(1.2)
+                        continue
+
+                    self._update_status(connected=False, state="CONNECTING", port=port, tx_bytes_sec=0)
+                    ser = serial.Serial(
+                        port=port,
+                        baudrate=self.baud,
+                        timeout=0.04,
+                        write_timeout=0.35,
+                    )
+                    # Aguarda estabilização do bootloader ESP32 após abertura da porta DTR/RTS
+                    time.sleep(1.5)
+                    ser.reset_input_buffer()
+                    ser.reset_output_buffer()
+                    self._update_status(connected=True, state="CONNECTED", port=port, last_error="")
+                    if self.on_log:
+                        self.on_log(f"⚡ SerialManager conectado em {port} ({self.baud} bps • Non-Blocking I/O)")
+                    if self.on_rx_line:
+                        try:
+                            self.on_rx_line("SERIAL_CONNECTED")
+                        except Exception:
+                            pass
+
+                # 1) Leitura não-bloqueante de respostas da CYD
+                self._read_available_lines(ser)
+
+                # 2) Prioridade 1: Transferência de blocos para o Cartão SD
+                if not self.transfer_queue.empty():
+                    pkt = self.transfer_queue.get_nowait()
+                    bytes_window += self._write_json_line(ser, pkt)
+                    continue
+
+                # 3) Prioridade 2: Eventos imediatos de UI / Terminal / Alertas (< 20ms)
+                ev_sent = 0
+                while not self.event_queue.empty() and ev_sent < 3:
+                    ev_pkt = self.event_queue.get_nowait()
+                    bytes_window += self._write_json_line(ser, ev_pkt)
+                    ev_sent += 1
+
+                # 4) Prioridade 3: Telemetria periódica (apenas o snapshot mais recente)
+                tele_pkt = None
+                with self._telemetry_lock:
+                    if self._latest_telemetry is not None:
+                        tele_pkt = self._latest_telemetry
+                        self._latest_telemetry = None
+                if tele_pkt is not None:
+                    bytes_window += self._write_json_line(ser, tele_pkt)
+
+                # Atualiza taxa de transmissão (B/s) a cada 1.0s
+                now_m = time.monotonic()
+                if now_m - window_t0 >= 1.0:
+                    bps = int(round(bytes_window / (now_m - window_t0)))
+                    bytes_window = 0
+                    window_t0 = now_m
+                    with self._status_lock:
+                        self._status["tx_bytes_sec"] = bps
+
+            except Exception as ex:
+                err_s = str(ex)[:60]
+                self._update_status(connected=False, state="DISCONNECTED", port="", tx_bytes_sec=0, last_error=err_s)
+                if self.on_log:
+                    self.on_log(f"⚠️ Porta USB desconectada ou ocupada ({err_s}). Reconectando em background...")
+                if ser is not None:
+                    try:
+                        ser.close()
+                    except Exception:
+                        pass
+                    ser = None
+                time.sleep(1.5)
+                continue
+
+            time.sleep(0.015)
+
+        if ser is not None:
+            try:
+                ser.reset_output_buffer()
+                ser.close()
+            except Exception:
+                pass
 
 
 def get_local_lan_ip() -> str:
@@ -908,6 +1339,23 @@ DEFAULT_PORTFOLIO = [
     {"ticker": "PETR4", "qty": 100.0, "avg_price": 35.80, "currency": "BRL"},
 ]
 
+DEFAULT_NEWS_TOPICS = [
+    "Política",
+    "Tecnologia",
+    "Relações Internacionais",
+    "Mercado Financeiro",
+]
+
+ALL_PRESET_NEWS_TOPICS = [
+    "Política",
+    "Tecnologia",
+    "Relações Internacionais",
+    "Mercado Financeiro",
+    "Sistemas Embarcados",
+    "Cibersegurança & Linux",
+    "Ciência & Espaço",
+]
+
 DEFAULT_GEMS = [
     {
         "id": "gem_embedded",
@@ -982,6 +1430,9 @@ def load_ui_config():
         "media_source_pref": "auto",
         "media_auto_cover": True,
         "weather_city": "Votuporanga",
+        "news_topics": list(DEFAULT_NEWS_TOPICS),
+        "news_api_key": os.environ.get("NEWS_API_KEY", ""),
+        "news_rotate_sec": 15,
         "gemini_api_key": os.environ.get("GEMINI_API_KEY", ""),
         "gemini_model": "gemini-3.8-flash",
         "gems": [dict(g) for g in DEFAULT_GEMS],
@@ -1012,6 +1463,8 @@ def load_ui_config():
                     defaults["portfolio"] = [dict(p) for p in DEFAULT_PORTFOLIO]
                 if "gems" not in saved or not isinstance(saved["gems"], list) or not saved["gems"]:
                     defaults["gems"] = [dict(g) for g in DEFAULT_GEMS]
+                if "news_topics" not in saved or not isinstance(saved["news_topics"], list) or not saved["news_topics"]:
+                    defaults["news_topics"] = list(DEFAULT_NEWS_TOPICS)
                 if not defaults.get("gemini_api_key") and os.environ.get("GEMINI_API_KEY"):
                     defaults["gemini_api_key"] = os.environ.get("GEMINI_API_KEY", "")
         except Exception:
@@ -2282,335 +2735,647 @@ class WeatherCollector:
         }
 
 
-# ========================================== MOTOR GEMINI GEMS (AUTOMAÇÕES IA) =
-class GeminiGemsEngine:
+# ========================================== MÓDULO 1: FEED DE NOTÍCIAS (NEWS API / RSS) =
+class NewsFeedCollector:
     """
-    Motor de Automações Diárias Inteligentes ("Gems") integrado ao Google Gemini:
-      - Conecta via API oficial Google Gemini Interactions (`/v1beta/interactions`) usando
-        `gemini-3.8-flash` (padrão), `gemini-4-argon` ou `gemini-3.5-flash-lite` com Grounding
-        (`google_search`) para buscar notícias recentes (ex: Sistemas Embarcados, ESP32, IoT).
-      - Possui Fallback Inteligente Automático via Google News RSS PT-BR + Telemetria Local,
-        garantindo que as Gems tragam notícias reais de Embarcados, Clima e Mercado mesmo antes
-        de o usuário configurar uma chave de API!
+    Leitor Passivo de Notícias Customizável (Substitui a antiga lógica de IA Gems):
+      - Permite escolher múltiplos tópicos (ex: 'Política', 'Tecnologia', 'Relações Internacionais',
+        'Mercado Financeiro', 'Sistemas Embarcados', além de tópicos customizados).
+      - Possui função assíncrona (`fetch_topics_async`) que coleta manchetes reais em português
+        via fontes gratuitas (Google News RSS PT-BR, Bing/DuckDuckGo News RSS e suporte opcional a NewsAPI.org).
+      - Mantém uma fila circular de manchetes e rotaciona automaticamente a cada 15 segundos,
+        enviando no JSON via Serial: `"news": {"topic": "Política", "headline": "Título da notícia aqui..."}`.
     """
+
+    TOPIC_QUERIES = {
+        "política": "Política Brasil Congresso Governo Brasília STF",
+        "tecnologia": "Tecnologia Inteligência Artificial Computação Chips Software",
+        "relações internacionais": "Relações Internacionais Geopolítica Diplomacia Mundo",
+        "mercado financeiro": "Mercado Financeiro Ibovespa Dólar Economia Juros",
+        "sistemas embarcados": "Sistemas Embarcados ESP32 Microcontroladores IoT Arduino",
+        "cibersegurança & linux": "Cibersegurança Linux Redes Servidores Open Source",
+        "ciência & espaço": "Ciência Espaço NASA Astronomia Descobertas",
+    }
+
+    FALLBACK_HEADLINES = {
+        "Política": [
+            ("Congresso debate agenda econômica e pacote de responsabilidade fiscal em Brasília", "Agência Brasil"),
+            ("Comissões analisam marco regulatório de tecnologia e infraestrutura nacional", "Senado Notícias"),
+        ],
+        "Tecnologia": [
+            ("Novas arquiteturas de chips e IA na borda aceleram automação e dispositivos conectados", "Canaltech"),
+            ("Comunidade open-source lança ferramentas otimizadas para sistemas Linux e containers", "Tecnoblog"),
+        ],
+        "Relações Internacionais": [
+            ("Cúpula internacional discute acordos comerciais, energia limpa e cadeias de semicondutores", "Reuters"),
+            ("Diplomacia global acompanha negociações estratégicas entre blocos econômicos", "DW Brasil"),
+        ],
+        "Mercado Financeiro": [
+            ("Investidores monitoram fluxo cambial, curva de juros e desempenho do Ibovespa e Bitcoin", "InfoMoney"),
+            ("Mercados globais operam atentos a indicadores de inflação e liquidez internacional", "Valor"),
+        ],
+        "Sistemas Embarcados": [
+            ("ESP32 e RTOS: Displays SPI TFT com sprites em RAM garantem interfaces fluidas sem flicker", "Embedded Lab"),
+            ("Cyber Decks baseados em microcontroladores ganham espaço em monitoramento de redes e DevOps", "Hackaday"),
+        ],
+    }
 
     def __init__(
         self,
-        api_key: str = "",
-        model: str = "gemini-3.8-flash",
-        gems: list[dict] = None,
-        active_gem_id: str = "gem_embedded",
-        auto_rotate: bool = True,
+        topics: list[str] = None,
+        news_api_key: str = "",
+        rotate_sec: float = 15.0,
+        poll_interval: float = 180.0,
+        **kwargs,
     ):
         self._lock = threading.Lock()
-        self.api_key = (api_key or os.environ.get("GEMINI_API_KEY", "")).strip()
-        self.model = (model or "gemini-3.8-flash").strip()
-        self.gems = [dict(g) for g in (gems or DEFAULT_GEMS)]
-        self.active_gem_id = active_gem_id or (self.gems[0]["id"] if self.gems else "gem_embedded")
-        self.auto_rotate = bool(auto_rotate)
-        self._outputs: dict[str, dict] = {}
-        self._last_run_ts: dict[str, float] = {}
+        self.topics = list(topics or DEFAULT_NEWS_TOPICS)
+        if not self.topics:
+            self.topics = list(DEFAULT_NEWS_TOPICS)
+        self.news_api_key = (news_api_key or os.environ.get("NEWS_API_KEY", "")).strip()
+        self.rotate_sec = max(5.0, float(rotate_sec or 15.0))
+        self.poll_interval = max(60.0, float(poll_interval or 180.0))
+        self._queue: list[dict] = []
+        self._active_idx = 0
         self._last_rotate_ts = time.time()
-        self._running = True
+        self._last_fetch_ts = 0.0
         self._busy = False
-        self._status_msg = "Pronto para executar Gems"
+        self._status_msg = "Inicializando Feed de Notícias..."
+        self._running = True
+        self._trigger = threading.Event()
+        self._seed_initial_queue()
+        threading.Thread(target=self._worker, daemon=True).start()
 
-    def configure(self, api_key: str = None, model: str = None, gems: list[dict] = None, active_gem_id: str = None, auto_rotate: bool = None):
+    def _seed_initial_queue(self):
+        now_hm = brasilia_now().strftime("%H:%M")
+        seeded = []
+        for t in self.topics:
+            items = self.FALLBACK_HEADLINES.get(t) or [
+                (f"Acompanhando últimas atualizações em tempo real sobre {t}", "News Feed")
+            ]
+            hl, src = items[0]
+            seeded.append({
+                "topic": t,
+                "headline": hl,
+                "src": src,
+                "tm": now_hm,
+            })
         with self._lock:
-            if api_key is not None:
-                self.api_key = api_key.strip()
-            if model is not None and model.strip():
-                self.model = model.strip()
-            if gems is not None:
-                self.gems = [dict(g) for g in gems]
-            if active_gem_id is not None:
-                self.active_gem_id = active_gem_id
-            if auto_rotate is not None:
-                self.auto_rotate = bool(auto_rotate)
+            if not self._queue:
+                self._queue = seeded
 
-    def update_config(self, api_key: str = None, model: str = None, gems: list[dict] = None, active_gem_id: str = None, auto_rotate: bool = None):
-        self.configure(api_key=api_key, model=model, gems=gems, active_gem_id=active_gem_id, auto_rotate=auto_rotate)
-
-    def set_active_gem(self, gem_id: str):
+    def set_topics(self, topics: list[str], news_api_key: str = None):
+        cleaned = []
+        for t in (topics or []):
+            s = str(t).strip()
+            if s and s not in cleaned:
+                cleaned.append(s)
+        if not cleaned:
+            cleaned = list(DEFAULT_NEWS_TOPICS)
         with self._lock:
-            if gem_id:
-                self.active_gem_id = gem_id
+            self.topics = cleaned
+            if news_api_key is not None:
+                self.news_api_key = news_api_key.strip()
+        self.force_refresh()
 
-    def _call_gemini_interactions_api(self, prompt_text: str, topic_hint: str) -> tuple[str | None, str]:
+    def configure(self, **kwargs):
+        if "topics" in kwargs and kwargs["topics"]:
+            self.set_topics(kwargs["topics"], kwargs.get("news_api_key"))
+
+    def update_config(self, **kwargs):
+        self.configure(**kwargs)
+
+    def force_refresh(self):
+        self._trigger.set()
+
+    def next_headline(self) -> dict:
         with self._lock:
-            key = self.api_key or os.environ.get("GEMINI_API_KEY", "").strip()
-            mdl = self.model or "gemini-3.8-flash"
+            if self._queue:
+                self._active_idx = (self._active_idx + 1) % len(self._queue)
+                self._last_rotate_ts = time.time()
+                return dict(self._queue[self._active_idx])
+        return self.get_active_item()
 
-        if not key:
-            return None, "Sem API Key (Usando Feed Inteligente Google News RSS + Contexto)"
+    def select_index(self, idx: int) -> dict:
+        with self._lock:
+            if self._queue:
+                self._active_idx = max(0, min(int(idx), len(self._queue) - 1))
+                self._last_rotate_ts = time.time()
+                return dict(self._queue[self._active_idx])
+        return self.get_active_item()
 
-        sys_inst = (
-            "Você é uma Gem (Agente de Automação Diária) do painel embarcado CYD Hardware & Market Monitor. "
-            "Responda SEMPRE em português do Brasil, de forma ultra-concisa, dividida em 3 tópicos curtos "
-            "separados por quebra de linha (máximo de 340 caracteres no total), sem blocos de código e sem asteriscos duplos."
-        )
-
-        try:
-            url = "https://generativelanguage.googleapis.com/v1beta/interactions"
-            payload = {
-                "model": mdl,
-                "input": f"{prompt_text}\nContexto de busca: {topic_hint} (data atual: {brasilia_now().strftime('%d/%m/%Y')})",
-                "system_instruction": sys_inst,
-                "tools": [{"type": "google_search"}],
-            }
-            req = urllib.request.Request(
-                url,
-                data=json.dumps(payload).encode("utf-8"),
-                headers={
-                    "Content-Type": "application/json",
-                    "x-goog-api-key": key,
-                    "Api-Revision": "2026-05-20",
-                },
-                method="POST",
-            )
-            with urllib.request.urlopen(req, timeout=12.0) as resp:
-                data = json.loads(resp.read().decode("utf-8", errors="ignore"))
-                outputs = data.get("outputs") or []
-                texts = [o.get("text", "") for o in outputs if o.get("type") == "text" and o.get("text")]
-                if texts:
-                    clean = self._clean_gem_text("\n".join(texts))
-                    return clean, f"Gemini IA ({mdl} • Interactions API)"
-                if data.get("text"):
-                    return self._clean_gem_text(str(data["text"])), f"Gemini IA ({mdl})"
-        except urllib.error.HTTPError as he:
-            err_code = he.code
-            if err_code in (401, 403):
-                return None, f"API Key inválida/sem permissão (HTTP {err_code}) — usando Feed RSS"
-        except Exception:
-            pass
-
-        return None, "Feed Inteligente Google News RSS + Telemetria (Fallback Ativo)"
-
-    def _fetch_google_news_rss(self, query_topic: str, max_items: int = 3) -> list[str]:
+    def _fetch_single_topic_sync(self, topic: str, max_items: int = 3) -> list[dict]:
         import html
         import xml.etree.ElementTree as ET
 
-        q = urllib.parse.quote((query_topic or "Sistemas Embarcados ESP32 IoT").strip())
-        url = f"https://news.google.com/rss/search?q={q}&hl=pt-BR&gl=BR&ceid=BR:pt-419"
-        req = urllib.request.Request(
-            url,
-            headers={"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) CYDMonitor/4.1"},
-        )
-        headlines = []
-        try:
-            with urllib.request.urlopen(req, timeout=5.0) as resp:
-                xml_bytes = resp.read()
-            root = ET.fromstring(xml_bytes)
-            for item in root.findall(".//item"):
-                title_el = item.find("title")
-                if title_el is not None and title_el.text:
-                    raw_t = html.unescape(title_el.text).strip()
-                    if " - " in raw_t:
-                        parts = raw_t.rsplit(" - ", 1)
-                        raw_t = f"{parts[0].strip()} ({parts[1].strip()[:14]})"
-                    headlines.append(f"- {raw_t}")
-                    if len(headlines) >= max_items:
-                        break
-        except Exception:
-            pass
-        return headlines
+        q_raw = self.TOPIC_QUERIES.get(topic.strip().lower(), topic.strip())
+        q_enc = urllib.parse.quote(q_raw)
+        now_hm = brasilia_now().strftime("%H:%M")
+        results = []
 
-    @staticmethod
-    def _clean_gem_text(raw: str) -> str:
-        txt = (raw or "").replace("**", "").replace("##", "").replace("`", "").strip()
-        lines = [ln.strip() for ln in txt.splitlines() if ln.strip()]
-        cleaned = "\n".join(lines)
-        return cleaned[:380]
-
-    def run_gem_now(
-        self,
-        gem_id: str,
-        wth_snap: dict = None,
-        mkt_snap: dict = None,
-        sys_snap: dict = None,
-        weather_snap: dict = None,
-        market_snap: dict = None,
-    ) -> dict:
-        wth_snap = wth_snap if wth_snap is not None else (weather_snap or {})
-        mkt_snap = mkt_snap if mkt_snap is not None else (market_snap or {})
-        sys_snap = sys_snap or {}
+        # 1) Se o usuário configurou chave opcional da NewsAPI.org, tenta primeiro
         with self._lock:
-            target_gem = None
-            for g in self.gems:
-                if g.get("id") == gem_id:
-                    target_gem = dict(g)
-                    break
-            if not target_gem and self.gems:
-                target_gem = dict(self.gems[0])
-            self._busy = True
-            self._status_msg = f"Executando {target_gem.get('name', 'Gem')}..."
+            api_key = self.news_api_key
+        if api_key:
+            try:
+                url_napi = (
+                    f"https://newsapi.org/v2/everything?q={q_enc}&language=pt&sortBy=publishedAt&pageSize={max_items}"
+                )
+                req = urllib.request.Request(
+                    url_napi,
+                    headers={"X-Api-Key": api_key, "User-Agent": "CYDCyberDeck/4.0"},
+                )
+                with urllib.request.urlopen(req, timeout=4.5) as resp:
+                    data = json.loads(resp.read().decode("utf-8", errors="ignore"))
+                    for art in (data.get("articles") or [])[:max_items]:
+                        tit = str(art.get("title") or "").strip()
+                        src = str((art.get("source") or {}).get("name") or "NewsAPI").strip()
+                        if tit and tit != "[Removed]":
+                            results.append({"topic": topic, "headline": tit, "src": src[:20], "tm": now_hm})
+                if results:
+                    return results
+            except Exception:
+                pass
 
-        if not target_gem:
+        # 2) Fonte Gratuita Principal: Google News RSS PT-BR (Zero API Key)
+        rss_urls = [
+            f"https://news.google.com/rss/search?q={q_enc}&hl=pt-BR&gl=BR&ceid=BR:pt-419",
+            f"https://www.bing.com/news/search?q={q_enc}&format=rss&setlang=pt-br",
+        ]
+        for rss_url in rss_urls:
+            try:
+                req = urllib.request.Request(
+                    rss_url,
+                    headers={"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) CYDCyberDeck/4.0"},
+                )
+                with urllib.request.urlopen(req, timeout=4.5) as resp:
+                    xml_bytes = resp.read()
+                root = ET.fromstring(xml_bytes)
+                for item in root.findall(".//item"):
+                    title_el = item.find("title")
+                    source_el = item.find("source")
+                    if title_el is not None and title_el.text:
+                        raw_t = html.unescape(title_el.text).strip()
+                        src_name = (
+                            html.unescape(source_el.text).strip()
+                            if (source_el is not None and source_el.text)
+                            else "News RSS"
+                        )
+                        if " - " in raw_t:
+                            parts = raw_t.rsplit(" - ", 1)
+                            raw_t = parts[0].strip()
+                            if src_name == "News RSS" and parts[1].strip():
+                                src_name = parts[1].strip()
+                        if raw_t and len(raw_t) > 12:
+                            results.append({
+                                "topic": topic,
+                                "headline": raw_t[:190],
+                                "src": src_name[:20],
+                                "tm": now_hm,
+                            })
+                            if len(results) >= max_items:
+                                break
+                if results:
+                    return results
+            except Exception:
+                continue
+
+        # 3) Fallback local resiliente se estiver sem internet
+        fb_list = self.FALLBACK_HEADLINES.get(topic) or [
+            (f"{topic}: Monitoramento de manchetes ativo no Cyber Deck", "Local RSS")
+        ]
+        for hl, src in fb_list[:max_items]:
+            results.append({"topic": topic, "headline": hl, "src": src, "tm": now_hm})
+        return results
+
+    async def fetch_topics_async(self, topics_list: list[str]) -> list[dict]:
+        """Função assíncrona que busca em paralelo as últimas manchetes de todos os tópicos ativos."""
+        loop = asyncio.get_running_loop()
+        tasks = [
+            loop.run_in_executor(None, self._fetch_single_topic_sync, topic_name, 3)
+            for topic_name in topics_list
+        ]
+        per_topic_results = await asyncio.gather(*tasks, return_exceptions=True)
+
+        # Intercala as manchetes por tópico (Política -> Tecnologia -> Rel. Internacionais...)
+        interleaved: list[dict] = []
+        valid_lists = [r for r in per_topic_results if isinstance(r, list) and r]
+        max_len = max((len(lst) for lst in valid_lists), default=0)
+        for i in range(max_len):
+            for lst in valid_lists:
+                if i < len(lst):
+                    interleaved.append(lst[i])
+        return interleaved
+
+    def fetch_now(self) -> bool:
+        with self._lock:
+            topics_copy = list(self.topics)
+            self._busy = True
+            self._status_msg = f"Buscando manchetes ({', '.join(topics_copy[:3])}...)"
+
+        try:
+            new_queue = asyncio.run(self.fetch_topics_async(topics_copy))
+            if new_queue:
+                now_str = brasilia_now().strftime("%H:%M:%S")
+                with self._lock:
+                    self._queue = new_queue[:16]
+                    if self._active_idx >= len(self._queue):
+                        self._active_idx = 0
+                    self._last_fetch_ts = time.time()
+                    self._busy = False
+                    self._status_msg = f"{len(self._queue)} manchetes sincronizadas às {now_str} (RSS/API)"
+                return True
+        except Exception as ex:
             with self._lock:
                 self._busy = False
-            return {}
-
-        gid = target_gem.get("id", "gem_custom")
-        gname = target_gem.get("name", "Gem Personalizada")
-        topic = target_gem.get("topic", "Sistemas Embarcados ESP32 IoT")
-        raw_prompt = target_gem.get("prompt", "Traga 3 novidades sobre o tema.")
-
-        ctx_vars = {
-            "city": wth_snap.get("city", "Votuporanga"),
-            "temp": wth_snap.get("temp", 28.0),
-            "feels": wth_snap.get("feels", 29.0),
-            "cond": wth_snap.get("cond", "Céu Limpo"),
-            "rain": wth_snap.get("rain", 0),
-            "wind": wth_snap.get("wind", 10.0),
-            "tmin": wth_snap.get("tmin", 20.0),
-            "tmax": wth_snap.get("tmax", 32.0),
-            "usd": f"{mkt_snap.get('usd', 5.0):.2f}",
-            "btc": f"{mkt_snap.get('btc', 80000):,.0f}",
-            "eth": f"{mkt_snap.get('eth', 2500):,.0f}",
-            "ibov": f"{mkt_snap.get('ibov', 128000):,.0f}",
-            "cpu": f"{sys_snap.get('cpu', 0.0):.1f}",
-            "ram": f"{sys_snap.get('ram', 0.0):.1f}",
-        }
-        try:
-            formatted_prompt = raw_prompt.format(**ctx_vars)
-        except Exception:
-            formatted_prompt = raw_prompt
-
-        ai_text, source_lbl = self._call_gemini_interactions_api(formatted_prompt, topic)
-
-        if not ai_text:
-            if "weather" in gid or "clima" in gname.lower() or "{temp}" in raw_prompt:
-                alert_str = "ALERTA DE TEMPESTADE ATIVO! Redobre a atencao." if wth_snap.get("alert") else "Sem alertas severos no momento."
-                ai_text = (
-                    f"- {ctx_vars['city']}: {ctx_vars['temp']}C (Sens. {ctx_vars['feels']}C), {ctx_vars['cond']}.\n"
-                    f"- Min {ctx_vars['tmin']}C / Max {ctx_vars['tmax']}C | Chuva {ctx_vars['rain']}% | Vento {ctx_vars['wind']} km/h.\n"
-                    f"- {alert_str}"
-                )
-            elif "market" in gid or "mercado" in gname.lower() or "{btc}" in raw_prompt:
-                news = self._fetch_google_news_rss(topic, max_items=2)
-                n_line = news[0] if news else "- Mercado global acompanhando fluxo de cripto e cambio."
-                ai_text = (
-                    f"- Cambio: Dolar R$ {ctx_vars['usd']} | IBOV {ctx_vars['ibov']} pts.\n"
-                    f"- Cripto: BTC US$ {ctx_vars['btc']} | ETH US$ {ctx_vars['eth']}.\n"
-                    f"{n_line}"
-                )
-            else:
-                news = self._fetch_google_news_rss(topic, max_items=3)
-                if news:
-                    ai_text = "\n".join(news)
-                else:
-                    ai_text = (
-                        "- ESP32 & RTOS: Uso de sprites DMA e caches evita flicker em displays SPI TFT.\n"
-                        "- IoT & Edge AI: Agentes locais em Python + Serial JSON reduzem latencia para <50ms.\n"
-                        "- Dica C++: Prefira buffers estaticos char[] no loop principal para evitar fragmentacao de heap."
-                    )
-
-        clean_out = self._clean_gem_text(ai_text)
-        ts_str = brasilia_now().strftime("%H:%M")
-        res_entry = {
-            "id": gid,
-            "title": gname,
-            "text": clean_out,
-            "time": ts_str,
-            "source": source_lbl,
-            "model": source_lbl,
-            "updated_at": time.time(),
-        }
+                self._status_msg = f"Usando fila em cache ({ex})"
         with self._lock:
-            self._outputs[gid] = res_entry
-            self._last_run_ts[gid] = time.time()
-            self.active_gem_id = gid
             self._busy = False
-            self._status_msg = f"Última execução: {gname} às {ts_str} ({source_lbl})"
-        return res_entry
+        return False
 
-    def tick_scheduler(
-        self,
-        wth_snap: dict = None,
-        mkt_snap: dict = None,
-        sys_snap: dict = None,
-        weather_snap: dict = None,
-        market_snap: dict = None,
-    ) -> dict | None:
-        wth_snap = wth_snap if wth_snap is not None else (weather_snap or {})
-        mkt_snap = mkt_snap if mkt_snap is not None else (market_snap or {})
-        sys_snap = sys_snap or {}
+    def _worker(self):
+        self.fetch_now()
+        while self._running:
+            self._trigger.wait(timeout=self.poll_interval)
+            self._trigger.clear()
+            if not self._running:
+                break
+            self.fetch_now()
+
+    def tick_scheduler(self, **kwargs) -> dict | None:
+        """Avança a fila de manchetes a cada 15 segundos e retorna a nova manchete quando rotacionar."""
         now = time.time()
         with self._lock:
-            if self._busy:
+            if not self._queue:
                 return None
-            gems_copy = [dict(g) for g in self.gems if g.get("enabled", True)]
-            act_id = self.active_gem_id
-            rotate = self.auto_rotate
-
-        if not gems_copy:
-            return None
-
-        for g in gems_copy:
-            gid = g.get("id", "")
-            interval_s = max(5, int(g.get("interval_min", 60))) * 60
-            last_t = self._last_run_ts.get(gid, 0.0)
-            if now - last_t >= interval_s:
-                return self.run_gem_now(gid, wth_snap, mkt_snap, sys_snap)
-
-        if rotate and len(gems_copy) > 1 and (now - self._last_rotate_ts >= 25.0):
-            with self._lock:
+            if now - self._last_rotate_ts >= self.rotate_sec:
+                self._active_idx = (self._active_idx + 1) % len(self._queue)
                 self._last_rotate_ts = now
-                ids = [g["id"] for g in gems_copy if g["id"] in self._outputs]
-                if len(ids) > 1:
-                    cur_idx = ids.index(act_id) if act_id in ids else 0
-                    self.active_gem_id = ids[(cur_idx + 1) % len(ids)]
+                return dict(self._queue[self._active_idx])
         return None
 
-    def get_cyd_payload(self) -> dict:
+    def get_active_item(self) -> dict:
         with self._lock:
-            act_id = self.active_gem_id
-            entry = self._outputs.get(act_id)
-            if not entry and self._outputs:
-                entry = next(iter(self._outputs.values()))
-            mdl = self.model
-
-        if not entry:
-            return {
-                "tit": "Gem: Embarcados & IoT",
-                "txt": "Sincronizando manchetes e automacoes diarias do Gemini IA...",
-                "tm": brasilia_now().strftime("%H:%M"),
-                "mdl": mdl[:18],
-            }
+            if self._queue:
+                idx = self._active_idx % len(self._queue)
+                return dict(self._queue[idx])
         return {
-            "tit": to_ascii_safe(entry.get("title", "Gem IA"))[:32],
-            "txt": to_ascii_safe(entry.get("text", ""))[:380],
-            "tm": entry.get("time", "--:--")[:8],
-            "mdl": to_ascii_safe(mdl)[:18],
+            "topic": "Tecnologia",
+            "headline": "Sincronizando manchetes do Cyber Deck News Feed...",
+            "src": "RSS Live",
+            "tm": brasilia_now().strftime("%H:%M"),
+        }
+
+    def get_cyd_news_payload(self, include_queue: bool = False, force: bool = True) -> dict:
+        """Retorna o nó `"news": {"topic": "...", "headline": "..."}` otimizado para Serial 115200 bps."""
+        item = self.get_active_item()
+        pkt = {
+            "topic": to_ascii_safe(item.get("topic", "Noticias"))[:24],
+            "headline": to_ascii_safe(item.get("headline", ""))[:190],
+            "src": to_ascii_safe(item.get("src", "RSS"))[:18],
+            "tm": str(item.get("tm", "--:--"))[:8],
+            "force": bool(force),
+        }
+        if include_queue:
+            with self._lock:
+                q_slice = list(self._queue[:6])
+            pkt["queue"] = [
+                {
+                    "topic": to_ascii_safe(x.get("topic", "Noticias"))[:22],
+                    "headline": to_ascii_safe(x.get("headline", ""))[:160],
+                    "src": to_ascii_safe(x.get("src", "RSS"))[:16],
+                    "tm": str(x.get("tm", "--:--"))[:8],
+                }
+                for x in q_slice
+            ]
+        return pkt
+
+    def get_cyd_payload(self) -> dict:
+        """Mantém compatibilidade com o campo legado `gem` caso necessário."""
+        item = self.get_active_item()
+        return {
+            "tit": to_ascii_safe(f"[{item.get('topic', 'NEWS')}] {item.get('src', '')}")[:32],
+            "txt": to_ascii_safe(item.get("headline", ""))[:220],
+            "tm": str(item.get("tm", "--:--"))[:8],
+            "mdl": "NEWS-RSS",
         }
 
     def get_ui_snapshot(self) -> dict:
         with self._lock:
-            act_id = self.active_gem_id
-            entry = self._outputs.get(act_id) or {}
-            if not entry and self._outputs:
-                entry = next(iter(self._outputs.values()))
-            tit = entry.get("title", "🔧 Radar Embarcados & IoT")
-            txt = entry.get("text", "Clique em '▶️ Rodar na CYD' ou '⚡ Executar Gem Ativa Agora' para gerar o briefing.")
-            tm = entry.get("time", "--:--")
-            src = entry.get("source", "Smart Feed / Gemini")
+            q_copy = [dict(x) for x in self._queue]
+            act_idx = self._active_idx % len(q_copy) if q_copy else 0
+            act = q_copy[act_idx] if q_copy else {
+                "topic": "Tecnologia",
+                "headline": "Carregando manchetes...",
+                "src": "RSS",
+                "tm": "--:--",
+            }
+            rem_s = max(0, int(round(self.rotate_sec - (time.time() - self._last_rotate_ts))))
             return {
-                "active_gem_id": act_id,
-                "active_title": tit,
-                "active_text": txt,
-                "active_time": tm,
-                "active_source": src,
-                "last_title": tit,
-                "last_text": txt,
-                "last_time": tm,
-                "last_model": src,
+                "topics": list(self.topics),
+                "queue": q_copy,
+                "active_index": act_idx,
+                "total": len(q_copy),
+                "active_topic": act.get("topic", "Notícias"),
+                "active_headline": act.get("headline", ""),
+                "active_source": act.get("src", "RSS"),
+                "active_time": act.get("tm", "--:--"),
+                "remain_sec": rem_s,
                 "status_msg": self._status_msg,
                 "busy": self._busy,
-                "has_key": bool(self.api_key),
-                "model": self.model,
-                "auto_rotate": self.auto_rotate,
-                "gems": [dict(g) for g in self.gems],
+                "news_api_key": self.news_api_key,
+                # Chaves de retrocompatibilidade UI
+                "last_title": f"[{act.get('topic', 'News')}] {act.get('src', 'RSS')}",
+                "last_text": act.get("headline", ""),
+                "last_time": act.get("tm", "--:--"),
+                "last_model": "News Feed RSS/API",
             }
+
+
+# Alias de retrocompatibilidade
+GeminiGemsEngine = NewsFeedCollector
+
+
+# ========================================== MÓDULO 2: O TERMINAL CYD (CYBER DECK) =
+class CyberDeckTerminalEngine:
+    """
+    Motor do Terminal Administrativo Cyber Deck (`SCR_TERMINAL` - Tela 11):
+      - Processa comandos locais no Python e envia o output enxuto linha a linha para a tela da CYD:
+        * `ping [alvo]`   : Dispara pings ICMP e transmite a latência em tempo real para a CYD.
+        * `fetch [url]`   : Faz um HTTP GET na URL/Repositório e informa Status (ex: 200 OK) e latência.
+        * `docker [cmd]`  : Executa subprocessos Docker locais (ex: `docker ps`, `docker stats --no-stream`).
+        * `ip` / `top`    : Utilitários administrativos rápidos de rede e processos do PC.
+      - Delega comandos nativos para o hardware ESP32 executar:
+        * `wifi scan`     : Envia `{"cmd": "wifi_scan"}` para o ESP32 rodar `WiFi.scanNetworks()` e listar SSID/RSSI.
+        * `esp info`      : Envia `{"cmd": "esp_info"}` para o ESP32 imprimir Heap livre, Clock e Uptime.
+    """
+
+    def __init__(self, max_history: int = 120):
+        self._lock = threading.Lock()
+        self.max_history = max_history
+        self._lines: list[str] = [
+            "================================================",
+            " CYD CYBER DECK TERMINAL v4.0 [115200 bps READY]",
+            " Comandos: ping <alvo> | fetch <url> | docker <cmd> | wifi scan",
+            "================================================",
+        ]
+        self._cmd_history: list[str] = []
+        self._busy = False
+        self._last_cmd = "ready"
+
+    def append_line(self, text: str):
+        if not text:
+            return
+        with self._lock:
+            for raw_ln in str(text).splitlines():
+                ln = raw_ln.rstrip()
+                if ln:
+                    self._lines.append(ln)
+            if len(self._lines) > self.max_history:
+                self._lines = self._lines[-self.max_history :]
+
+    def get_snapshot(self) -> dict:
+        with self._lock:
+            return {
+                "lines": list(self._lines),
+                "text": "\n".join(self._lines),
+                "busy": self._busy,
+                "last_cmd": self._last_cmd,
+                "history": list(self._cmd_history[-15:]),
+            }
+
+    def clear(self, dispatch_fn=None):
+        with self._lock:
+            self._lines = [
+                "CYD CYBER DECK OS v4.0 - Terminal limpo.",
+                "Digite 'help' ou use os atalhos rapidos abaixo.",
+            ]
+            self._last_cmd = "clear"
+        if dispatch_fn:
+            dispatch_fn({"cmd": "term_clear"})
+
+    def execute_command(self, raw_cmd: str, dispatch_fn, log_fn=None, auto_switch_screen: bool = True):
+        """Interpreta e executa um comando em background sem travar a interface Flet nem a Serial."""
+        cmd_str = (raw_cmd or "").strip()
+        if not cmd_str:
+            return
+
+        with self._lock:
+            self._cmd_history.append(cmd_str)
+            self._last_cmd = cmd_str
+
+        def _send_cyd_lines(lines_list: list[str], switch_scr: bool = False):
+            clean_batch = [to_ascii_safe(x)[:96] for x in lines_list if x and str(x).strip()]
+            if not clean_batch:
+                return
+            for c_ln in clean_batch:
+                self.append_line(c_ln)
+            # Divide em pacotes enxutos de até 4 linhas para não saturar a Serial a 115200 bps
+            for i in range(0, len(clean_batch), 4):
+                chunk = clean_batch[i : i + 4]
+                pkt = {
+                    "term": {
+                        "lines": chunk,
+                        "cmd": to_ascii_safe(cmd_str)[:30],
+                        "auto_scr": bool(switch_scr and i == 0),
+                    }
+                }
+                if dispatch_fn:
+                    dispatch_fn(pkt)
+                if i + 4 < len(clean_batch):
+                    time.sleep(0.06)
+
+        parts = cmd_str.split()
+        verb = parts[0].lower()
+        arg_rest = cmd_str[len(parts[0]) :].strip()
+
+        # 1) Comando Limpar Terminal
+        if verb in ("clear", "cls"):
+            self.clear(dispatch_fn)
+            return
+
+        # 2) Comando Delegado ao ESP32: `wifi scan` (ou `wifi`)
+        if verb == "wifi" or cmd_str.lower().startswith("wifi scan") or cmd_str.lower() == "wifiscan":
+            self.append_line(f"$ {cmd_str}")
+            self.append_line("[PC->ESP32] Delegando 'wifi_scan' para execucao nativa na placa CYD...")
+            if dispatch_fn:
+                dispatch_fn({"cmd": "wifi_scan"})
+            if log_fn:
+                log_fn("💻 Terminal CYD: Trigger {'cmd': 'wifi_scan'} enviado ao ESP32!")
+            return
+
+        # 3) Comando Delegado ao ESP32: `esp` / `esp_info` / `free`
+        if verb in ("esp", "esp_info", "espinfo", "free"):
+            self.append_line(f"$ {cmd_str}")
+            if dispatch_fn:
+                dispatch_fn({"cmd": "esp_info"})
+            return
+
+        # 4) Comandos Processados no Agente Python em Thread Assíncrona
+        def _runner():
+            with self._lock:
+                self._busy = True
+            try:
+                _send_cyd_lines([f"$ {cmd_str}"], switch_scr=auto_switch_screen)
+
+                if verb == "help":
+                    _send_cyd_lines([
+                        "Comandos disponiveis no CYD Cyber Deck:",
+                        "  ping <alvo>   : Testa latencia ICMP (ex: ping 8.8.8.8)",
+                        "  fetch <url>   : HTTP GET status/tempo (ex: fetch github.com)",
+                        "  docker <cmd>  : Executa Docker CLI (ex: docker ps)",
+                        "  wifi scan     : Escaneia redes Wi-Fi 2.4GHz no ESP32",
+                        "  esp info      : Exibe Heap livre e Uptime do ESP32",
+                        "  ip / top      : Rede local e Top Processos do PC",
+                        "  clear         : Limpa a tela do terminal",
+                    ])
+
+                elif verb == "ping":
+                    target = arg_rest or "8.8.8.8"
+                    # Sanitiza alvo para segurança
+                    target = re.sub(r"[^a-zA-Z0-9.\-:]", "", target) or "8.8.8.8"
+                    _send_cyd_lines([f"[PING] Disparando 4 pacotes para {target}..."])
+                    ping_cmd = ["ping", "-n", "4", "-w", "2000", target] if IS_WINDOWS else ["ping", "-c", "4", "-W", "2", target]
+                    creation_flags = getattr(subprocess, "CREATE_NO_WINDOW", 0) if IS_WINDOWS else 0
+                    proc = subprocess.Popen(
+                        ping_cmd,
+                        stdout=subprocess.PIPE,
+                        stderr=subprocess.STDOUT,
+                        text=True,
+                        encoding="cp850" if IS_WINDOWS else "utf-8",
+                        errors="ignore",
+                        creationflags=creation_flags,
+                    )
+                    latencies = []
+                    seq_n = 0
+                    for raw_line in proc.stdout:
+                        line_s = raw_line.strip()
+                        if not line_s:
+                            continue
+                        # Extrai tempo=XXms / time=XXms
+                        m_time = re.search(r"(?:tempo|time)[=<]\s*([\d.]+)\s*ms", line_s, re.IGNORECASE)
+                        m_ttl = re.search(r"TTL=(\d+)", line_s, re.IGNORECASE)
+                        if m_time:
+                            seq_n += 1
+                            ms_val = float(m_time.group(1))
+                            latencies.append(ms_val)
+                            ttl_str = f" TTL={m_ttl.group(1)}" if m_ttl else ""
+                            _send_cyd_lines([f"  #{seq_n} {target}: {ms_val:.1f} ms{ttl_str} [OK]"])
+                        elif "esgotado" in line_s.lower() or "timed out" in line_s.lower() or "unreachable" in line_s.lower():
+                            seq_n += 1
+                            _send_cyd_lines([f"  #{seq_n} {target}: TIMEOUT [ERR]"])
+                    proc.wait(timeout=10)
+                    if latencies:
+                        avg_ms = sum(latencies) / len(latencies)
+                        _send_cyd_lines([
+                            f"[OK] {target}: {len(latencies)}/4 pkts | min={min(latencies):.0f}ms med={avg_ms:.1f}ms max={max(latencies):.0f}ms"
+                        ])
+                    else:
+                        _send_cyd_lines([f"[ERR] {target}: Sem resposta ICMP (100% perda)"])
+
+                elif verb in ("fetch", "curl", "http"):
+                    url = arg_rest or "https://api.github.com"
+                    if not url.startswith("http://") and not url.startswith("https://"):
+                        url = "https://" + url
+                    _send_cyd_lines([f"[FETCH] GET {url[:36]}..."])
+                    t0 = time.perf_counter()
+                    try:
+                        req = urllib.request.Request(
+                            url,
+                            headers={
+                                "User-Agent": "CYD-CyberDeck-Terminal/4.0",
+                                "Accept": "*/*",
+                            },
+                        )
+                        with urllib.request.urlopen(req, timeout=6.0) as resp:
+                            elapsed_ms = (time.perf_counter() - t0) * 1000.0
+                            code = getattr(resp, "status", 200)
+                            srv = resp.headers.get("Server", "Web")[:16]
+                            ctype = (resp.headers.get("Content-Type", "text/html").split(";")[0])[:22]
+                            body_sample = resp.read(2048).decode("utf-8", errors="ignore")
+                            _send_cyd_lines([
+                                f"[OK] ONLINE - Status {code} OK ({elapsed_ms:.0f} ms)",
+                                f"Srv: {srv} | Tipo: {ctype}",
+                            ])
+                            # Tenta extrair <title> ou chave JSON de resumo
+                            m_tit = re.search(r"<title[^>]*>(.*?)</title>", body_sample, re.IGNORECASE | re.DOTALL)
+                            if m_tit:
+                                clean_t = re.sub(r"\s+", " ", m_tit.group(1)).strip()[:44]
+                                if clean_t:
+                                    _send_cyd_lines([f"Title: {clean_t}"])
+                    except urllib.error.HTTPError as he:
+                        elapsed_ms = (time.perf_counter() - t0) * 1000.0
+                        _send_cyd_lines([f"[WARN] HTTP Status {he.code} ({he.reason}) em {elapsed_ms:.0f} ms"])
+                    except Exception as ex:
+                        _send_cyd_lines([f"[ERR] OFFLINE / Falha ao conectar: {str(ex)[:40]}"])
+
+                elif verb == "docker":
+                    sub_args = parts[1:] if len(parts) > 1 else ["ps", "--format", "table {{.Names}}\t{{.Status}}"]
+                    _send_cyd_lines([f"[DOCKER] Executando: docker {' '.join(sub_args)[:30]}..."])
+                    creation_flags = getattr(subprocess, "CREATE_NO_WINDOW", 0) if IS_WINDOWS else 0
+                    try:
+                        res = subprocess.run(
+                            ["docker"] + sub_args,
+                            capture_output=True,
+                            text=True,
+                            timeout=8.0,
+                            encoding="utf-8",
+                            errors="ignore",
+                            creationflags=creation_flags,
+                        )
+                        out_txt = (res.stdout or "") + ("\n" + res.stderr if res.stderr else "")
+                        out_lines = [ln.strip() for ln in out_txt.splitlines() if ln.strip()]
+                        if res.returncode == 0:
+                            if out_lines:
+                                _send_cyd_lines(out_lines[:10])
+                            else:
+                                _send_cyd_lines(["[OK] Comando docker concluido (0 containers ativos)."])
+                        else:
+                            err_preview = out_lines[:4] if out_lines else ["Daemon Docker parado ou inacessivel."]
+                            _send_cyd_lines(["[ERR] Docker retornou codigo " + str(res.returncode)] + err_preview)
+                    except FileNotFoundError:
+                        _send_cyd_lines(["[ERR] Docker CLI nao encontrado no PATH deste PC."])
+                    except subprocess.TimeoutExpired:
+                        _send_cyd_lines(["[ERR] Timeout (8s) aguardando resposta do Docker Daemon."])
+                    except Exception as ex:
+                        _send_cyd_lines([f"[ERR] Falha ao executar docker: {str(ex)[:38]}"])
+
+                elif verb in ("ip", "ipconfig", "ifconfig", "net"):
+                    lan = get_local_lan_ip()
+                    host = socket.gethostname()
+                    _send_cyd_lines([
+                        f"[NET] Host: {host}",
+                        f"[NET] IPv4 LAN: {lan} [ONLINE]",
+                    ])
+
+                elif verb in ("top", "ps", "procs"):
+                    procs = []
+                    for p in psutil.process_iter(["name", "cpu_percent", "memory_percent"]):
+                        try:
+                            info = p.info
+                            if info["name"] and info["name"].lower() not in ("system idle process", "idle"):
+                                procs.append((float(info.get("memory_percent") or 0.0), info["name"]))
+                        except Exception:
+                            pass
+                    procs.sort(reverse=True)
+                    lines_p = ["[TOP] Top 5 Processos por Uso de RAM no PC:"]
+                    for idx_p, (mem_p, pname) in enumerate(procs[:5], 1):
+                        lines_p.append(f"  {idx_p}) {pname[:24]:<24} RAM: {mem_p:.1f}%")
+                    _send_cyd_lines(lines_p)
+
+                else:
+                    _send_cyd_lines([
+                        f"[ERR] Comando desconhecido: '{verb}'",
+                        "Use: ping <alvo>, fetch <url>, docker <cmd>, wifi scan",
+                    ])
+
+                if log_fn:
+                    log_fn(f"💻 Terminal executou: {cmd_str}")
+            finally:
+                with self._lock:
+                    self._busy = False
+
+        threading.Thread(target=_runner, daemon=True).start()
 
 
 # ========================================== INTERFACE MODERNA EM FLET (FLUTTER) ==
@@ -2620,10 +3385,14 @@ def launch_flet_gui(
     media_col: MediaCollector,
     pomo_eng: PomodoroEngine,
     wth_col: WeatherCollector,
-    gems_eng: GeminiGemsEngine,
+    gems_eng: NewsFeedCollector,
     cli_args,
+    term_eng: CyberDeckTerminalEngine = None,
 ):
     import flet as ft
+
+    if term_eng is None:
+        term_eng = CyberDeckTerminalEngine()
 
     # Helpers compativeis entre Flet 0.2x e Flet 1.0+
     _ICONS = getattr(ft, "Icons", getattr(ft, "icons", None))
@@ -2665,7 +3434,7 @@ def launch_flet_gui(
         return ft.Dropdown(**kw)
 
     def build_app(page: ft.Page):
-        page.title = "CYD Hardware & Financial Market Monitor v4.1 — Central de Controle + Clima & Gemini IA"
+        page.title = "CYD Cyber Deck v4.0 — Terminal Administrativo, News Feed, Clima & Telemetria"
         page.bgcolor = "#07090E"
         page.padding = 14
         page.scroll = None  # Viewport fixo com abas independentes (zero poluicao visual!)
@@ -2697,11 +3466,9 @@ def launch_flet_gui(
             "media_source_pref": str(cfg.get("media_source_pref", "auto")),
             "media_auto_cover": bool(cfg.get("media_auto_cover", True)),
             "weather_city": str(cfg.get("weather_city", "Votuporanga")),
-            "gemini_api_key": str(cfg.get("gemini_api_key", os.environ.get("GEMINI_API_KEY", ""))),
-            "gemini_model": str(cfg.get("gemini_model", "gemini-3.8-flash")),
-            "gems": [dict(g) for g in cfg.get("gems", DEFAULT_GEMS)],
-            "active_gem_id": str(cfg.get("active_gem_id", "gem_embedded")),
-            "gem_auto_rotate": bool(cfg.get("gem_auto_rotate", True)),
+            "news_topics": list(cfg.get("news_topics", DEFAULT_NEWS_TOPICS)),
+            "news_api_key": str(cfg.get("news_api_key", os.environ.get("NEWS_API_KEY", ""))),
+            "term_auto_switch": True,
             "synced_cover_id": "",
             "sd_missing_warned": False,
             "current_effective_brt": int(cfg.get("brt", 200)),
@@ -2710,18 +3477,45 @@ def launch_flet_gui(
             "last_ui_sync": 0.0,
             "last_mkt_sync": 0.0,
             "last_brt_ev": 0.0,
+            "rail_extended": True,
+            "_last_news_sig": None,
+            "_last_pf_sig": None,
         }
         mkt_col.set_custom_tickers([p.get("ticker", "") for p in state["portfolio"]])
         media_col.set_source_pref(state["media_source_pref"])
         pomo_eng.set_durations(state["pomo_work_min"], state["pomo_break_min"], state["pomo_long_min"])
         pomo_eng.buzzer_enabled = state["pomo_buzzer"]
-        gems_eng.configure(
-            api_key=state["gemini_api_key"],
-            model=state["gemini_model"],
-            gems=state["gems"],
-            active_gem_id=state["active_gem_id"],
-            auto_rotate=state["gem_auto_rotate"],
-        )
+        gems_eng.set_topics(state["news_topics"], state["news_api_key"])
+
+        def safe_update(*controls):
+            """
+            State Management Eficiente (Clean UI):
+            Atualiza apenas os controles específicos passados como argumento via `.update()` isolado,
+            evitando re-renderizar a página inteira a cada ciclo de telemetria.
+            """
+            if not state.get("running", True):
+                return
+            if not controls:
+                try:
+                    page.update()
+                except Exception:
+                    pass
+                return
+            updated_any = False
+            for ctrl in controls:
+                if ctrl is None:
+                    continue
+                try:
+                    if getattr(ctrl, "page", None) is not None:
+                        ctrl.update()
+                        updated_any = True
+                except Exception:
+                    pass
+            if not updated_any:
+                try:
+                    page.update()
+                except Exception:
+                    pass
 
         def restore_window(icon=None, item=None):
             try:
@@ -2748,6 +3542,14 @@ def launch_flet_gui(
         def quit_app(icon=None, item=None):
             state["running"] = False
             try:
+                serial_mgr.stop()
+            except Exception:
+                pass
+            try:
+                col.stop()
+            except Exception:
+                pass
+            try:
                 if tray_icon:
                     tray_icon.stop()
             except Exception:
@@ -2766,22 +3568,22 @@ def launch_flet_gui(
             if "close" in ev_data or "close" in ev_type:
                 minimize_window()
 
+        ico_file, png_file = get_app_icon_paths()
         try:
-            ico_file = get_resource_path(os.path.join("imgs", "imgsCYD.ico"))
             if hasattr(page, "window") and page.window is not None:
-                page.window.width = 1040
-                page.window.height = 820
-                page.window.min_width = 880
+                page.window.width = 1140
+                page.window.height = 840
+                page.window.min_width = 920
                 page.window.min_height = 660
                 page.window.prevent_close = True
                 page.window.on_event = on_window_event
-                if os.path.exists(ico_file):
+                if ico_file and os.path.exists(ico_file):
                     page.window.icon = ico_file
-            else:
-                page.window_width = 1040
-                page.window_height = 820
-                if os.path.exists(ico_file) and hasattr(page, "window_icon"):
+            if ico_file and os.path.exists(ico_file) and hasattr(page, "window_icon"):
+                try:
                     page.window_icon = ico_file
+                except Exception:
+                    pass
         except Exception:
             pass
 
@@ -2792,12 +3594,12 @@ def launch_flet_gui(
             from PIL import Image, ImageDraw
 
             def create_tray_image():
-                ico_file = get_resource_path(os.path.join("imgs", "imgsCYD.ico"))
-                if os.path.exists(ico_file):
-                    try:
-                        return Image.open(ico_file)
-                    except Exception:
-                        pass
+                for candidate in (png_file, ico_file):
+                    if candidate and os.path.exists(candidate):
+                        try:
+                            return Image.open(candidate)
+                        except Exception:
+                            pass
                 img = Image.new("RGBA", (64, 64), (0, 0, 0, 0))
                 draw = ImageDraw.Draw(img)
                 draw.rounded_rectangle([2, 2, 62, 62], radius=12, fill=(15, 23, 42, 255), outline=(0, 255, 128, 255), width=3)
@@ -2813,17 +3615,18 @@ def launch_flet_gui(
             tray_icon = pystray.Icon(
                 "cyd_monitor",
                 create_tray_image(),
-                "CYD Hardware & Market Monitor (Ativo em Segundo Plano)",
+                "CYD Cyber Deck v4.0 (Ativo em Segundo Plano)",
                 menu=tray_menu,
             )
             threading.Thread(target=tray_icon.run, daemon=True).start()
         except Exception:
             tray_icon = None
 
-        ui_event_queue = queue.Queue()
-        transfer_queue = queue.Queue()
-        ack_event = threading.Event()
-        last_ack = {"val": None}
+        serial_mgr = SerialManager(preferred_port=cli_args.port, baud=BAUD)
+        ui_event_queue = serial_mgr.event_queue
+        transfer_queue = serial_mgr.transfer_queue
+        ack_event = serial_mgr.ack_event
+        last_ack = serial_mgr.last_ack
         log_lines = []
         upload_state = {
             "active": False,
@@ -2869,30 +3672,25 @@ def launch_flet_gui(
                 "media_source_pref": state["media_source_pref"],
                 "media_auto_cover": state["media_auto_cover"],
                 "weather_city": state["weather_city"],
-                "gemini_api_key": state["gemini_api_key"],
-                "gemini_model": state["gemini_model"],
-                "gems": state["gems"],
-                "active_gem_id": state["active_gem_id"],
-                "gem_auto_rotate": state["gem_auto_rotate"],
+                "news_topics": state["news_topics"],
+                "news_api_key": state["news_api_key"],
             })
             save_ui_config(cfg)
             mkt_col.set_custom_tickers([p.get("ticker", "") for p in state["portfolio"]])
             portf_pkt, _ = mkt_col.compute_portfolio(state["portfolio"], state["portfolio_pnl_mode"])
             state["ui_dirty"] = True
-            while not ui_event_queue.empty():
-                try:
-                    ui_event_queue.get_nowait()
-                except Exception:
-                    break
-            ui_event_queue.put({
-                "ui": get_ui_dict(),
-                "mkt": mkt_col.get_market_dict(),
-                "portf": portf_pkt,
-                "pomo": pomo_eng.get_payload(),
-                "media": media_col.get_cyd_payload(state["synced_cover_id"]),
-                "wth": wth_col.get_cyd_payload(),
-                "gem": gems_eng.get_cyd_payload(),
-            })
+            serial_mgr.send_event(
+                {
+                    "ui": get_ui_dict(),
+                    "mkt": mkt_col.get_market_dict(),
+                    "portf": portf_pkt,
+                    "pomo": pomo_eng.get_payload(),
+                    "media": media_col.get_cyd_payload(state["synced_cover_id"]),
+                    "wth": wth_col.get_cyd_payload(),
+                    "news": gems_eng.get_cyd_news_payload(include_queue=True, force=True),
+                },
+                coalesce=True,
+            )
 
         def append_log(msg: str):
             ts = datetime.now().strftime("%H:%M:%S")
@@ -2900,10 +3698,8 @@ def launch_flet_gui(
             if len(log_lines) > 60:
                 del log_lines[0]
             txt_console.value = "\n".join(log_lines)
-            try:
-                page.update()
-            except Exception:
-                pass
+            if state.get("active_tab") == 7:
+                safe_update(txt_console)
 
         SCREEN_SHORT_NAMES = {
             0: "Gauges",
@@ -2916,21 +3712,29 @@ def launch_flet_gui(
             7: "Portfólio",
             8: "Pomodoro",
             9: "Mídia",
-            10: "Clima & IA",
+            10: "Clima & News",
+            11: "Terminal CYD",
         }
 
         def switch_tab(tab_idx: int):
             state["active_tab"] = int(tab_idx)
             refresh_tabs_ui()
-            try:
-                page.update()
-            except Exception:
-                pass
 
-        # ------------------------ CABECALHO COMPACTO + CHIPS GLOBAIS ---------
+        # ------------------------ CABECALHO COMPACTO + NOVA IDENTIDADE VISUAL -
+        hdr_brand_logo = (
+            ft.Image(
+                src=png_file,
+                width=30,
+                height=30,
+                border_radius=7,
+                fit=ft.BoxFit.CONTAIN if hasattr(ft, "BoxFit") else "contain",
+            )
+            if (png_file and os.path.exists(png_file))
+            else ft.Icon(icon_val("MEMORY"), size=24, color=state["hex_color"])
+        )
         lbl_title = ft.Text(
-            "⚡ CYD MONITOR v4.1",
-            size=18,
+            "CYD CYBER DECK v4.0",
+            size=17,
             weight=ft.FontWeight.BOLD,
             color=state["hex_color"],
             font_family="Consolas",
@@ -2949,7 +3753,7 @@ def launch_flet_gui(
             border_radius=16,
             padding=pad_sym(horizontal=10, vertical=4),
             ink=True,
-            tooltip="Clique para gerenciar as 11 telas da CYD",
+            tooltip="Clique para gerenciar as 12 telas da CYD (0 a 11)",
             on_click=lambda e: switch_tab(0),
         )
 
@@ -2969,7 +3773,7 @@ def launch_flet_gui(
             border_radius=16,
             padding=pad_sym(horizontal=10, vertical=4),
             ink=True,
-            tooltip="Hora, Data e Clima Regional (Votuporanga) + Gemini Gems — Clique para abrir Clima & Gemini IA",
+            tooltip="Hora, Data e Clima Regional (Votuporanga) + News Feed — Clique para abrir Clima & News Feed",
             on_click=lambda e: switch_tab(3),
         )
 
@@ -2995,7 +3799,7 @@ def launch_flet_gui(
             color="#94A3B8",
             max_lines=1,
             overflow=ft.TextOverflow.ELLIPSIS,
-            width=150,
+            width=135,
         )
         btn_hdr_media_pp = ft.IconButton(
             icon=icon_val("PLAY_ARROW"),
@@ -3036,7 +3840,7 @@ def launch_flet_gui(
             padding=pad_sym(horizontal=10, vertical=4),
             ink=True,
             tooltip="Brilho Dinâmico & Modo Sleep — Clique para abrir Estúdio & Energia",
-            on_click=lambda e: switch_tab(4),
+            on_click=lambda e: switch_tab(5),
         )
 
         status_dot = ft.Container(
@@ -3058,7 +3862,9 @@ def launch_flet_gui(
             border=border_all(1, "#222B3D"),
             border_radius=20,
             padding=pad_sym(horizontal=11, vertical=5),
-            tooltip="Status da Conexão Serial USB (115200 bps)",
+            ink=True,
+            on_click=lambda e: switch_tab(7),
+            tooltip="Status da Conexão Serial USB Assíncrona (115200 bps) — Clique para diagnóstico",
         )
 
         btn_hdr_qr = ft.IconButton(
@@ -3066,7 +3872,7 @@ def launch_flet_gui(
             icon_size=18,
             icon_color="#94A3B8",
             tooltip="Abrir QR Code Controle pelo Celular (Wi-Fi)",
-            on_click=lambda e: switch_tab(6),
+            on_click=lambda e: switch_tab(7),
         )
         btn_minimize = ft.IconButton(
             icon=icon_val("MINIMIZE"),
@@ -3083,27 +3889,37 @@ def launch_flet_gui(
             on_click=lambda e: quit_app(),
         )
 
-        header_row = ft.Row(
-            [
-                ft.Row([lbl_title, chip_active_screen], spacing=10, vertical_alignment=ft.CrossAxisAlignment.CENTER),
-                ft.Row(
-                    [
-                        pill_hdr_weather,
-                        pill_hdr_pomo,
-                        pill_hdr_media,
-                        pill_hdr_power,
-                        status_badge,
-                        btn_hdr_qr,
-                        btn_minimize,
-                        btn_quit,
-                    ],
-                    spacing=6,
-                    tight=True,
-                    vertical_alignment=ft.CrossAxisAlignment.CENTER,
-                ),
-            ],
-            alignment=ft.MainAxisAlignment.SPACE_BETWEEN,
-            vertical_alignment=ft.CrossAxisAlignment.CENTER,
+        header_row = ft.Container(
+            content=ft.Row(
+                [
+                    ft.Row(
+                        [hdr_brand_logo, lbl_title, chip_active_screen],
+                        spacing=10,
+                        vertical_alignment=ft.CrossAxisAlignment.CENTER,
+                    ),
+                    ft.Row(
+                        [
+                            pill_hdr_weather,
+                            pill_hdr_pomo,
+                            pill_hdr_media,
+                            pill_hdr_power,
+                            status_badge,
+                            btn_hdr_qr,
+                            btn_minimize,
+                            btn_quit,
+                        ],
+                        spacing=6,
+                        tight=True,
+                        vertical_alignment=ft.CrossAxisAlignment.CENTER,
+                    ),
+                ],
+                alignment=ft.MainAxisAlignment.SPACE_BETWEEN,
+                vertical_alignment=ft.CrossAxisAlignment.CENTER,
+            ),
+            bgcolor="#0A0E17",
+            border=border_all(1, "#182030"),
+            border_radius=12,
+            padding=pad_sym(horizontal=12, vertical=6),
         )
 
         # ---------------- FAIXA DE TELEMETRIA AO VIVO NO PC ------------------
@@ -3249,8 +4065,9 @@ def launch_flet_gui(
                             ft.Row(
                                 [
                                     btn_ticker_quick,
-                                    ft.OutlinedButton("💼 Abrir Carteira", on_click=lambda e: switch_tab(2)),
-                                    ft.OutlinedButton("🌦️🤖 Clima & Gemini", on_click=lambda e: switch_tab(3)),
+                                    ft.OutlinedButton("💼 Carteira", on_click=lambda e: switch_tab(2)),
+                                    ft.OutlinedButton("📰 Clima & News", on_click=lambda e: switch_tab(3)),
+                                    ft.OutlinedButton("💻 Terminal CYD", on_click=lambda e: switch_tab(4)),
                                 ],
                                 spacing=8,
                             ),
@@ -3306,7 +4123,7 @@ def launch_flet_gui(
             padding=12,
         )
 
-        # ---------------- 1. GERENCIADOR DE TELAS (11 MODOS 0..10) -----------
+        # ---------------- 1. GERENCIADOR DE TELAS (12 MODOS 0..11) -----------
         screen_defs = [
             (0, "⚡ Tela 0: Resumo Gauges", "Gauges circulares de CPU & RAM + Disco/Rede", "SPEED"),
             (1, "🖥️ Tela 1: CPU + RAM", "Barras duplas + Gráficos CPU % e RAM % lado a lado", "TERMINAL"),
@@ -3318,7 +4135,8 @@ def launch_flet_gui(
             (7, "💼 Tela 7: Meu Portfólio", "Patrimônio (R$), Lucro/Prejuízo Dinâmico + Top 3 Ativos", "ACCOUNT_BALANCE_WALLET"),
             (8, "🍅 Tela 8: Pomodoro Focus", "Cronômetro circular Foco 25m / Pausa 5m + Buzzer no fim", "TIMER"),
             (9, "🎵 Tela 9: Spotify & YT Music", "Capa 320x240 no SD + Overlay Translúcido Título/Artista", "ALBUM"),
-            (10, "🌦️🤖 Tela 10: Clima & Gemini Gems", "Data, Localização (Votuporanga), Temp °C, Alertas de Tempestade & IA Gems", "WB_SUNNY"),
+            (10, "📰 Tela 10: Clima & News Feed", "Clima Regional (Votuporanga) + Manchetes Deslizantes (TFT_eSprite 15s)", "NEWSPAPER"),
+            (11, "💻 Tela 11: Terminal Cyber Deck", "Console Verde Clássico c/ Scroll + ping, fetch, docker & Wi-Fi Scan", "TERMINAL"),
         ]
         screen_cards = []
 
@@ -3337,10 +4155,7 @@ def launch_flet_gui(
                 title_t.color = state["hex_color"] if active else "#E2E8F0"
                 badge_t.bgcolor = state["hex_color"] if active else "#1A2234"
                 badge_t.content.color = "#05070A" if active else "#94A3B8"
-            try:
-                page.update()
-            except Exception:
-                pass
+            safe_update(screens_grid, chip_active_screen)
 
         for idx, title, desc, _ic in screen_defs:
             active = (idx == state["screen"])
@@ -3376,9 +4191,9 @@ def launch_flet_gui(
                 ft.Row([screen_cards[0][1], screen_cards[1][1], screen_cards[2][1]], spacing=8),
                 ft.Row([screen_cards[3][1], screen_cards[4][1], screen_cards[5][1]], spacing=8),
                 ft.Divider(height=4, color="#151C28"),
-                ft.Text("MÓDULOS INTELIGENTES v4.1 — FINANÇAS, FOCO, MÍDIA, CLIMA REGIONAL & GEMINI GEMS (TELAS 6 A 10)", size=10, weight=ft.FontWeight.BOLD, color="#64748B"),
-                ft.Row([screen_cards[6][1], screen_cards[7][1]], spacing=8),
-                ft.Row([screen_cards[8][1], screen_cards[9][1], screen_cards[10][1]], spacing=8),
+                ft.Text("CYD CYBER DECK v4.0 — FINANÇAS, FOCO, MÍDIA, CLIMA, NEWS FEED & TERMINAL (TELAS 6 A 11)", size=10, weight=ft.FontWeight.BOLD, color="#64748B"),
+                ft.Row([screen_cards[6][1], screen_cards[7][1], screen_cards[8][1]], spacing=8),
+                ft.Row([screen_cards[9][1], screen_cards[10][1], screen_cards[11][1]], spacing=8),
             ],
             spacing=7,
         )
@@ -3388,7 +4203,7 @@ def launch_flet_gui(
                 [
                     ft.Row(
                         [
-                            ft.Text("🖥️ SELECIONE A TELA ATIVA NA CYD (11 MODOS EM TEMPO REAL + CLIMA NO TOPO)", size=12, weight=ft.FontWeight.BOLD, color="#94A3B8"),
+                            ft.Text("🖥️ SELECIONE A TELA ATIVA NA CYD (12 MODOS CYBER DECK EM TEMPO REAL)", size=12, weight=ft.FontWeight.BOLD, color="#94A3B8"),
                             ft.Text("Troca instantânea via USB (< 50ms)", size=11, color="#64748B"),
                         ],
                         alignment=ft.MainAxisAlignment.SPACE_BETWEEN,
@@ -4277,6 +5092,15 @@ def launch_flet_gui(
             lbl_portf_pnl.color = "#22C55E" if pnl_v >= 0 else "#EF4444"
             lbl_portf_day.value = f"Variação 24h: {'+' if day_p >= 0 else ''}{day_p:.2f}%  •  Top 3: {', '.join(pf_summary['top3']) or 'Nenhum'}"
             lbl_portf_day.color = "#22C55E" if day_p >= 0 else "#F59E0B"
+
+            pf_sig = (
+                state["hex_color"],
+                state["portfolio_pnl_mode"],
+                tuple((r["ticker"], r["qty"], r["avg_price"], round(r["pos_val_brl"], 1)) for r in pf_rows),
+            )
+            if pf_sig == state.get("_last_pf_sig"):
+                return
+            state["_last_pf_sig"] = pf_sig
 
             portfolio_rows_col.controls.clear()
             if not pf_rows:
@@ -5211,275 +6035,216 @@ def launch_flet_gui(
             expand=True,
         )
 
-        # ---- Painel Direito: Google Gemini & Automação de Gems Diárias ----
-        txt_gemini_key = ft.TextField(
-            label="Google Gemini API Key (Opcional — sem chave usa Smart Feed RSS PT-BR)",
-            value=state["gemini_api_key"],
-            password=True,
-            can_reveal_password=True,
-            expand=True,
-            height=42,
-            text_size=12,
-            content_padding=pad_sym(horizontal=10, vertical=6),
+        # ---- Painel Direito (Aba 3): Módulo 1 — Feed de Notícias Customizável (SCR_NEWS / Tela 10) ----
+        lbl_news_status = ft.Text(
+            "Sincronizando manchetes via RSS/API...",
+            size=10,
+            color="#94A3B8",
+            font_family="Consolas",
         )
-        dd_gemini_model = ft.Dropdown(
-            label="Modelo Gemini",
-            value=state["gemini_model"],
-            width=185,
-            text_size=12,
-            content_padding=pad_sym(horizontal=10, vertical=4),
-            options=make_dropdown_options(["gemini-3.8-flash", "gemini-4-argon", "gemini-3.5-flash-lite"]),
+        lbl_news_active_topic = ft.Text(
+            "📰 [POLÍTICA]",
+            size=12,
+            weight=ft.FontWeight.BOLD,
+            color="#38BDF8",
+            font_family="Consolas",
         )
-        sw_gem_autorotate = ft.Switch(
-            value=state["gem_auto_rotate"],
-            active_color="#A855F7",
-            tooltip="Alternar e executar automaticamente as Gems habilitadas conforme o intervalo de cada uma",
+        lbl_news_active_timer = ft.Text(
+            "Próxima em 15s • Fonte: RSS",
+            size=10,
+            color="#FACC15",
+            font_family="Consolas",
         )
-
-        lbl_gem_active_title = ft.Text("🤖 GEM ATIVA: Radar Embarcados & IoT", size=12, weight=ft.FontWeight.BOLD, color="#C084FC", font_family="Consolas")
-        lbl_gem_active_meta = ft.Text("Modelo: Smart Feed • Atualizado: --:--", size=10, color="#94A3B8", font_family="Consolas")
-        lbl_gem_active_body = ft.Text(
-            "Carregando briefing da Gem...",
-            size=11,
-            color="#E2E8F0",
+        lbl_news_active_headline = ft.Text(
+            "Carregando manchetes em tempo real...",
+            size=12,
+            weight=ft.FontWeight.BOLD,
+            color="#F8FAFC",
             font_family="Consolas",
             selectable=True,
         )
 
-        def on_save_gemini_config(_e):
-            state["gemini_api_key"] = (txt_gemini_key.value or "").strip()
-            state["gemini_model"] = dd_gemini_model.value or "gemini-3.8-flash"
-            state["gem_auto_rotate"] = bool(sw_gem_autorotate.value)
-            gems_eng.update_config(
-                api_key=state["gemini_api_key"],
-                model=state["gemini_model"],
-                gems=state["gems"],
-                active_gem_id=state["active_gem_id"],
-                auto_rotate=state["gem_auto_rotate"],
-            )
-            persist_and_queue_ui()
-            mode_str = f"Gemini API ({state['gemini_model']})" if state["gemini_api_key"] else "Smart Feed RSS + Contexto Local"
-            append_log(f"🤖 Configuração Gemini salva ({mode_str}).")
-            refresh_weather_gems_ui()
-
-        sw_gem_autorotate.on_change = on_save_gemini_config
-
-        txt_gem_name = ft.TextField(
-            label="Nome da Gem (Ex: Radar Embarcados & ESP32)",
-            value="🔧 Radar Embarcados & IoT",
+        txt_custom_topic = ft.TextField(
+            label="Adicionar Tópico Customizado (Ex: Inteligência Artificial, Linux, Agronegócio)",
+            value="",
             expand=True,
             height=40,
             text_size=12,
             content_padding=pad_sym(horizontal=10, vertical=6),
         )
-        dd_gem_cat = ft.Dropdown(
-            label="Categoria / Fonte",
-            value="embarcados",
-            width=145,
-            text_size=12,
-            content_padding=pad_sym(horizontal=8, vertical=4),
-            options=make_dropdown_options(["embarcados", "clima", "mercado", "dev", "custom"]),
-        )
-        txt_gem_interval = ft.TextField(
-            label="Intervalo (min)",
-            value="30",
-            width=105,
+        txt_news_api_key = ft.TextField(
+            label="NewsAPI.org Key (Opcional — sem chave usa Google/Bing News RSS Gratuito)",
+            value=state["news_api_key"],
+            password=True,
+            can_reveal_password=True,
+            width=260,
             height=40,
-            text_size=12,
-            content_padding=pad_sym(horizontal=8, vertical=6),
-        )
-        txt_gem_prompt = ft.TextField(
-            label="Prompt / Instrução da Gem (Enviado ao Gemini com Pesquisa Google em tempo real)",
-            value=DEFAULT_GEMS[0]["prompt"],
-            multiline=True,
-            min_lines=2,
-            max_lines=3,
             text_size=11,
-            content_padding=pad_sym(horizontal=10, vertical=8),
+            content_padding=pad_sym(horizontal=10, vertical=6),
         )
 
-        gems_list_col = ft.Column(spacing=5, scroll=ft.ScrollMode.AUTO, height=145)
+        topic_chips_row = ft.Row(wrap=True, spacing=6, run_spacing=6)
+        news_queue_col = ft.Column(spacing=5, scroll=ft.ScrollMode.AUTO, height=150)
 
-        def on_run_gem_now(gem_id: str):
-            def _worker():
-                append_log(f"🤖 Executando Gem '{gem_id}' e sincronizando com a placa CYD...")
-                gems_eng.set_active_gem(gem_id)
-                state["active_gem_id"] = gem_id
-                res = gems_eng.run_gem_now(
-                    gem_id,
-                    weather_snap=wth_col.get_ui_snapshot(),
-                    market_snap=mkt_col.get_market_dict(),
-                    sys_snap=col.sample_sys(),
-                )
-                persist_and_queue_ui()
-                ui_event_queue.put({
-                    "wth": wth_col.get_cyd_payload(),
-                    "gem": gems_eng.get_cyd_payload(),
-                })
-                append_log(f"✅ Gem '{res.get('title', gem_id)}' atualizada ({res.get('model', '')}) e enviada para a CYD!")
+        def on_toggle_news_topic(topic_name: str):
+            curr = list(state["news_topics"])
+            if topic_name in curr:
+                if len(curr) <= 1:
+                    append_log("⚠️ Mantenha pelo menos 1 tópico ativo no Feed de Notícias.")
+                    return
+                curr.remove(topic_name)
+                append_log(f"📰 Tópico '{topic_name}' removido do Feed de Notícias.")
+            else:
+                curr.append(topic_name)
+                append_log(f"📰 Tópico '{topic_name}' ativado no Feed de Notícias.")
+            state["news_topics"] = curr
+            gems_eng.set_topics(curr, state["news_api_key"])
+            persist_and_queue_ui()
+            refresh_weather_gems_ui()
+
+        def on_add_custom_news_topic(_e=None):
+            new_t = (txt_custom_topic.value or "").strip()
+            api_k = (txt_news_api_key.value or "").strip()
+            state["news_api_key"] = api_k
+            if new_t and new_t not in state["news_topics"]:
+                state["news_topics"].append(new_t)
+                txt_custom_topic.value = ""
+                append_log(f"📰 Tópico customizado '{new_t}' adicionado ao Feed de Notícias!")
+            gems_eng.set_topics(state["news_topics"], state["news_api_key"])
+            persist_and_queue_ui()
+            refresh_weather_gems_ui()
+
+        txt_custom_topic.on_submit = on_add_custom_news_topic
+
+        def on_manual_news_refresh(_e=None):
+            def _w():
+                append_log("📰 Atualizando manchetes de todos os tópicos selecionados (Async RSS/API)...")
+                gems_eng.fetch_now()
+                ui_event_queue.put({"news": gems_eng.get_cyd_news_payload(include_queue=True, force=True)})
                 refresh_weather_gems_ui()
+                append_log("✅ Feed de Notícias sincronizado e enviado para a SCR_NEWS (Tela 10)!")
                 try:
                     page.update()
                 except Exception:
                     pass
 
-            threading.Thread(target=_worker, daemon=True).start()
+            threading.Thread(target=_w, daemon=True).start()
 
-        def on_load_gem_into_editor(g: dict):
-            txt_gem_name.value = g.get("name", "")
-            dd_gem_cat.value = g.get("category", "embarcados")
-            txt_gem_interval.value = str(g.get("interval_min", 30))
-            txt_gem_prompt.value = g.get("prompt", "")
-            try:
-                page.update()
-            except Exception:
-                pass
-
-        def on_save_or_add_gem(_e):
-            name_v = (txt_gem_name.value or "").strip()
-            prompt_v = (txt_gem_prompt.value or "").strip()
-            cat_v = dd_gem_cat.value or "custom"
-            try:
-                int_v = max(5, int(float(txt_gem_interval.value or "30")))
-            except Exception:
-                int_v = 30
-            if not name_v or not prompt_v:
-                append_log("⚠️ Informe o nome e o prompt da Gem.")
-                return
-            # Atualiza se mesmo nome existir, senao cria nova
-            found = False
-            for g in state["gems"]:
-                if g.get("name", "").strip().lower() == name_v.lower():
-                    g["prompt"] = prompt_v
-                    g["category"] = cat_v
-                    g["interval_min"] = int_v
-                    g["enabled"] = True
-                    state["active_gem_id"] = g["id"]
-                    found = True
-                    break
-            if not found:
-                new_id = f"gem_{int(time.time()) % 100000}"
-                state["gems"].append({
-                    "id": new_id,
-                    "name": name_v,
-                    "category": cat_v,
-                    "prompt": prompt_v,
-                    "interval_min": int_v,
-                    "enabled": True,
-                })
-                state["active_gem_id"] = new_id
-            gems_eng.update_config(
-                api_key=state["gemini_api_key"],
-                model=state["gemini_model"],
-                gems=state["gems"],
-                active_gem_id=state["active_gem_id"],
-                auto_rotate=state["gem_auto_rotate"],
-            )
-            persist_and_queue_ui()
-            on_run_gem_now(state["active_gem_id"])
-
-        def on_delete_gem(gid: str):
-            if len(state["gems"]) <= 1:
-                append_log("⚠️ Mantenha pelo menos 1 Gem configurada.")
-                return
-            state["gems"] = [g for g in state["gems"] if g.get("id") != gid]
-            if state["active_gem_id"] == gid:
-                state["active_gem_id"] = state["gems"][0]["id"]
-            gems_eng.update_config(
-                api_key=state["gemini_api_key"],
-                model=state["gemini_model"],
-                gems=state["gems"],
-                active_gem_id=state["active_gem_id"],
-                auto_rotate=state["gem_auto_rotate"],
-            )
-            persist_and_queue_ui()
+        def on_next_news_headline(_e=None):
+            nxt = gems_eng.next_headline()
+            ui_event_queue.put({"news": gems_eng.get_cyd_news_payload(include_queue=False, force=True)})
             refresh_weather_gems_ui()
+            append_log(f"📰 Manchete avançada na CYD: [{nxt.get('topic', '')}] {nxt.get('headline', '')[:55]}...")
 
-        def rebuild_gems_list_ui():
-            gems_list_col.controls.clear()
-            act_id = state["active_gem_id"]
-            for g in state["gems"]:
-                gid = g.get("id", "")
-                is_act = (gid == act_id)
-                row_c = ft.Container(
+        def on_select_news_item(idx_q: int):
+            sel = gems_eng.select_index(idx_q)
+            ui_event_queue.put({"news": gems_eng.get_cyd_news_payload(include_queue=False, force=True)})
+            refresh_weather_gems_ui()
+            append_log(f"📰 Manchete #{idx_q + 1} enviada para a CYD: [{sel.get('topic', '')}] {sel.get('headline', '')[:55]}...")
+
+        def rebuild_news_topics_and_queue_ui(ns: dict):
+            news_sig = (
+                tuple(state["news_topics"]),
+                ns.get("active_index", 0),
+                len(ns.get("queue", [])),
+                ns.get("active_headline", ""),
+            )
+            if news_sig == state.get("_last_news_sig"):
+                return
+            state["_last_news_sig"] = news_sig
+
+            topic_chips_row.controls.clear()
+            all_topics = list(ALL_PRESET_NEWS_TOPICS)
+            for ct in state["news_topics"]:
+                if ct not in all_topics:
+                    all_topics.append(ct)
+
+            for t_name in all_topics:
+                active = t_name in state["news_topics"]
+                chip = ft.Container(
+                    content=ft.Row(
+                        [
+                            ft.Text("✓" if active else "+", size=11, weight=ft.FontWeight.BOLD, color="#05070A" if active else "#94A3B8"),
+                            ft.Text(t_name, size=11, weight=ft.FontWeight.BOLD if active else ft.FontWeight.W_500, color="#05070A" if active else "#E2E8F0"),
+                        ],
+                        spacing=5,
+                        tight=True,
+                    ),
+                    bgcolor="#38BDF8" if active else "#111827",
+                    border=border_all(1, "#38BDF8" if active else "#1E293B"),
+                    border_radius=14,
+                    padding=pad_sym(horizontal=10, vertical=4),
+                    ink=True,
+                    on_click=lambda e, tn=t_name: on_toggle_news_topic(tn),
+                )
+                topic_chips_row.controls.append(chip)
+
+            news_queue_col.controls.clear()
+            q_items = ns.get("queue", [])
+            act_idx = ns.get("active_index", 0)
+            for idx_i, item in enumerate(q_items):
+                is_curr = (idx_i == act_idx)
+                row_card = ft.Container(
                     content=ft.Row(
                         [
                             ft.Container(
-                                content=ft.Column(
-                                    [
-                                        ft.Row(
-                                            [
-                                                ft.Text(
-                                                    f"{'🟢 ' if is_act else ''}{g.get('name', 'Gem')}",
-                                                    size=11,
-                                                    weight=ft.FontWeight.BOLD,
-                                                    color="#C084FC" if is_act else "#E2E8F0",
-                                                ),
-                                                ft.Text(
-                                                    f"[{g.get('category', 'ia').upper()} • a cada {g.get('interval_min', 30)}m]",
-                                                    size=10,
-                                                    color="#64748B",
-                                                    font_family="Consolas",
-                                                ),
-                                            ],
-                                            spacing=6,
-                                        ),
-                                        ft.Text(
-                                            g.get("prompt", ""),
-                                            size=10,
-                                            color="#94A3B8",
-                                            max_lines=1,
-                                            overflow=ft.TextOverflow.ELLIPSIS,
-                                        ),
-                                    ],
-                                    spacing=1,
+                                content=ft.Text(
+                                    item.get("topic", "News")[:16].upper(),
+                                    size=9,
+                                    weight=ft.FontWeight.BOLD,
+                                    color="#05070A" if is_curr else "#38BDF8",
+                                    font_family="Consolas",
                                 ),
+                                bgcolor="#38BDF8" if is_curr else "#0F172A",
+                                border=border_all(1, "#38BDF8"),
+                                border_radius=5,
+                                padding=pad_sym(horizontal=6, vertical=2),
+                            ),
+                            ft.Text(
+                                item.get("headline", ""),
+                                size=11,
+                                weight=ft.FontWeight.BOLD if is_curr else ft.FontWeight.NORMAL,
+                                color="#FFFFFF" if is_curr else "#CBD5E1",
+                                max_lines=1,
+                                overflow=ft.TextOverflow.ELLIPSIS,
                                 expand=True,
-                                on_click=lambda e, gem_obj=g: on_load_gem_into_editor(gem_obj),
                             ),
-                            ft.OutlinedButton(
-                                "▶️ Rodar na CYD",
-                                on_click=lambda e, target_id=gid: on_run_gem_now(target_id),
-                            ),
-                            ft.IconButton(
-                                icon=icon_val("DELETE_OUTLINE"),
-                                icon_color="#EF4444",
-                                icon_size=16,
-                                tooltip="Remover Gem",
-                                on_click=lambda e, target_id=gid: on_delete_gem(target_id),
+                            ft.Text(
+                                item.get("src", "RSS")[:14],
+                                size=10,
+                                color="#64748B",
+                                font_family="Consolas",
                             ),
                         ],
-                        alignment=ft.MainAxisAlignment.SPACE_BETWEEN,
+                        spacing=8,
                         vertical_alignment=ft.CrossAxisAlignment.CENTER,
                     ),
-                    bgcolor="#151026" if is_act else "#0E1420",
-                    border=border_all(1, "#A855F7" if is_act else "#1E293B"),
-                    border_radius=8,
-                    padding=pad_sym(horizontal=10, vertical=5),
+                    bgcolor="#132038" if is_curr else "#0A0E17",
+                    border=border_all(1, "#38BDF8" if is_curr else "#161F30"),
+                    border_radius=7,
+                    padding=pad_sym(horizontal=8, vertical=5),
+                    ink=True,
+                    on_click=lambda e, ii=idx_i: on_select_news_item(ii),
                 )
-                gems_list_col.controls.append(row_c)
+                news_queue_col.controls.append(row_card)
 
-        sec_gemini_gems = ft.Container(
+        sec_news_feed = ft.Container(
             content=ft.Column(
                 [
                     ft.Row(
                         [
-                            ft.Text("🤖 CONEXÃO GOOGLE GEMINI & AUTOMAÇÕES DIÁRIAS (GEMS)", size=12, weight=ft.FontWeight.BOLD, color="#C084FC"),
-                            ft.Row(
-                                [
-                                    ft.Text("Auto-Rotação", size=11, color="#94A3B8"),
-                                    sw_gem_autorotate,
-                                ],
-                                spacing=4,
-                            ),
+                            ft.Text("📰 MÓDULO 1: FEED DE NOTÍCIAS CUSTOMIZÁVEL (TELA 10 • SCR_NEWS)", size=12, weight=ft.FontWeight.BOLD, color="#38BDF8"),
+                            lbl_news_status,
                         ],
                         alignment=ft.MainAxisAlignment.SPACE_BETWEEN,
                     ),
+                    ft.Text("Selecione os tópicos para monitorar (clique para ativar/desativar na fila serial de 15s):", size=11, color="#94A3B8"),
+                    topic_chips_row,
                     ft.Row(
                         [
-                            txt_gemini_key,
-                            dd_gemini_model,
-                            ft.OutlinedButton("🔑 Conectar", on_click=on_save_gemini_config),
+                            txt_custom_topic,
+                            txt_news_api_key,
+                            ft.OutlinedButton("➕ Salvar Tópico", on_click=on_add_custom_news_topic),
                         ],
                         spacing=8,
                     ),
@@ -5488,31 +6253,30 @@ def launch_flet_gui(
                             [
                                 ft.Row(
                                     [
-                                        lbl_gem_active_title,
-                                        lbl_gem_active_meta,
+                                        lbl_news_active_topic,
+                                        lbl_news_active_timer,
                                     ],
                                     alignment=ft.MainAxisAlignment.SPACE_BETWEEN,
                                 ),
-                                lbl_gem_active_body,
+                                lbl_news_active_headline,
                             ],
                             spacing=4,
                         ),
-                        bgcolor="#090714",
-                        border=border_all(1, "#6B21A8"),
+                        bgcolor="#060D1A",
+                        border=border_all(1.5, "#0284C7"),
                         border_radius=10,
                         padding=10,
                     ),
-                    ft.Row([txt_gem_name, dd_gem_cat, txt_gem_interval], spacing=8),
-                    txt_gem_prompt,
                     ft.Row(
                         [
-                            ft.OutlinedButton("💾 Salvar / Criar Gem & Enviar p/ CYD", on_click=on_save_or_add_gem),
-                            ft.OutlinedButton("⚡ Executar Gem Ativa Agora", on_click=lambda e: on_run_gem_now(state["active_gem_id"])),
+                            ft.OutlinedButton("⏭️ Próxima Manchete (15s)", on_click=on_next_news_headline),
+                            ft.OutlinedButton("🔄 Buscar Últimas Manchetes", on_click=on_manual_news_refresh),
+                            ft.OutlinedButton("📺 Abrir SCR_NEWS (Tela 10)", on_click=lambda e: on_select_screen(10)),
                         ],
                         spacing=8,
                     ),
-                    ft.Text("GEMS CONFIGURADAS (CLIQUE PARA EDITAR OU RODAR NA PLACA):", size=10, weight=ft.FontWeight.BOLD, color="#64748B"),
-                    gems_list_col,
+                    ft.Text("FILA DE MANCHETES ATIVAS (DESLIZANDO NO SPRITE DA CYD A CADA 15s):", size=10, weight=ft.FontWeight.BOLD, color="#64748B"),
+                    news_queue_col,
                 ],
                 spacing=7,
             ),
@@ -5523,9 +6287,182 @@ def launch_flet_gui(
             expand=True,
         )
 
+        # ---------------- 11. MÓDULO 2: O TERMINAL CYD (CYBER DECK • TELA 11 / SCR_TERMINAL) ---
+        lbl_term_status_badge = ft.Text(
+            "🟢 TERMINAL PRONTO • 115200 bps",
+            size=11,
+            weight=ft.FontWeight.BOLD,
+            color="#22C55E",
+            font_family="Consolas",
+        )
+        txt_term_screen = ft.Text(
+            value=term_eng.get_snapshot()["text"],
+            size=12,
+            color="#22C55E",
+            font_family="Consolas",
+            selectable=True,
+        )
+        term_scroll_col = ft.Column(
+            [txt_term_screen],
+            scroll=ft.ScrollMode.ALWAYS,
+            auto_scroll=True,
+            expand=True,
+        )
+        txt_term_input = ft.TextField(
+            hint_text="Digite um comando (ex: ping 8.8.8.8, fetch https://api.github.com, docker ps, wifi scan)...",
+            value="",
+            expand=True,
+            height=44,
+            text_size=13,
+            color="#22C55E",
+            bgcolor="#030508",
+            border_color="#22C55E",
+            focused_border_color="#4ADE80",
+            cursor_color="#22C55E",
+            text_style=ft.TextStyle(font_family="Consolas", weight=ft.FontWeight.BOLD),
+            prefix="root@cyd-deck:~# ",
+            prefix_style=ft.TextStyle(font_family="Consolas", color="#4ADE80", weight=ft.FontWeight.BOLD),
+            content_padding=pad_sym(horizontal=12, vertical=8),
+        )
+        sw_term_autoscr = ft.Switch(
+            label="Abrir Tela 11 (SCR_TERMINAL) automaticamente na CYD ao executar comando",
+            value=state["term_auto_switch"],
+            active_color="#22C55E",
+            on_change=lambda e: state.update({"term_auto_switch": bool(e.control.value)}),
+        )
+
+        def refresh_terminal_ui():
+            snap_t = term_eng.get_snapshot()
+            txt_term_screen.value = snap_t["text"]
+            if snap_t["busy"]:
+                lbl_term_status_badge.value = f"⏳ EXECUTANDO: {snap_t['last_cmd']}"
+                lbl_term_status_badge.color = "#FACC15"
+            else:
+                lbl_term_status_badge.value = f"🟢 PRONTO • Último: {snap_t['last_cmd']}"
+                lbl_term_status_badge.color = "#22C55E"
+            if state.get("active_tab") == 4:
+                safe_update(txt_term_screen, lbl_term_status_badge, txt_term_input)
+
+        def run_terminal_command(cmd_raw: str = None):
+            cmd_to_run = (cmd_raw if cmd_raw is not None else (txt_term_input.value or "")).strip()
+            if not cmd_to_run:
+                return
+            if cmd_raw is None:
+                txt_term_input.value = ""
+
+            if state.get("term_auto_switch", True) and state["screen"] != 11:
+                state["screen"] = 11
+                lbl_hdr_screen.value = f"📺 TELA 11 • {SCREEN_SHORT_NAMES.get(11, 'Terminal CYD')}"
+                refresh_screen_cards()
+
+            def _dispatch_to_cyd(pkt: dict):
+                ui_event_queue.put(pkt)
+                refresh_terminal_ui()
+
+            term_eng.execute_command(
+                cmd_to_run,
+                dispatch_fn=_dispatch_to_cyd,
+                log_fn=lambda m: (append_log(m), refresh_terminal_ui()),
+                auto_switch_screen=bool(state.get("term_auto_switch", True)),
+            )
+            refresh_terminal_ui()
+
+        txt_term_input.on_submit = lambda e: run_terminal_command()
+
+        def make_cmd_chip(label: str, cmd_str: str, accent_col: str = "#22C55E"):
+            return ft.Container(
+                content=ft.Text(label, size=11, weight=ft.FontWeight.BOLD, color=accent_col, font_family="Consolas"),
+                bgcolor="#091310",
+                border=border_all(1, accent_col),
+                border_radius=8,
+                padding=pad_sym(horizontal=10, vertical=5),
+                ink=True,
+                tooltip=f"Executar '{cmd_str}' e transmitir para a SCR_TERMINAL da CYD",
+                on_click=lambda e, c=cmd_str: run_terminal_command(c),
+            )
+
+        sec_cyber_terminal = ft.Container(
+            content=ft.Column(
+                [
+                    ft.Row(
+                        [
+                            ft.Column(
+                                [
+                                    ft.Text(
+                                        "💻 MÓDULO 2: O TERMINAL CYD — FERRAMENTAS DE REDE E SISTEMA (TELA 11 • SCR_TERMINAL)",
+                                        size=13,
+                                        weight=ft.FontWeight.BOLD,
+                                        color="#22C55E",
+                                        font_family="Consolas",
+                                    ),
+                                    ft.Text(
+                                        "Execute diagnósticos de rede (ping, fetch), containers (docker) no PC ou delegue Wi-Fi Scan nativo para o ESP32:",
+                                        size=11,
+                                        color="#94A3B8",
+                                    ),
+                                ],
+                                spacing=2,
+                            ),
+                            ft.Row(
+                                [
+                                    lbl_term_status_badge,
+                                    ft.OutlinedButton("📺 Exibir Tela 11 na CYD", on_click=lambda e: on_select_screen(11)),
+                                ],
+                                spacing=10,
+                            ),
+                        ],
+                        alignment=ft.MainAxisAlignment.SPACE_BETWEEN,
+                    ),
+                    ft.Row(
+                        [
+                            make_cmd_chip("📡 wifi scan (ESP32 Nativo)", "wifi scan", "#38BDF8"),
+                            make_cmd_chip("⚡ ping 8.8.8.8", "ping 8.8.8.8", "#22C55E"),
+                            make_cmd_chip("⚡ ping 1.1.1.1", "ping 1.1.1.1", "#22C55E"),
+                            make_cmd_chip("🌐 fetch https://api.github.com", "fetch https://api.github.com", "#A855F7"),
+                            make_cmd_chip("🐳 docker ps", "docker ps", "#F59E0B"),
+                            make_cmd_chip("🧠 esp info", "esp info", "#38BDF8"),
+                            make_cmd_chip("📊 top (Processos PC)", "top", "#22C55E"),
+                            make_cmd_chip("🖧 ip (Rede LAN)", "ip", "#22C55E"),
+                            make_cmd_chip("🧹 clear", "clear", "#EF4444"),
+                        ],
+                        wrap=True,
+                        spacing=8,
+                        run_spacing=8,
+                    ),
+                    ft.Container(
+                        content=term_scroll_col,
+                        bgcolor="#030508",
+                        border=border_all(1.5, "#15803D"),
+                        border_radius=10,
+                        padding=12,
+                        height=285,
+                        width=float("inf"),
+                    ),
+                    ft.Row(
+                        [
+                            txt_term_input,
+                            _Button(
+                                "▶ Executar na CYD",
+                                icon=icon_val("SEND"),
+                                on_click=lambda e: run_terminal_command(),
+                            ),
+                        ],
+                        spacing=10,
+                        vertical_alignment=ft.CrossAxisAlignment.CENTER,
+                    ),
+                    sw_term_autoscr,
+                ],
+                spacing=10,
+            ),
+            bgcolor="#0B0F17",
+            border=border_all(1, "#1A2232"),
+            border_radius=14,
+            padding=14,
+        )
+
         def refresh_weather_gems_ui():
             ws = wth_col.get_ui_snapshot()
-            gs = gems_eng.get_ui_snapshot()
+            ns = gems_eng.get_ui_snapshot()
             now_hm = datetime.now().strftime("%H:%M")
 
             # Atualiza o Header Superior (Hora + Data + Temperatura na Região)
@@ -5560,16 +6497,17 @@ def launch_flet_gui(
                 cont_wth_alert_box.bgcolor = "#0B1915"
                 cont_wth_alert_box.border = border_all(1, "#10B981")
 
-            lbl_gem_active_title.value = f"🤖 GEM ATIVA: {gs['last_title']}"
-            lbl_gem_active_meta.value = f"Fonte: {gs['last_model']} • Atualizado: {gs['last_time']}"
-            lbl_gem_active_body.value = gs["last_text"]
-            rebuild_gems_list_ui()
+            lbl_news_status.value = ns.get("status_msg", "")
+            lbl_news_active_topic.value = f"📰 [{ns.get('active_topic', 'Notícias').upper()}] ({ns.get('active_index', 0) + 1}/{max(1, ns.get('total', 1))})"
+            lbl_news_active_timer.value = f"⏱️ Troca em {ns.get('remain_sec', 15)}s • Fonte: {ns.get('active_source', 'RSS')} ({ns.get('active_time', '--:--')})"
+            lbl_news_active_headline.value = ns.get("active_headline", "")
+            rebuild_news_topics_and_queue_ui(ns)
 
         refresh_weather_gems_ui()
 
         # ---------------- CONSOLE SERIAL & LOG (COM COPIAR E LIMPAR) ---------
         txt_console = ft.Text(
-            value="Inicializando agente v4.1 (Telemetria, Clima Votuporanga, Gemini Gems, Mercado, Portfólio, Pomodoro & Mídia)...",
+            value="Inicializando CYD Cyber Deck v4.0 (Telemetria, Clima Regional, News Feed, Terminal CYD, Mercado, Portfólio, Pomodoro & Mídia)...",
             size=11,
             color="#94A3B8",
             font_family="Consolas",
@@ -5656,7 +6594,9 @@ def launch_flet_gui(
                     "pomodoro": pomo_eng.get_ui_snapshot() if pomo_eng else {},
                     "media": media_col.get_ui_snapshot() if media_col else {},
                     "weather": wth_col.get_ui_snapshot() if wth_col else {},
+                    "news": gems_eng.get_ui_snapshot() if gems_eng else {},
                     "gems": gems_eng.get_ui_snapshot() if gems_eng else {},
+                    "terminal": term_eng.get_snapshot() if term_eng else {},
                     "upload": upload_state,
                     "connected": True,
                 }
@@ -5708,7 +6648,7 @@ def launch_flet_gui(
                     if val is not None:
                         try:
                             scr_idx = int(val)
-                            if 0 <= scr_idx <= 10:
+                            if 0 <= scr_idx <= 11:
                                 on_select_screen(scr_idx)
                                 append_log(f"📱 Smartphone selecionou Tela {scr_idx}")
                         except Exception:
@@ -5743,12 +6683,12 @@ def launch_flet_gui(
 
                 if p == "/api/screen":
                     scr = int(body.get("screen", state["screen"]))
-                    if 0 <= scr <= 10:
+                    if 0 <= scr <= 11:
                         on_select_screen(scr)
                         append_log(f"📱 Smartphone selecionou Tela {scr}")
                     else:
                         ok = False
-                        err_msg = "Tela inválida (0-10)"
+                        err_msg = "Tela inválida (0-11)"
 
                 elif p == "/api/weather":
                     act = str(body.get("action", "refresh")).lower()
@@ -5760,9 +6700,27 @@ def launch_flet_gui(
                     else:
                         on_refresh_weather(None)
 
-                elif p == "/api/gem":
-                    gid = str(body.get("gem_id", state["active_gem_id"]))
-                    on_run_gem_now(gid)
+                elif p in ("/api/news", "/api/gem"):
+                    act = str(body.get("action", "next")).lower()
+                    if act == "toggle_topic" and body.get("topic"):
+                        on_toggle_news_topic(str(body["topic"]).strip())
+                    elif act == "topics" and isinstance(body.get("topics"), list):
+                        state["news_topics"] = [str(x).strip() for x in body["topics"] if str(x).strip()]
+                        gems_eng.set_topics(state["news_topics"], state["news_api_key"])
+                        persist_and_queue_ui()
+                        refresh_weather_gems_ui()
+                    elif act == "refresh":
+                        on_manual_news_refresh(None)
+                    else:
+                        on_next_news_headline(None)
+
+                elif p == "/api/terminal":
+                    cmd_str = str(body.get("cmd", "")).strip()
+                    if cmd_str:
+                        run_terminal_command(cmd_str)
+                    else:
+                        ok = False
+                        err_msg = "Comando vazio"
 
                 elif p == "/api/color":
                     hex_c = body.get("hex", state["hex_color"])
@@ -5948,7 +6906,7 @@ def launch_flet_gui(
                             ),
                             ft.Text(
                                 "Aponte a câmera do seu celular para o QR Code ou acesse o link abaixo na mesma rede Wi-Fi.\n"
-                                "Alterne as 11 telas, veja o Clima de Votuporanga, rode Gems da IA, controle Pomodoro e Mídia!",
+                                "Alterne as 12 telas, veja o Clima de Votuporanga, customize o News Feed e execute comandos no Terminal CYD!",
                                 size=11,
                                 color="#94A3B8",
                             ),
@@ -5994,19 +6952,20 @@ def launch_flet_gui(
             padding=14,
         )
 
-        # ---------------- NAVEGACAO POR ABAS (7 VIEWS LIMPAS E ORGANIZADAS) --
+        # ---------------- NAVIGATION RAIL LATERAL EXPANSIVEL (CLEAN UI) ------
         tab_defs = [
             (0, "Painel & Telas", "DASHBOARD"),
             (1, "Foco & Mídia", "ALBUM"),
             (2, "Mercado & Carteira", "ACCOUNT_BALANCE_WALLET"),
-            (3, "Clima & Gemini IA", "WB_SUNNY"),
-            (4, "Estúdio & Energia", "PALETTE"),
-            (5, "Alertas Físicos", "NOTIFICATIONS_ACTIVE"),
-            (6, "Remoto & Serial", "QR_CODE_2"),
+            (3, "Clima & News", "NEWSPAPER"),
+            (4, "Terminal CYD", "TERMINAL"),
+            (5, "Estúdio & Energia", "PALETTE"),
+            (6, "Alertas Físicos", "NOTIFICATIONS_ACTIVE"),
+            (7, "Remoto & Serial", "QR_CODE_2"),
         ]
 
         tab_views = [
-            # Aba 0: Painel Geral & Seletor de 11 Telas (Home limpa e rápida)
+            # Aba 0: Painel Geral & Seletor de 12 Telas (Home limpa e rápida)
             ft.Column(
                 [telemetry_row, sec_market_quick, sec_screens],
                 spacing=10,
@@ -6014,7 +6973,7 @@ def launch_flet_gui(
                 expand=True,
                 visible=True,
             ),
-            # Aba 1: Módulo 3 — Produtividade Pomodoro (Tela 8) + Spotify & YouTube Music (Tela 9)
+            # Aba 1: Produtividade Pomodoro (Tela 8) + Spotify & YouTube Music (Tela 9)
             ft.Column(
                 [ft.Row([sec_pomodoro, sec_media], spacing=12, vertical_alignment=ft.CrossAxisAlignment.START)],
                 spacing=10,
@@ -6030,15 +6989,23 @@ def launch_flet_gui(
                 expand=True,
                 visible=False,
             ),
-            # Aba 3: Clima Regional (Votuporanga), Avisos de Tempestade & Conexão Google Gemini Gems (Tela 10)
+            # Aba 3: Módulo 1 — Clima Regional (Votuporanga) + Feed de Notícias Customizável (Tela 10 / SCR_NEWS)
             ft.Column(
-                [ft.Row([sec_weather_regional, sec_gemini_gems], spacing=12, vertical_alignment=ft.CrossAxisAlignment.START)],
+                [ft.Row([sec_weather_regional, sec_news_feed], spacing=12, vertical_alignment=ft.CrossAxisAlignment.START)],
                 spacing=10,
                 scroll=ft.ScrollMode.AUTO,
                 expand=True,
                 visible=False,
             ),
-            # Aba 4: Aparência & Energia — Cores RGB565 + Wallpaper SD + Brilho PWM + Sleep/Noturno
+            # Aba 4: Módulo 2 — O Terminal CYD: Ferramentas de Rede e Sistema (Tela 11 / SCR_TERMINAL)
+            ft.Column(
+                [sec_cyber_terminal],
+                spacing=10,
+                scroll=ft.ScrollMode.AUTO,
+                expand=True,
+                visible=False,
+            ),
+            # Aba 5: Aparência & Energia — Cores RGB565 + Wallpaper SD + Brilho PWM + Sleep/Noturno
             ft.Column(
                 [sec_colors, sec_bg_and_brt, sec_sleep],
                 spacing=10,
@@ -6046,7 +7013,7 @@ def launch_flet_gui(
                 expand=True,
                 visible=False,
             ),
-            # Aba 5: Módulo 1 — Alertas Físicos Avançados (Buzzer & LED RGB)
+            # Aba 6: Alertas Físicos Avançados (Buzzer & LED RGB)
             ft.Column(
                 [sec_alerts],
                 spacing=10,
@@ -6054,7 +7021,7 @@ def launch_flet_gui(
                 expand=True,
                 visible=False,
             ),
-            # Aba 6: Controle Remoto Smartphone Wi-Fi + Console Serial
+            # Aba 7: Controle Remoto Smartphone Wi-Fi + Console Serial
             ft.Column(
                 [sec_mobile_remote, sec_console],
                 spacing=10,
@@ -6064,108 +7031,309 @@ def launch_flet_gui(
             ),
         ]
 
-        tab_pill_refs = []
+        rail_destinations = []
         for t_idx, t_title, t_icon_name in tab_defs:
-            is_act = (t_idx == state["active_tab"])
-            ic_ctrl = ft.Icon(icon_val(t_icon_name), size=16, color=state["hex_color"] if is_act else "#64748B")
-            lbl_ctrl = ft.Text(
-                t_title,
-                size=12,
-                weight=ft.FontWeight.BOLD if is_act else ft.FontWeight.W_600,
-                color="#FFFFFF" if is_act else "#94A3B8",
+            rail_destinations.append(
+                ft.NavigationRailDestination(
+                    icon=ft.Icon(icon_val(t_icon_name), size=19, color="#64748B"),
+                    selected_icon=ft.Icon(icon_val(t_icon_name), size=20, color=state["hex_color"]),
+                    label=t_title,
+                )
             )
-            pill_c = ft.Container(
-                content=ft.Row(
-                    [ic_ctrl, lbl_ctrl],
-                    spacing=7,
-                    alignment=ft.MainAxisAlignment.CENTER,
-                    vertical_alignment=ft.CrossAxisAlignment.CENTER,
-                ),
-                bgcolor="#162032" if is_act else "transparent",
-                border=border_all(1.5 if is_act else 1, state["hex_color"] if is_act else "transparent"),
-                border_radius=9,
-                padding=pad_sym(horizontal=10, vertical=8),
-                ink=True,
+
+        def on_rail_change(e):
+            try:
+                idx_sel = int(e.control.selected_index)
+            except Exception:
+                idx_sel = 0
+            switch_tab(idx_sel)
+
+        nav_rail = ft.NavigationRail(
+            selected_index=state["active_tab"],
+            extended=bool(state.get("rail_extended", True)),
+            min_width=64,
+            min_extended_width=192,
+            bgcolor="#0A0E17",
+            indicator_color="#162032",
+            destinations=rail_destinations,
+            on_change=on_rail_change,
+            expand=True,
+        )
+
+        lbl_rail_brand = ft.Text(
+            "CYBER DECK",
+            size=11,
+            weight=ft.FontWeight.BOLD,
+            color="#E2E8F0",
+            font_family="Consolas",
+            visible=bool(state.get("rail_extended", True)),
+        )
+        rail_logo_widget = (
+            ft.Image(
+                src=png_file,
+                width=22,
+                height=22,
+                border_radius=5,
+                fit=ft.BoxFit.CONTAIN if hasattr(ft, "BoxFit") else "contain",
+            )
+            if (png_file and os.path.exists(png_file))
+            else ft.Icon(icon_val("MEMORY"), size=18, color=state["hex_color"])
+        )
+
+        # Card lateral de diagnóstico da Conexão Serial no rodapé do NavigationRail
+        rail_serial_dot = ft.Container(width=9, height=9, border_radius=5, bgcolor="#F59E0B")
+        lbl_rail_serial_title = ft.Text(
+            "USB: Buscando...",
+            size=11,
+            weight=ft.FontWeight.BOLD,
+            color="#E2E8F0",
+            font_family="Consolas",
+            visible=bool(state.get("rail_extended", True)),
+        )
+        lbl_rail_serial_sub = ft.Text(
+            "115200 bps • Fila 0",
+            size=9,
+            color="#64748B",
+            font_family="Consolas",
+            visible=bool(state.get("rail_extended", True)),
+        )
+        btn_rail_reconnect = ft.IconButton(
+            icon=icon_val("SYNC"),
+            icon_size=14,
+            icon_color="#38BDF8",
+            tooltip="Forçar Reconexão / Flush Serial (115200 bps)",
+            width=24,
+            height=24,
+            padding=0,
+            visible=bool(state.get("rail_extended", True)),
+            on_click=lambda e: (
+                serial_mgr.request_reconnect(),
+                append_log("🔄 Reconexão e flush de buffers Serial solicitados manualmente."),
+            ),
+        )
+        rail_serial_card = ft.Container(
+            content=ft.Column(
+                [
+                    ft.Row(
+                        [
+                            ft.Row([rail_serial_dot, lbl_rail_serial_title], spacing=6, tight=True),
+                            btn_rail_reconnect,
+                        ],
+                        alignment=ft.MainAxisAlignment.SPACE_BETWEEN,
+                        vertical_alignment=ft.CrossAxisAlignment.CENTER,
+                    ),
+                    lbl_rail_serial_sub,
+                ],
+                spacing=2,
+                tight=True,
+            ),
+            bgcolor="#0F172A",
+            border=border_all(1, "#1E293B"),
+            border_radius=10,
+            padding=pad_sym(horizontal=10, vertical=7),
+            ink=True,
+            tooltip="Diagnóstico Serial Assíncrono (115200 bps) — Clique para abrir Remoto & Serial",
+            on_click=lambda e: switch_tab(7),
+        )
+
+        def toggle_rail_extended(e):
+            ext = not bool(state.get("rail_extended", True))
+            state["rail_extended"] = ext
+            nav_rail.extended = ext
+            lbl_rail_brand.visible = ext
+            lbl_rail_serial_title.visible = ext
+            lbl_rail_serial_sub.visible = ext
+            btn_rail_reconnect.visible = ext
+            btn_rail_toggle.icon = icon_val("MENU_OPEN" if ext else "MENU")
+            sidebar_rail_box.width = 204 if ext else 74
+            safe_update(sidebar_rail_box)
+
+        btn_rail_toggle = ft.IconButton(
+            icon=icon_val("MENU_OPEN" if state.get("rail_extended", True) else "MENU"),
+            icon_size=17,
+            icon_color="#94A3B8",
+            tooltip="Expandir / Recolher Menu Lateral (Clean UI)",
+            width=28,
+            height=28,
+            padding=0,
+            on_click=toggle_rail_extended,
+        )
+
+        rail_brand_header = ft.Container(
+            content=ft.Row(
+                [
+                    ft.Row([rail_logo_widget, lbl_rail_brand], spacing=7, tight=True),
+                    btn_rail_toggle,
+                ],
+                alignment=ft.MainAxisAlignment.SPACE_BETWEEN,
+                vertical_alignment=ft.CrossAxisAlignment.CENTER,
+            ),
+            padding=pad_sym(horizontal=8, vertical=4),
+        )
+
+        sidebar_rail_box = ft.Container(
+            content=ft.Column(
+                [
+                    rail_brand_header,
+                    ft.Divider(height=1, color="#182030"),
+                    ft.Container(content=nav_rail, expand=True),
+                    ft.Divider(height=1, color="#182030"),
+                    rail_serial_card,
+                ],
+                spacing=6,
                 expand=True,
-                on_click=lambda e, idx_target=t_idx: switch_tab(idx_target),
-            )
-            tab_pill_refs.append((t_idx, pill_c, ic_ctrl, lbl_ctrl))
+            ),
+            width=204 if state.get("rail_extended", True) else 74,
+            bgcolor="#0A0E17",
+            border=border_all(1, "#182030"),
+            border_radius=12,
+            padding=pad_sym(horizontal=6, vertical=8),
+        )
 
         def refresh_tabs_ui():
             h = state["hex_color"]
-            act = state["active_tab"]
-            for idx_t, pill_c, ic_ctrl, lbl_ctrl in tab_pill_refs:
-                on = (idx_t == act)
-                pill_c.bgcolor = "#162032" if on else "transparent"
-                pill_c.border = border_all(1.5 if on else 1, h if on else "transparent")
-                ic_ctrl.color = h if on else "#64748B"
-                lbl_ctrl.color = "#FFFFFF" if on else "#94A3B8"
-                tab_views[idx_t].visible = on
+            act = int(state["active_tab"])
+            nav_rail.selected_index = act
+            for idx_t, dest in enumerate(rail_destinations):
+                try:
+                    if hasattr(dest, "selected_icon") and dest.selected_icon is not None:
+                        dest.selected_icon.color = h
+                except Exception:
+                    pass
+                tab_views[idx_t].visible = (idx_t == act)
 
-        tab_bar_container = ft.Container(
-            content=ft.Row([p[1] for p in tab_pill_refs], spacing=6),
-            bgcolor="#0B0F17",
-            border=border_all(1, "#1A2232"),
-            border_radius=12,
-            padding=4,
-        )
+            # Ao alternar para uma aba, sincroniza imediatamente seus controles em cache
+            if act == 1:
+                refresh_focus_media_ui()
+            elif act == 2:
+                refresh_portfolio_ui()
+            elif act == 3:
+                refresh_weather_gems_ui()
+            elif act == 4:
+                refresh_terminal_ui()
+            elif act == 7:
+                txt_console.value = "\n".join(log_lines)
+
+            safe_update(nav_rail, tabs_viewport)
 
         tabs_viewport = ft.Container(
             content=ft.Stack(tab_views, expand=True),
             expand=True,
         )
 
-        page.add(
-            header_row,
-            tab_bar_container,
-            tabs_viewport,
+        body_split_row = ft.Row(
+            [sidebar_rail_box, tabs_viewport],
+            spacing=10,
+            expand=True,
+            vertical_alignment=ft.CrossAxisAlignment.STRETCH,
         )
 
-        # ---------------- THREAD DE COMUNICACAO SERIAL -----------------------
-        def read_serial_responses(ser):
-            while ser.in_waiting > 0:
+        page.add(
+            header_row,
+            body_split_row,
+        )
+
+        # ---------------- SERIAL CALLBACKS & STATE MANAGEMENT GRANULAR -------
+        def refresh_serial_indicators(snap: dict | None = None):
+            s = snap or serial_mgr.get_status_snapshot()
+            st_code = str(s.get("state", "searching")).lower()
+            port_str = s.get("port") or ""
+            tx_cnt = s.get("tx_packets", 0)
+            bps = s.get("tx_bytes_sec", 0)
+            if s.get("connected") and st_code == "connected":
+                c_hex = "#22C55E"
+                b_hex = "#14532D"
+                hdr_txt = f"{port_str} • 115k"
+                rail_t = f"ON • {port_str}"
+                rail_s = f"115200 • TX {tx_cnt} ({bps} B/s)"
+            elif st_code in ("connecting", "reconnecting"):
+                c_hex = "#38BDF8"
+                b_hex = "#0284C7"
+                hdr_txt = f"Abrindo {port_str}..."
+                rail_t = f"Sync {port_str}..."
+                rail_s = "Handshake USB..."
+            elif st_code in ("error", "disconnected") and s.get("last_error"):
+                c_hex = "#EF4444"
+                b_hex = "#7F1D1D"
+                hdr_txt = "Reconectando..."
+                rail_t = "Erro USB"
+                rail_s = (s.get("last_error") or "Reconectando...")[:24]
+            else:
+                c_hex = "#F59E0B"
+                b_hex = "#78350F"
+                hdr_txt = "Buscando CYD..."
+                rail_t = "Sem Porta COM"
+                rail_s = "Aguardando USB..."
+
+            status_dot.bgcolor = c_hex
+            status_badge.border = border_all(1, b_hex)
+            lbl_usb_status.value = hdr_txt
+
+            rail_serial_dot.bgcolor = c_hex
+            rail_serial_card.border = border_all(1, b_hex)
+            lbl_rail_serial_title.value = rail_t
+            lbl_rail_serial_sub.value = rail_s
+            safe_update(status_badge, rail_serial_card)
+
+        def on_serial_status_change(snap: dict):
+            st_code = str(snap.get("state", "")).lower()
+            port_str = snap.get("port", "")
+            if st_code == "connected":
+                state["ui_dirty"] = True
+                append_log(f"✅ SerialManager conectado em {port_str} ({snap.get('baud', BAUD)} bps — I/O Assíncrono)")
+                request_sd_files()
+            elif st_code in ("error", "disconnected"):
+                append_log(f"⚠️ Serial desconectada ({snap.get('last_error', 'erro I/O')}). Tentando reconectar...")
+            refresh_serial_indicators(snap)
+
+        def on_serial_rx_line(raw: str):
+            if raw.startswith("TERM_LOG:"):
+                t_line = raw.split("TERM_LOG:", 1)[1].strip()
+                if t_line:
+                    term_eng.append_line(t_line)
+                    if state.get("active_tab") == 4:
+                        refresh_terminal_ui()
+                        safe_update(sec_cyber_terminal)
+            elif raw == "MONITOR_READY":
+                state["ui_dirty"] = True
+                state["synced_cover_id"] = ""  # Reenvia capa atual após reboot da CYD
+                request_sd_files()
+            elif raw.startswith("SD_FILES:"):
                 try:
-                    raw = ser.readline().decode("utf-8", errors="ignore").strip()
+                    files = json.loads(raw.split("SD_FILES:", 1)[1])
+                    if isinstance(files, list):
+                        base_opts = ["none", "terminal", "z1p0"]
+                        merged = base_opts + [f for f in files if f not in base_opts and not str(f).startswith("_media")]
+                        state["sd_files"] = merged
+                        cfg["sd_files"] = merged
+                        save_ui_config(cfg)
+                        dd_bg.options = make_dropdown_options(merged)
+                        if state.get("active_tab") == 5:
+                            safe_update(dd_bg)
+                        if files:
+                            append_log(f"SD Card sincronizado: {len(files)} imagem(ns) encontrada(s): {', '.join(files)}")
+                        else:
+                            append_log("SD Card sincronizado: Nenhuma imagem encontrada ou cartão não detectado.")
                 except Exception:
-                    break
-                if not raw:
-                    continue
-                if raw.startswith("ACK_") or raw.startswith("ERR_"):
-                    last_ack["val"] = raw
-                    ack_event.set()
-                elif raw == "MONITOR_READY":
-                    state["ui_dirty"] = True
-                    state["synced_cover_id"] = ""  # Reenvia capa atual após reboot da CYD
-                    request_sd_files()
-                elif raw.startswith("SD_FILES:"):
-                    try:
-                        files = json.loads(raw.split("SD_FILES:", 1)[1])
-                        if isinstance(files, list):
-                            base_opts = ["none", "terminal", "z1p0"]
-                            merged = base_opts + [f for f in files if f not in base_opts and not str(f).startswith("_media")]
-                            state["sd_files"] = merged
-                            cfg["sd_files"] = merged
-                            save_ui_config(cfg)
-                            dd_bg.options = make_dropdown_options(merged)
-                            if files:
-                                append_log(f"SD Card sincronizado: {len(files)} imagem(ns) encontrada(s): {', '.join(files)}")
-                            else:
-                                append_log("SD Card sincronizado: Nenhuma imagem encontrada ou cartão não detectado.")
-                    except Exception:
-                        pass
-                elif raw.startswith("SD_INIT:OK"):
-                    state["sd_missing_warned"] = False
-                    append_log(f"Cartão MicroSD detectado e montado com sucesso ({raw}).")
-                elif raw.startswith("SD_INIT:FAIL"):
-                    append_log("⚠️ Cartão MicroSD não detectado pela placa CYD. Verifique se está inserido e formatado em FAT32.")
-                elif raw.startswith("JPG_ERR:"):
-                    append_log(f"⚠️ Erro no hardware CYD ao decodificar imagem JPEG ({raw}).")
+                    pass
+            elif raw.startswith("SD_INIT:OK"):
+                state["sd_missing_warned"] = False
+                append_log(f"Cartão MicroSD detectado e montado com sucesso ({raw}).")
+            elif raw.startswith("SD_INIT:FAIL"):
+                append_log("⚠️ Cartão MicroSD não detectado pela placa CYD. Verifique se está inserido e formatado em FAT32.")
+            elif raw.startswith("JPG_ERR:"):
+                append_log(f"⚠️ Erro no hardware CYD ao decodificar imagem JPEG ({raw}).")
+
+        serial_mgr.set_callbacks(on_rx_line=on_serial_rx_line, on_status_change=on_serial_status_change)
 
         def _fmt_chg(lbl_c, chg_val: float):
             lbl_c.value = f"{'+' if chg_val >= 0 else ''}{chg_val:.2f}%"
             lbl_c.color = "#22C55E" if chg_val >= 0 else "#EF4444"
 
         def update_pc_telemetry_cards(sys_m: dict, mkt_m: dict):
+            active_tab = int(state.get("active_tab", 0))
+
+            # 1) Atualiza valores em memória (operações leves de atributo Python)
             cpu_v = sys_m.get("cpu", 0.0)
             cput_v = sys_m.get("cput")
             lbl_cpu_val.value = f"{cpu_v:.1f}%"
@@ -6188,7 +7356,6 @@ def launch_flet_gui(
             lbl_dsk_sub.value = f"↓{sys_m.get('rx', 0):.1f} ↑{sys_m.get('tx', 0):.1f} MB/s"
             bar_dsk.value = min(max(dsk_v / 100.0, 0.0), 1.0)
 
-            # Atualiza pílulas de mercado (Aba 0 e Aba 2)
             if mkt_m.get("usd", 0) > 0:
                 lbl_usd_p.value = lbl_m2_usd_p.value = f"R$ {mkt_m['usd']:.2f}"
                 _fmt_chg(lbl_usd_c, mkt_m.get("usdc", 0.0))
@@ -6214,10 +7381,14 @@ def launch_flet_gui(
                 _fmt_chg(lbl_ibov_c, mkt_m.get("ibovc", 0.0))
                 _fmt_chg(lbl_m2_ibov_c, mkt_m.get("ibovc", 0.0))
 
+            # Atualiza pílulas do Header e apenas a aba ativa (State Management isolado)
             try:
-                refresh_portfolio_ui()
                 refresh_focus_media_ui()
                 refresh_weather_gems_ui()
+                if active_tab == 2:
+                    refresh_portfolio_ui()
+                elif active_tab == 4:
+                    refresh_terminal_ui()
             except Exception:
                 pass
 
@@ -6255,14 +7426,30 @@ def launch_flet_gui(
                 lbl_market_status.value = "🟢 Cripto: Ao Vivo (Coinbase / 3s) • 🟢 B3 & Câmbio: Mercado Aberto"
                 lbl_market_status.color = "#10B981"
 
-            try:
-                page.update()
-            except Exception:
-                pass
+            # Atualiza indicador Serial (taxa B/s e pacotes) sem re-renderizar toda a árvore
+            refresh_serial_indicators()
 
-        def serial_worker():
-            import serial
-            ser = None
+            # State Management Granular: atualiza APENAS os controles visíveis na aba ativa + Header
+            dirty_controls = [header_row]
+            if active_tab == 0:
+                dirty_controls.extend([telemetry_row, sec_market_quick])
+            elif active_tab == 1:
+                dirty_controls.extend([sec_pomodoro, sec_media])
+            elif active_tab == 2:
+                dirty_controls.extend([sec_market_live, sec_portfolio])
+            elif active_tab == 3:
+                dirty_controls.extend([sec_weather_regional, sec_news_feed])
+            elif active_tab == 4:
+                dirty_controls.append(sec_cyber_terminal)
+            elif active_tab == 5:
+                dirty_controls.append(lbl_power_status)
+            safe_update(*dirty_controls)
+
+        def orchestrator_worker():
+            """
+            Worker leve de orquestração (sem qualquer I/O Serial bloqueante).
+            Consome snapshots em cache O(1) do Collector e alimenta o SerialManager assíncrono.
+            """
             last_telemetry_t = 0.0
             last_fired_alerts = {}
             last_dispatched_brt = -1
@@ -6273,7 +7460,6 @@ def launch_flet_gui(
             while state["running"]:
                 try:
                     now = time.time()
-                    sys_metrics = None
                     mkt_metrics = mkt_col.get_market_dict()
 
                     # Tick contínuo do Pomodoro mesmo se a CYD estiver desconectada
@@ -6284,21 +7470,10 @@ def launch_flet_gui(
                         append_log(f"🍅 CICLO POMODORO CONCLUÍDO ({fin_p} -> {nxt_p})! Ciclos hoje: #{pomo_done_ev['cycles']}")
                         if pomo_done_ev.get("buzzer", True):
                             led_c = "0x07FF" if fin_p == "WORK" else "0x07E0"
-                            ui_event_queue.put({
+                            serial_mgr.send_event({
                                 "pomo": pomo_eng.get_payload(done_flag=True),
                                 "alrt": {"bz": True, "led": led_c, "p": 3},
                             })
-
-                    if now - last_telemetry_t >= cli_args.interval:
-                        last_telemetry_t = now
-                        sys_metrics = col.sample_sys()
-                        # Tick agendador de Gems (Automações Diárias Gemini / Smart Feed)
-                        gems_eng.tick_scheduler(
-                            weather_snap=wth_col.get_ui_snapshot(),
-                            market_snap=mkt_metrics,
-                            sys_snap=sys_metrics,
-                        )
-                        update_pc_telemetry_cards(sys_metrics, mkt_metrics)
 
                     # Avaliação do Brilho Dinâmico (Modo Sleep & Modo Noturno)
                     eff_brt, brt_reason = calculate_dynamic_brightness(state["brt"], state)
@@ -6306,36 +7481,13 @@ def launch_flet_gui(
                     if eff_brt != last_dispatched_brt:
                         prev_b = last_dispatched_brt
                         last_dispatched_brt = eff_brt
-                        ui_event_queue.put({"ui": {"brt": eff_brt}})
+                        serial_mgr.send_event({"ui": {"brt": eff_brt}})
                         if eff_brt == 0:
                             append_log("🌙 CYD em Modo Sleep (Inatividade de teclado/mouse detectada - Backlight = 0)")
                         elif prev_b == 0:
                             append_log(f"☀️ CYD acordando do Modo Sleep (Backlight restaurado para {eff_brt})")
                         elif "Noturno" in brt_reason:
                             append_log(f"🌃 CYD em Modo Noturno (Backlight atenuado para {eff_brt})")
-
-                    if ser is None:
-                        port = cli_args.port or find_port()
-                        if not port:
-                            status_dot.bgcolor = "#F59E0B"
-                            lbl_usb_status.value = "USB..."
-                            try:
-                                page.update()
-                            except Exception:
-                                pass
-                            time.sleep(1.5)
-                            continue
-
-                        ser = serial.Serial(port, BAUD, timeout=0.5)
-                        time.sleep(1.8)
-                        ser.reset_input_buffer()
-                        state["ui_dirty"] = True
-                        status_dot.bgcolor = "#22C55E"
-                        lbl_usb_status.value = f"{port}"
-                        append_log(f"Conectado com sucesso na porta {port} ({BAUD} bps)")
-                        request_sd_files()
-
-                    read_serial_responses(ser)
 
                     # Sincronização automática da capa de álbum 320x240 p/ Cartão SD (com debounce de 1.3s)
                     if state["media_auto_cover"] and not upload_state["active"] and transfer_queue.empty():
@@ -6348,25 +7500,20 @@ def launch_flet_gui(
                                 pending_cov_t0 = now + 8.0
                                 start_media_cover_transfer(cov_id, cov_bytes, manual=False)
 
-                    # 1) Prioridade maxima: Transferencia de imagem / capa em andamento
-                    if not transfer_queue.empty():
-                        pkt = transfer_queue.get_nowait()
-                        line = json.dumps(pkt, separators=(",", ":")) + "\n"
-                        ser.write(line.encode("utf-8"))
-                        ser.flush()
-                        continue
+                    if now - last_telemetry_t >= cli_args.interval:
+                        last_telemetry_t = now
+                        # Coleta instantânea em O(1) do cache preparado pelo worker de background
+                        sys_metrics = col.sample_sys()
 
-                    # 2) Prioridade alta: Mudanca de UI instantanea (Event-Driven <50ms)
-                    if not ui_event_queue.empty():
-                        ev_pkt = ui_event_queue.get_nowait()
-                        line = json.dumps(ev_pkt, separators=(",", ":")) + "\n"
-                        ser.write(line.encode("utf-8"))
-                        ser.flush()
-                        state["ui_dirty"] = False
-                        state["last_ui_sync"] = time.time()
+                        # Tick de rotação de 15s do Feed de Notícias (Módulo 1)
+                        rotated_news = gems_eng.tick_scheduler()
+                        if rotated_news is not None:
+                            serial_mgr.send_event({
+                                "news": gems_eng.get_cyd_news_payload(include_queue=False, force=True),
+                            })
 
-                    # 3) Envio periodico de telemetria + Clima Regional + Gemini Gems + Mercado + Portfólio + Pomodoro + Mídia
-                    if sys_metrics is not None:
+                        update_pc_telemetry_cards(sys_metrics, mkt_metrics)
+
                         wth_payload = wth_col.get_cyd_payload()
                         payload = {
                             "sys": sys_metrics,
@@ -6401,31 +7548,22 @@ def launch_flet_gui(
                                 state["portfolio"],
                                 state["portfolio_pnl_mode"],
                             )[0]
-                            payload["gem"] = gems_eng.get_cyd_payload()
+                            payload["news"] = gems_eng.get_cyd_news_payload(
+                                include_queue=("ui" in payload),
+                                force=("ui" in payload),
+                            )
 
-                        line = json.dumps(payload, separators=(",", ":")) + "\n"
-                        ser.write(line.encode("utf-8"))
-                        ser.flush()
+                        # Envia de forma 100% não-bloqueante para o SerialManager (substitui amostra obsoleta se ocupada)
+                        serial_mgr.send_telemetry(payload)
 
                 except Exception as ex:
-                    status_dot.bgcolor = "#EF4444"
-                    lbl_usb_status.value = "Reconec..."
-                    append_log(f"Conexão USB interrompida ({ex})")
-                    if ser:
-                        try:
-                            ser.close()
-                        except Exception:
-                            pass
-                    ser = None
-                    time.sleep(2.0)
-                    continue
+                    append_log(f"Erro no orquestrador: {ex}")
 
-                time.sleep(0.04)
+                time.sleep(0.10)
 
-            if ser:
-                ser.close()
+            serial_mgr.stop()
 
-        threading.Thread(target=serial_worker, daemon=True).start()
+        threading.Thread(target=orchestrator_worker, daemon=True, name="OrchestratorThread").start()
 
     # Inicializa Flet compativel com versoes 1.0+ (ft.run) e 0.2x (ft.app)
     if hasattr(ft, "run"):
@@ -6435,7 +7573,7 @@ def launch_flet_gui(
 
 
 def main():
-    ap = argparse.ArgumentParser(description="Agente CYD Hardware, Clima Regional, Gemini Gems & Financial Monitor v4.1 (Flet / Flutter Edition)")
+    ap = argparse.ArgumentParser(description="Agente CYD Cyber Deck v4.0 — Terminal, News Feed, Clima & Telemetria (Flet / Flutter Edition)")
     ap.add_argument("-p", "--port", help="Porta serial, ex: COM5 ou /dev/ttyUSB0")
     ap.add_argument("-i", "--interval", type=float, default=INTERVAL)
     ap.add_argument("--stdout", action="store_true", help="Imprime o JSON no terminal e nao abre GUI")
@@ -6454,13 +7592,12 @@ def main():
         buzzer_enabled=cfg.get("pomo_buzzer", True),
     )
     wth_col = WeatherCollector(city=cfg.get("weather_city", "Votuporanga"), interval=300.0)
-    gems_eng = GeminiGemsEngine(
-        api_key=cfg.get("gemini_api_key", ""),
-        model=cfg.get("gemini_model", "gemini-3.8-flash"),
-        gems=cfg.get("gems", DEFAULT_GEMS),
-        active_gem_id=cfg.get("active_gem_id", "gem_emb"),
-        auto_rotate=cfg.get("gem_auto_rotate", True),
+    news_col = NewsFeedCollector(
+        topics=cfg.get("news_topics", DEFAULT_NEWS_TOPICS),
+        news_api_key=cfg.get("news_api_key", ""),
+        rotate_sec=15.0,
     )
+    term_eng = CyberDeckTerminalEngine()
     time.sleep(0.55)
 
     if args.stdout or args.once:
@@ -6474,11 +7611,7 @@ def main():
                 cfg.get("portfolio", []),
                 cfg.get("portfolio_pnl_mode", "hist"),
             )
-            gems_eng.tick_scheduler(
-                weather_snap=wth_col.get_ui_snapshot(),
-                market_snap=mkt_s,
-                sys_snap=sys_s,
-            )
+            news_col.tick_scheduler()
             eff_brt, _ = calculate_dynamic_brightness(cfg["brt"], cfg)
             payload = {
                 "sys": sys_s,
@@ -6487,7 +7620,7 @@ def main():
                 "pomo": pomo_eng.get_payload(),
                 "media": media_col.get_cyd_payload(),
                 "wth": wth_col.get_cyd_payload(),
-                "gem": gems_eng.get_cyd_payload(),
+                "news": news_col.get_cyd_news_payload(include_queue=False, force=True),
                 "ui": {
                     "screen": cfg["screen"],
                     "color": cfg["color"],
@@ -6502,7 +7635,7 @@ def main():
                 return
             time.sleep(args.interval)
 
-    launch_flet_gui(col, mkt_col, media_col, pomo_eng, wth_col, gems_eng, args)
+    launch_flet_gui(col, mkt_col, media_col, pomo_eng, wth_col, news_col, args, term_eng=term_eng)
 
 
 if __name__ == "__main__":

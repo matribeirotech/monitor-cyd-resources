@@ -1,0 +1,60 @@
+# -*- mode: python ; coding: utf-8 -*-
+
+
+a = Analysis(
+    ['agent/agent.py'],
+    pathex=['agent'],
+    binaries=[],
+    datas=[
+        ('imgs', 'imgs'),
+        ('agent/imgs', 'imgs'),
+        ('agent/ui_config.json', '.'),
+    ],
+    hiddenimports=[
+        'serial',
+        'serial.tools.list_ports',
+        'psutil',
+        'wmi',
+        'win32com.client',
+        'PIL',
+        'pystray',
+        'pystray._win32',
+        'qrcode',
+        'mobile_web',
+        'winrt',
+        'winrt.windows.media.control',
+        'winrt.windows.storage.streams',
+        'winrt.windows.foundation',
+        'winrt.windows.foundation.collections',
+    ],
+    hookspath=[],
+    hooksconfig={},
+    runtime_hooks=[],
+    excludes=[],
+    noarchive=False,
+    optimize=0,
+)
+pyz = PYZ(a.pure)
+
+exe = EXE(
+    pyz,
+    a.scripts,
+    a.binaries,
+    a.datas,
+    [],
+    name='CYD-Hardware-Monitor',
+    debug=False,
+    bootloader_ignore_signals=False,
+    strip=False,
+    upx=True,
+    upx_exclude=[],
+    runtime_tmpdir=None,
+    console=False,
+    disable_windowed_traceback=False,
+    argv_emulation=False,
+    target_arch=None,
+    codesign_identity=None,
+    entitlements_file=None,
+    version='agent/file_version_info.txt',
+    icon=['imgs/icone-cyd-resource-monitor.ico'],
+)

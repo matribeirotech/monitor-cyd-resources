@@ -5,7 +5,11 @@ a = Analysis(
     ['agent.py'],
     pathex=[],
     binaries=[],
-    datas=[('../imgs/imgsCYD.ico', 'imgs')],
+    datas=[
+        ('../imgs/icone-cyd-resource-monitor.ico', 'imgs'),
+        ('../imgs/icone-cyd-resource-monitor.png', 'imgs'),
+        ('../imgs/imgsCYD.ico', 'imgs'),
+    ],
     hiddenimports=['serial', 'serial.tools.list_ports', 'psutil', 'wmi', 'win32com.client', 'PIL', 'pystray', 'pystray._win32', 'qrcode', 'mobile_web', 'winrt', 'winrt.windows.media.control', 'winrt.windows.storage.streams', 'winrt.windows.foundation', 'winrt.windows.foundation.collections'],
     hookspath=[],
     hooksconfig={},
@@ -35,6 +39,6 @@ exe = EXE(
     target_arch=None,
     codesign_identity=None,
     entitlements_file=None,
-    icon=['../imgs/imgsCYD.ico'],
+    icon=['../imgs/icone-cyd-resource-monitor.ico'],
     version='file_version_info.txt',
 )

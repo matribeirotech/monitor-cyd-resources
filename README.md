@@ -1,13 +1,15 @@
-# ⚡ CYD Hardware, Clima Regional, Gemini Gems & Financial Market Monitor (v4.1)
+# ⚡ CYD Cyber Deck: Hardware, Clima Regional, News Feed, Terminal Administrativo & Financial Market Monitor (v4.2)
 
-![Versão](https://img.shields.io/badge/vers%C3%A3o-4.1.0-00FF00?style=for-the-badge)
+![Versão](https://img.shields.io/badge/vers%C3%A3o-4.2.0-00FF00?style=for-the-badge)
 ![Plataforma](https://img.shields.io/badge/ESP32-2432S028R%20(CYD)-blue?style=for-the-badge&logo=espressif)
 ![Interface PC](https://img.shields.io/badge/GUI%20PC-Flet%20%2F%20Flutter-02569B?style=for-the-badge&logo=flutter)
 ![CI/CD](https://img.shields.io/badge/CI%2FCD-GitHub%20Actions-2088FF?style=for-the-badge&logo=githubactions)
 ![Autor](https://img.shields.io/badge/Autor-Matheus%20Ribeiro%20(z1po)-FF5500?style=for-the-badge)
 ![Licença](https://img.shields.io/badge/Licen%C3%A7a-MIT-green?style=for-the-badge)
 
-Um **monitor de hardware, estação meteorológica regional, hub de automações com Google Gemini e terminal de mercado financeiro em tempo real** de código aberto para a placa **ESP32-2432S028R (*Cheap Yellow Display* / CYD 2.8" 320×240)**, controlado **100% pelo PC via USB Serial** através de uma interface desktop moderna em 7 abas construída em **Flet (Flutter para Python)**, CI/CD automatizado no GitHub Actions e controle remoto pelo smartphone via **Wi-Fi local (PWA)**.
+Um **Cyber Deck administrativo, monitor de hardware de alta performance, feed de notícias passivo, terminal interativo de rede/sistema e estação meteorológica regional** de código aberto para a placa **ESP32-2432S028R (*Cheap Yellow Display* / CYD 2.8" 320×240)**.
+
+Controlado **100% pelo PC via USB Serial com I/O Assíncrono (`SerialManager` a 115200 bps sem delay de UI)**, interface desktop minimalista **Clean UI em 8 módulos com `NavigationRail` lateral expansível** construída em **Flet (Flutter para Python)**, nova identidade visual oficial, pipeline CI/CD automatizado no GitHub Actions e controle remoto pelo smartphone via **Wi-Fi local (PWA de 5 abas)**.
 
 ---
 
@@ -95,9 +97,27 @@ Todas as fotos abaixo foram capturadas diretamente da placa física em funcionam
 
 ---
 
-## 🎯 Destaques e Novidades da Versão 4.0
+## 🎯 Destaques e Novidades da Versão 4.2 (Cyber Deck Edition)
 
-* **🗂️ Arquitetura por Abas (Desktop & Mobile):** Fim da rolagem vertical poluída. Agora o app desktop possui um cabeçalho fixo com micro-indicadores globais e **6 abas limpas e fluidas**. O app mobile (PWA) foi expandido para **5 abas navegáveis**.
+* **⚡ Comunicação Serial 100% Assíncrona (`SerialManager` a 115200 bps):**
+  * Toda a leitura/escrita de porta COM (`pyserial`) foi isolada em uma thread dedicada (`SerialManagerThread`). O loop do Flet **nunca mais espera resposta da CYD** e opera com fluidez absoluta.
+  * **3 Canais de Prioridade:** `transfer_queue` (blocos de foto SD), `event_queue` (troca de tela e comandos imediatos `< 20ms`) e slot atômico `_latest_telemetry` que descarta frames velhos se a porta estiver ocupada, eliminando qualquer atraso acumulado (*buffer bloat*).
+  * Card lateral de diagnóstico em tempo real no rodapé do menu (Porta, Baudrate, pacotes TX/RX, taxa B/s e botão de reconexão rápida).
+* **🚀 Otimização de Coleta de Hardware (`Collector` em Background Worker):**
+  * Eliminação do stall de 800ms/s do Windows TCP com backoff de 30s caso o LibreHardwareMonitor (`127.0.0.1:8085`) não esteja rodando.
+  * Coleta em camadas: CPU/RAM/Disco/Rede (1.0s), GPU/WMI/Sensores (2.0s) e Processos/Jogos (6.0s). O método `sample_sys()` retorna a foto em cache instantaneamente em **`~0.028 ms` ($O(1)$)**.
+* **🎨 Clean UI com `NavigationRail` Lateral Expansível:**
+  * Substituição das antigas abas horizontais por uma barra lateral retrátil elegante (`NavigationRail`) com botão toggle de expansão/recolhimento.
+  * **State Management Granular:** As atualizações periódicas afetam exclusivamente a aba visível (`active_tab`) e os chips do cabeçalho via `safe_update()`, reduzindo drasticamente o uso de CPU e memória RAM do agente no PC.
+* **🛡️ Nova Identidade Visual Oficial:**
+  * Novos ícones vetorizados de alta resolução (`icone-cyd-resource-monitor.ico` e `icone-cyd-resource-monitor.png`) embutidos na barra de títulos da janela, no topo do menu lateral, na bandeja do sistema Windows (`pystray`) e no binário compilado `.exe`.
+* **📰 Feed de Notícias Customizável (Tela 10 / `SCR_NEWS`):**
+  * Módulo passivo de notícias por tópicos customizáveis ("Política", "Tecnologia", "Mercado Financeiro", "Inteligência Artificial", etc.) via NewsAPI.org ou feeds RSS gratuitos (Google/Bing News RSS).
+  * Fila inteligente com rotação automática a cada 15 segundos e letreiro deslizante suave na tela da CYD via `TFT_eSprite`.
+* **💻 O Terminal CYD — Ferramentas de Rede e Sistema (Tela 11 / `SCR_TERMINAL`):**
+  * Prompt interativo estilo hacker retrô / terminal CRT verde com buffer de rolagem vertical (*scroll* suave linha por linha).
+  * **Comandos Locais do PC:** `ping [alvo]`, `fetch [url]`, `docker [cmd]` e subprocessos de terminal.
+  * **Comandos de Hardware da CYD:** `wifi scan` (dispara `WiFi.scanNetworks()` nativo do ESP32 e imprime os SSIDs e potências RSSI direto no terminal da placa).
 * **🍅 Módulo de Foco Pomodoro (Tela 8):** Máquina de estados completa no PC (Trabalho 25m, Pausa Curta 5m, Pausa Longa 15m), anel circular anti-flicker (`drawSmoothArc`) na CYD com interpolação de 1s, contador de ciclos diários e **bipes sonoros automáticos no Buzzer** ao concluir cada ciclo.
 * **🎵 Hub Multimídia Spotify & YouTube Music (Tela 9):**
   * Integração nativa com Windows GSMTC (`winrt.windows.media.control`) identificando **Spotify** (Desktop/Store/Web) e **YouTube Music** (Chrome/Edge/Brave/Firefox/PWA/Desktop).
@@ -107,7 +127,6 @@ Todas as fotos abaixo foram capturadas diretamente da placa física em funcionam
 * **🔔 Sistema de Alertas Físicos Avançados:** Criação de gatilhos customizados (`CPU Temp > 85°C`, `GPU Uso > 95%`, `Bitcoin > $100k`, etc.) para disparar **bipes sonoros no Buzzer** e padrões visuais no **LED RGB traseiro** da CYD sem travar o processamento do ESP32.
 * **🌙 Controle de Brilho Dinâmico & Modo Sleep:** Monitoramento de inatividade do mouse/teclado no PC para apagar a tela (`brt: 0`), Modo Noturno automático entre 22h e 06h e transição suave por PWM no Pino 21.
 * **🌦️ Clima Regional & Temperatura no Topo (Todas as Telas):** Localidade configurável (padrão: `Votuporanga - SP`), exibindo permanentemente ao lado da Hora a Data Atual (`DD/MM`), a Temperatura Atual (`°C`) e a Cidade no menu superior da CYD e no cabeçalho do Desktop.
-* **🤖 Conexão Google Gemini & Automações Diárias (Gems):** Integração com a API oficial Google Gemini Interactions (`gemini-3.8-flash` / `gemini-4-argon` com Grounding `google_search`), além de fallback automático para Smart Feed RSS PT-BR para buscar notícias recentes sobre Sistemas Embarcados, ESP32, IoT, Clima e Mercado mesmo sem API Key.
 * **⛈️ Sistema de Alerta de Tempestade na Placa CYD:** Detecção automática de tempestades/raios via Open-Meteo com disparo de Banner de Emergência piscante vermelho/amarelo no topo de qualquer tela, alerta sonoro no Buzzer, LED RGB e aviso no Ticker Tape.
 * **🚀 CI/CD Totalmente Automatizado (GitHub Actions):** Pipeline configurado em `.github/workflows/build-release.yml` para compilar o executável Windows (`CYD-Hardware-Monitor.exe`) e o firmware ESP32 (`cyd_firmware.bin`), publicando releases com os binários anexados a cada tag `v*`.
 
@@ -122,11 +141,12 @@ Todas as fotos abaixo foram capturadas diretamente da placa física em funcionam
 | **v3.0** | **Painel Desktop em Flet** + **Gráfico Duplo CPU vs RAM** + **Terminal Financeiro (Bolsa & Cripto)** + **Ticker Tape a ~28 FPS** | ✅ Concluído |
 | **v3.1** | **Controle Remoto pelo Celular (Wi-Fi PWA com QR Code & App Flutter em `mobile/`)** + **Upload de fotos do smartphone p/ SD** | ✅ Concluído |
 | **v4.0** | **Pomodoro (Tela 8) + Spotify & YouTube Music (Tela 9) + Portfólio Pessoal (Tela 7) + Alertas Físicos Buzzer/LED + Modo Sleep/Noturno + UI 6 Abas** | ✅ Concluído |
-| **v4.1 (Atual)** | **Clima Regional (Votuporanga) no Topo + Tela 10 (Clima & Gemini Gems) + Alerta de Tempestade + CI/CD GitHub Actions + UI 7 Abas** | ✅ **Concluído (v4.1)** |
+| **v4.1** | **Clima Regional (Votuporanga) no Topo + Tela 10 (Clima & Gemini Gems) + Alerta de Tempestade + CI/CD GitHub Actions** | ✅ Concluído |
+| **v4.2 (Atual)** | **CYD Cyber Deck (12 Telas) + Feed de Notícias (Tela 10) + Terminal CYD (Tela 11) + Serial Assíncrona (115200 bps) + Clean UI (NavigationRail) + Nova Identidade Visual** | ✅ **Concluído (v4.2)** |
 
 ---
 
-## 🖥️ As 11 Telas da CYD (320×240)
+## 🖥️ As 12 Telas da CYD (320×240)
 
 Todas as telas podem ser alternadas instantaneamente pelo painel Desktop, pelo aplicativo do celular (Wi-Fi) ou pelo botão físico `BOOT` traseiro:
 
@@ -140,7 +160,8 @@ Todas as telas podem ser alternadas instantaneamente pelo painel Desktop, pelo a
 8. **💼 Tela 7 — `Portfólio de Investimentos` (`SCR_PORTFOLIO`):** Patrimônio total consolidado (`R$`), badge dinâmico de PnL (Lucro/Prejuízo) e Top 3 ativos da carteira.
 9. **🍅 Tela 8 — `Pomodoro Focus Hub` (`SCR_POMODORO`):** Cronômetro circular anti-flicker (25m Trabalho / 5m Pausa / 15m Longa), contador de ciclos, mini-status da música atual e bipe no Buzzer ao finalizar.
 10. **🎵 Tela 9 — `Player Spotify & YouTube Music` (`SCR_MEDIA`):** Capa do álbum em tela cheia do MicroSD com card de vidro fumê translúcido, Título, Artista, badge de fonte (`SPOTIFY` verde / `YT MUSIC` vermelho) e barra de progresso.
-11. **🌦️🤖 Tela 10 — `Clima Regional & Gemini Gems` (`SCR_WEATHER_GEMS`):** Data completa, Cidade (`VOTUPORANGA`), Temperatura Atual em destaque (`°C`), Sensação Térmica, Mín/Máx, Umidade, Vento, Probabilidade de Chuva com ícone climático vetorial e carrossel de notícias geradas pelas Gems da IA.
+11. **📰 Tela 10 — `Feed de Notícias Customizável` (`SCR_NEWS`):** Manchetes rotativas dos tópicos escolhidos (Política, Tecnologia, Mercado, IA) com deslize horizontal suave (*ticker smooth scroll* via `TFT_eSprite`).
+12. **💻 Tela 11 — `Terminal CYD & Rede` (`SCR_TERMINAL`):** Prompt estilo hacker CRT verde com buffer de rolagem vertical, logs em tempo real, comandos locais do PC (`ping`, `fetch`, `docker`) e escaneamento de redes Wi-Fi em hardware (`wifi scan` no ESP32).
 
 ---
 

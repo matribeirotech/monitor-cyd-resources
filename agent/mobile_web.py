@@ -769,7 +769,7 @@ HTML_MOBILE_APP = r"""<!DOCTYPE html>
     </div>
 
     <div class="sec-header" style="margin-top:14px;">
-      <div class="sec-title">FINANÇAS, FOCO, MÍDIA, CLIMA & GEMINI IA v4.1 (TELAS 6 A 10)</div>
+      <div class="sec-title">CYD CYBER DECK v4.0 — FINANÇAS, FOCO, MÍDIA, NEWS & TERMINAL (TELAS 6 A 11)</div>
     </div>
     <div class="screen-grid">
       <div class="screen-card" data-screen="6" onclick="selectScreen(6)">
@@ -816,15 +816,50 @@ HTML_MOBILE_APP = r"""<!DOCTYPE html>
         </div>
       </div>
 
-      <div class="screen-card" data-screen="10" onclick="selectScreen(10)" style="grid-column: span 2;">
+      <div class="screen-card" data-screen="10" onclick="selectScreen(10)">
         <div class="sc-top">
-          <div class="sc-icon">🌦️🤖</div>
+          <div class="sc-icon">📰</div>
           <div class="sc-badge" id="badge-10">T10</div>
         </div>
         <div>
-          <div class="sc-title">Tela 10: Clima Regional & Gemini Gems</div>
-          <div class="sc-desc" id="sc10Desc">Votuporanga • Data, Temp °C, Alertas de Tempestade & IA Gems</div>
+          <div class="sc-title">Tela 10: Clima & News</div>
+          <div class="sc-desc" id="sc10Desc">Votuporanga + Manchetes RSS 15s</div>
         </div>
+      </div>
+
+      <div class="screen-card" data-screen="11" onclick="selectScreen(11)">
+        <div class="sc-top">
+          <div class="sc-icon">💻</div>
+          <div class="sc-badge" id="badge-11">T11</div>
+        </div>
+        <div>
+          <div class="sc-title">Tela 11: Terminal CYD</div>
+          <div class="sc-desc">Console Verde • ping, fetch, docker, wifi</div>
+        </div>
+      </div>
+    </div>
+
+    <div class="sec-header" style="margin-top:14px;">
+      <div class="sec-title">💻 TERMINAL CYBER DECK & NEWS FEED (ATALHO RÁPIDO)</div>
+    </div>
+    <div class="action-card">
+      <div style="font-size:11px; color:#38BDF8; font-weight:800; font-family:monospace; margin-bottom:4px;" id="mNewsTopic">📰 [TECNOLOGIA]</div>
+      <div style="font-size:11.5px; color:var(--text); margin-bottom:8px; line-height:1.3;" id="mNewsHeadline">Sincronizando manchetes...</div>
+      <div class="btn-row" style="margin-bottom:10px;">
+        <button class="btn btn-secondary" onclick="newsAction('next')" style="font-size:11px;">⏭️ Próx. Notícia</button>
+        <button class="btn btn-secondary" onclick="newsAction('refresh')" style="font-size:11px;">🔄 Atualizar RSS</button>
+      </div>
+
+      <div style="background:#030508; border:1px solid #15803D; border-radius:8px; padding:8px; font-family:monospace; font-size:10.5px; color:#22C55E; max-height:130px; overflow-y:auto; white-space:pre-wrap; margin-bottom:8px;" id="mTermBox">CYD CYBER DECK TERMINAL v4.0 READY</div>
+      <div style="display:flex; gap:6px; margin-bottom:8px;">
+        <input type="text" id="mTermInput" placeholder="ping 8.8.8.8 | fetch github.com | wifi scan" style="flex:1; background:#030508; color:#22C55E; border:1px solid #22C55E; border-radius:8px; padding:9px; font-family:monospace; font-size:12px; outline:none;">
+        <button class="btn" onclick="sendTermCmd()" style="flex:0 0 auto; padding:9px 14px;">▶ Run</button>
+      </div>
+      <div class="brt-presets">
+        <div class="brt-btn" onclick="sendTermCmd('wifi scan')" style="color:#38BDF8;">📡 wifi scan</div>
+        <div class="brt-btn" onclick="sendTermCmd('ping 8.8.8.8')" style="color:#22C55E;">⚡ ping 8.8.8.8</div>
+        <div class="brt-btn" onclick="sendTermCmd('fetch https://api.github.com')" style="color:#A855F7;">🌐 fetch api</div>
+        <div class="brt-btn" onclick="sendTermCmd('docker ps')" style="color:#F59E0B;">🐳 docker ps</div>
       </div>
     </div>
   </div>
@@ -1280,6 +1315,38 @@ HTML_MOBILE_APP = r"""<!DOCTYPE html>
       }
     }
 
+    async function newsAction(action) {
+      vibrate(18);
+      showToast(action === "refresh" ? "Atualizando manchetes RSS..." : "Próxima manchete enviada!", "📰");
+      try {
+        await fetch("/api/news", {
+          method: "POST",
+          headers: {"Content-Type": "application/json"},
+          body: JSON.stringify({action: action})
+        });
+      } catch (err) {
+        console.error(err);
+      }
+    }
+
+    async function sendTermCmd(presetCmd) {
+      vibrate(20);
+      const inp = document.getElementById("mTermInput");
+      const cmd = (presetCmd !== undefined ? presetCmd : (inp ? inp.value : "")).trim();
+      if (!cmd) return;
+      if (presetCmd === undefined && inp) inp.value = "";
+      showToast("Terminal: " + cmd, "💻");
+      try {
+        await fetch("/api/terminal", {
+          method: "POST",
+          headers: {"Content-Type": "application/json"},
+          body: JSON.stringify({cmd: cmd})
+        });
+      } catch (err) {
+        console.error(err);
+      }
+    }
+
     async function togglePower(kind) {
       vibrate(15);
       const payload = {};
@@ -1580,7 +1647,7 @@ HTML_MOBILE_APP = r"""<!DOCTYPE html>
         }
       }
 
-      // Clima Regional (Votuporanga) & Gemini Gems (Tela 10)
+      // Clima Regional (Votuporanga), News Feed (Tela 10) & Terminal CYD (Tela 11)
       if (data.weather) {
         const w = data.weather;
         const subEl = document.getElementById("topWthSub");
@@ -1591,8 +1658,22 @@ HTML_MOBILE_APP = r"""<!DOCTYPE html>
         }
         const sc10 = document.getElementById("sc10Desc");
         if (sc10) {
-          const gTitle = (data.gems && data.gems.last_title) ? data.gems.last_title : "Gemini Gems";
-          sc10.innerText = `${w.city || "Votuporanga"}: ${Number(w.temp || 0).toFixed(1)}°C (${w.cond || ""}) • 🤖 ${gTitle}`;
+          const nTop = (data.news && data.news.active_topic) ? data.news.active_topic : "News Feed";
+          sc10.innerText = `${w.city || "Votuporanga"}: ${Number(w.temp || 0).toFixed(1)}°C • 📰 ${nTop}`;
+        }
+      }
+      if (data.news) {
+        const nw = data.news;
+        const elNT = document.getElementById("mNewsTopic");
+        const elNH = document.getElementById("mNewsHeadline");
+        if (elNT) elNT.innerText = `📰 [${(nw.active_topic || "NOTÍCIAS").toUpperCase()}] • ${nw.active_source || "RSS"} (${nw.remain_sec || 15}s)`;
+        if (elNH) elNH.innerText = nw.active_headline || "";
+      }
+      if (data.terminal && data.terminal.text) {
+        const tb = document.getElementById("mTermBox");
+        if (tb && tb.innerText !== data.terminal.text) {
+          tb.innerText = data.terminal.text;
+          tb.scrollTop = tb.scrollHeight;
         }
       }
 
