@@ -5,6 +5,7 @@
 ![Interface PC](https://img.shields.io/badge/GUI%20PC-Flet%20%2F%20Flutter-02569B?style=for-the-badge&logo=flutter)
 ![CI/CD](https://img.shields.io/badge/CI%2FCD-GitHub%20Actions-2088FF?style=for-the-badge&logo=githubactions)
 ![Autor](https://img.shields.io/badge/Autor-Matheus%20Ribeiro%20(z1po)-FF5500?style=for-the-badge)
+[![Maintained by LYPSYOS](https://img.shields.io/badge/Maintained%20by-LYPSYOS%20OSS%20Community-2457F5?style=for-the-badge)](https://lypsyos.com)
 ![Licença](https://img.shields.io/badge/Licen%C3%A7a-MIT-green?style=for-the-badge)
 
 Um **Cyber Deck administrativo, monitor de hardware de alta performance, feed de notícias passivo, terminal interativo de rede/sistema e estação meteorológica regional** de código aberto para a placa **ESP32-2432S028R (*Cheap Yellow Display* / CYD 2.8" 320×240)**.
@@ -307,4 +308,4 @@ O Agente envia dados via Serial a `115200 bps` no formato JSON terminado em `\n`
 Distribuído sob a licença **MIT**. Veja o arquivo [`LICENSE`](LICENSE) para mais detalhes.
 
 ---
-*Projeto idealizado, arquitetado e desenvolvido por **Matheus Ribeiro -- z1po** & comunidade Open Source.*
+*Projeto idealizado, arquitetado e desenvolvido por **Matheus Ribeiro -- z1po** (`@matribeirotech`) & **[LYPSYOS Open Source Lab & Community](https://lypsyos.com)**.*

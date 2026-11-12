@@ -95,3 +95,13 @@ Se você alterou o `agent/agent.py` e deseja atualizar o executável standalone 
 - [ ] Nenhum arquivo temporário de compilação (`.pio/`, `.venv/`, `build/`, `__pycache__/`) foi incluído no commit.
 - [ ] A descrição do Pull Request explica claramente o que foi adicionado ou corrigido (se possível, inclua uma foto da tela CYD ou print do painel Flet!).
 
+---
+
+## 🌐 6. Comunidade LYPSYOS Open Source
+
+Este repositório faz parte do ecossistema **[LYPSYOS — Open Source Lab & Community](https://lypsyos.com)**.
+
+- Respeite o nosso [`CODE_OF_CONDUCT.md`](CODE_OF_CONDUCT.md).
+- Para começar rápido, filtre Issues com as etiquetas `good first issue`, `help wanted` ou `hardware / esp32`.
+- Participe das discussões no GitHub Discussions ou em [lypsyos.com/projetos?projeto=monitor-cyd-resources](https://lypsyos.com/projetos?projeto=monitor-cyd-resources).
+
