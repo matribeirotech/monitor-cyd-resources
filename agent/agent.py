@@ -60,6 +60,7 @@ except ImportError:
         import agent.mobile_web as mobile_web
 
 IS_WINDOWS = platform.system() == "Windows"
+IS_LINUX = platform.system() == "Linux"
 if sys.stdout is None:
     sys.stdout = open(os.devnull, "w", encoding="utf-8")
 if sys.stderr is None:
@@ -73,7 +74,58 @@ except ImportError:
 BAUD = 115200
 INTERVAL = 1.0
 APP_DIR = os.path.dirname(sys.executable) if getattr(sys, "frozen", False) else os.path.dirname(os.path.abspath(__file__))
-CONFIG_FILE = os.path.join(APP_DIR, "ui_config.json")
+
+
+def _resolve_config_file() -> str:
+    """Resolve onde salvar ui_config.json (diretório do app ou ~/.config/cyd-cyber-deck no Linux/AppImage)."""
+    local_cfg = os.path.join(APP_DIR, "ui_config.json")
+    if os.path.exists(local_cfg) and os.access(local_cfg, os.W_OK):
+        return local_cfg
+    if os.access(APP_DIR, os.W_OK) and not os.environ.get("APPIMAGE"):
+        return local_cfg
+    xdg_cfg = os.environ.get("XDG_CONFIG_HOME") or os.path.expanduser("~/.config")
+    cfg_dir = os.path.join(xdg_cfg, "cyd-cyber-deck")
+    try:
+        os.makedirs(cfg_dir, exist_ok=True)
+        return os.path.join(cfg_dir, "ui_config.json")
+    except Exception:
+        return local_cfg
+
+
+CONFIG_FILE = _resolve_config_file()
+
+
+def copy_text_to_clipboard(text: str, page=None) -> bool:
+    """Copia texto para a área de transferência no Windows e Linux (Wayland wl-copy / X11 xclip / xsel)."""
+    if not text:
+        return False
+    if page is not None and hasattr(page, "set_clipboard"):
+        try:
+            page.set_clipboard(text)
+            return True
+        except Exception:
+            pass
+    try:
+        if IS_WINDOWS:
+            subprocess.run(
+                ["clip"],
+                input=text.encode("utf-16le"),
+                check=False,
+                creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+            )
+            return True
+        if IS_LINUX:
+            for cmd in (
+                ["wl-copy"],
+                ["xclip", "-selection", "clipboard"],
+                ["xsel", "--clipboard", "--input"],
+            ):
+                if shutil.which(cmd[0]):
+                    subprocess.run(cmd, input=text.encode("utf-8"), timeout=1.5, check=False)
+                    return True
+    except Exception:
+        pass
+    return False
 
 
 def get_resource_path(relative_path: str) -> str:
@@ -166,18 +218,21 @@ KNOWN_USB_IDS = {
     (0x1A86, 0x55D4),  # CH9102
     (0x10C4, 0xEA60),  # CP2102
     (0x0403, 0x6001),  # FT232
+    (0x303A, 0x1001),  # ESP32 Native USB JTAG/Serial
 }
 
 DEFAULT_GAME_PROCESSES = (
     "pcsx2", "rpcs3", "dolphin-emu", "yuzu", "ryujinx", "cemu", "citra",
     "ppsspp", "duckstation", "mupen64plus", "retroarch", "xemu",
+    "gamescope", "wine64-preloader", "wine-preloader", "mangohud",
 )
 
 
 def _is_steam_game(exe_path):
     if not exe_path:
         return False
-    return "steamapps/common" in exe_path.replace("\\", "/").lower()
+    low = exe_path.replace("\\", "/").lower()
+    return "steamapps/common" in low or "/proton" in low
 
 
 # --------------------------------------------------------------- helpers ----
@@ -205,6 +260,62 @@ def read_int(path):
 
 
 SYSTEM_ROOT = os.path.abspath(os.sep)
+
+
+def get_linux_distro_name() -> str:
+    """Retorna o nome amigável da distribuição Linux (ex: 'Zorin OS 17.2 Core')."""
+    if not IS_LINUX:
+        return f"{platform.system()} {platform.release()}"
+    for p in ("/etc/os-release", "/usr/lib/os-release"):
+        if os.path.isfile(p):
+            try:
+                with open(p, "r", encoding="utf-8", errors="ignore") as f:
+                    for ln in f:
+                        if ln.startswith("PRETTY_NAME="):
+                            val = ln.split("=", 1)[1].strip().strip('"').strip("'")
+                            if val:
+                                return val
+            except Exception:
+                pass
+    return f"Linux {platform.release()}"
+
+
+def get_linux_cpu_name() -> str:
+    """Lê o modelo real do processador via /proc/cpuinfo no Linux."""
+    if IS_LINUX and os.path.isfile("/proc/cpuinfo"):
+        try:
+            with open("/proc/cpuinfo", "r", encoding="utf-8", errors="ignore") as f:
+                for ln in f:
+                    if ln.lower().startswith("model name") and ":" in ln:
+                        return ln.split(":", 1)[1].strip()
+        except Exception:
+            pass
+    return platform.processor() or "x86_64 CPU"
+
+
+def get_cpu_freq_mhz() -> int | None:
+    """Retorna o clock atual da CPU em MHz com fallback para sysfs / /proc/cpuinfo no Linux."""
+    try:
+        freq = psutil.cpu_freq()
+        if freq and freq.current and freq.current > 100:
+            return int(freq.current)
+    except Exception:
+        pass
+    if IS_LINUX:
+        khz = read_int("/sys/devices/system/cpu/cpu0/cpufreq/scaling_cur_freq")
+        if khz and khz > 100000:
+            return int(khz // 1000)
+        try:
+            with open("/proc/cpuinfo", "r", encoding="utf-8", errors="ignore") as f:
+                mhz_vals = []
+                for ln in f:
+                    if ln.lower().startswith("cpu mhz") and ":" in ln:
+                        mhz_vals.append(float(ln.split(":", 1)[1].strip()))
+                if mhz_vals:
+                    return int(max(mhz_vals))
+        except Exception:
+            pass
+    return None
 
 
 def load_average():
@@ -287,7 +398,7 @@ def _lhm_sensors(kind):
 
 
 CPU_TEMP_KEYS = ("k10temp", "zenpower", "coretemp", "cpu_thermal",
-                 "acpitz", "soc_thermal", "thinkpad")
+                 "acpitz", "soc_thermal", "thinkpad", "nct67", "it86", "it87", "asusec")
 CPU_LABEL_HINTS = ("tctl", "tdie", "package", "cpu", "core 0", "composite")
 
 
@@ -302,6 +413,8 @@ def _get_lhm_web_data():
     Consulta o servidor web do LibreHardwareMonitor na porta 8085 com cache de 1.5s
     e backoff inteligente de 30s caso a porta esteja fechada (evita delay de 800ms de SYN no Windows!).
     """
+    if not IS_WINDOWS:
+        return None
     global _lhm_web_cache_data, _lhm_web_cache_ts, _lhm_web_backoff_until
     now = time.monotonic()
     with _lhm_web_lock:
@@ -357,7 +470,7 @@ def _find_web_sensors(node, kind, name_hints=None):
 
 
 def cpu_temperature(web_data=None):
-    """Retorna a temperatura da CPU em graus Celsius."""
+    """Retorna a temperatura da CPU em graus Celsius (Linux sysfs/hwmon/psutil & Windows LHM/WMI)."""
     temps = None
     try:
         temps = psutil.sensors_temperatures()
@@ -382,6 +495,13 @@ def cpu_temperature(web_data=None):
                     best = e.current if best is None else max(best, e.current)
         if best:
             return round(best, 1)
+
+    if IS_LINUX:
+        import glob
+        for tz in sorted(glob.glob("/sys/class/thermal/thermal_zone*/temp")):
+            val = read_int(tz)
+            if val and 10000 < val < 125000:
+                return round(val / 1000.0, 1)
 
     if web_data is None:
         web_data = _get_lhm_web_data()
@@ -412,6 +532,12 @@ def fan_rpm():
         for e in entries:
             if e.current and e.current > 0:
                 return int(e.current)
+    if IS_LINUX:
+        import glob
+        for fn in glob.glob("/sys/class/hwmon/hwmon*/fan*_input"):
+            v = read_int(fn)
+            if v and v > 0:
+                return int(v)
     for s in _lhm_sensors("Fan"):
         if s.Value:
             return int(s.Value)
@@ -428,6 +554,8 @@ def _find_nvidia_smi():
     exe = shutil.which("nvidia-smi")
     if exe:
         return exe
+    if IS_LINUX and os.path.isfile("/usr/bin/nvidia-smi"):
+        return "/usr/bin/nvidia-smi"
     if IS_WINDOWS:
         for c in (
             os.path.join(os.environ.get("SystemRoot", r"C:\Windows"), "System32", "nvidia-smi.exe"),
@@ -449,13 +577,20 @@ def _detect_gpu():
     for card in sorted(glob.glob("/sys/class/drm/card[0-9]/device")):
         if os.path.exists(os.path.join(card, "gpu_busy_percent")):
             hw = glob.glob(os.path.join(card, "hwmon", "hwmon*"))
+            pwr_path = None
+            if hw:
+                for p_cand in ("power1_average", "power1_input"):
+                    cand_full = os.path.join(hw[0], p_cand)
+                    if os.path.exists(cand_full):
+                        pwr_path = cand_full
+                        break
             _amd_paths = {
                 "busy": os.path.join(card, "gpu_busy_percent"),
                 "vram_used": os.path.join(card, "mem_info_vram_used"),
                 "vram_total": os.path.join(card, "mem_info_vram_total"),
                 "temp": os.path.join(hw[0], "temp1_input") if hw else None,
                 "fan": os.path.join(hw[0], "fan1_input") if hw else None,
-                "power": os.path.join(hw[0], "power1_average") if hw else None,
+                "power": pwr_path,
             }
             _gpu_kind = "amd"
             return
@@ -469,6 +604,28 @@ def _detect_gpu():
         except Exception:
             pass
     _gpu_kind = "none"
+
+
+def get_linux_gpu_model_name() -> str:
+    """Detecta o nome comercial da GPU no Linux (via nvidia-smi ou lspci)."""
+    if _nvidia_smi:
+        n_out = run([_nvidia_smi, "--query-gpu=name", "--format=csv,noheader"], timeout=1.5)
+        if n_out:
+            return n_out.splitlines()[0].strip()[:24]
+    if IS_LINUX and shutil.which("lspci"):
+        lsp = run(["lspci"], timeout=1.5)
+        if lsp:
+            for ln in lsp.splitlines():
+                low = ln.lower()
+                if "vga compatible controller:" in low or "3d controller:" in low or "display controller:" in low:
+                    desc = ln.split(":", 2)[-1].strip()
+                    m_br = re.findall(r"\[([^\]]+)\]", desc)
+                    if m_br:
+                        for b in reversed(m_br):
+                            if not re.match(r"^[0-9a-fA-F]{4}:[0-9a-fA-F]{4}$", b):
+                                return b[:24]
+                    return desc[:24]
+    return "GPU Linux"
 
 
 def _lhm_gpu_stats():
@@ -560,14 +717,14 @@ def gpu_stats(web_data=None):
         vt = read_int(_amd_paths.get("vram_total") or "")
         pw = read_int(_amd_paths.get("power") or "")
         return {
-            "gpu": busy if busy is not None else 0.0,
+            "gpu": float(busy) if busy is not None else 0.0,
             "gput": round(temp / 1000.0, 1) if temp else None,
             "vram": round(100.0 * vu / vt, 1) if vu and vt else None,
             "vramu": round(vu / 1073741824.0, 1) if vu else None,
             "vramt": round(vt / 1073741824.0, 1) if vt else None,
             "gpuw": round(pw / 1000000.0, 1) if pw else None,
             "gpufan": read_int(_amd_paths.get("fan") or ""),
-            "gpuname": "AMD",
+            "gpuname": "RADEON",
         }
 
     if web:
@@ -591,7 +748,7 @@ class Collector:
       - Isola leituras pesadas (WMI, LibreHardwareMonitor, nvidia-smi e varredura de processos)
         em uma thread daemon dedicada com cache multinível:
           * Contadores leves (CPU%, RAM%, Disco%, Rede RX/TX): 1.0s
-          * Sensores térmicos / GPU (WMI / LHM / nvidia-smi): 2.0s
+          * Sensores térmicos / GPU (WMI / LHM / nvidia-smi / sysfs): 2.0s
           * Top processos & detecção de jogos/RTSS: 6.0s
       - `sample_sys()` retorna o snapshot em cache instantaneamente (< 0.02 ms, O(1)),
         eliminando picos de CPU/RAM no agente e impedindo qualquer travamento na UI ou Serial.
@@ -608,6 +765,7 @@ class Collector:
         self.boot_t = psutil.boot_time()
         self.cores = psutil.cpu_count(logical=True)
         self.game_processes = tuple(g.lower() for g in DEFAULT_GAME_PROCESSES + tuple(game_processes))
+        self.last_gpu_name = get_linux_gpu_model_name() if IS_LINUX else None
 
         self._last_heavy_scan = 0.0
         self._last_proc_scan = 0.0
@@ -631,7 +789,7 @@ class Collector:
         dt = max(now - self.prev_t, 0.1)
 
         cpu = psutil.cpu_percent(interval=None)
-        freq = psutil.cpu_freq()
+        cpuf_mhz = get_cpu_freq_mhz()
         vm = psutil.virtual_memory()
         sw = psutil.swap_memory()
         du = psutil.disk_usage(SYSTEM_ROOT)
@@ -657,6 +815,8 @@ class Collector:
                 web_data = _get_lhm_web_data()
                 self._cached_cput = cpu_temperature(web_data)
                 self._cached_gpu = gpu_stats(web_data) or {"gpu": 0.0, "gpuname": None}
+                if self._cached_gpu.get("gpuname"):
+                    self.last_gpu_name = self._cached_gpu["gpuname"]
                 self._cached_fan = fan_rpm() if not web_data else None
             except Exception:
                 pass
@@ -690,7 +850,7 @@ class Collector:
             "cpu": round(cpu, 1),
             "temp": self._cached_cput,
             "cput": self._cached_cput,
-            "cpuf": int(freq.current) if freq and freq.current else None,
+            "cpuf": cpuf_mhz,
             "cores": self.cores,
             "load": load_average(),
             "hh": br.hour,
@@ -752,6 +912,8 @@ class Collector:
 
 # ---------------------------------------------------------------- serial ----
 def find_port():
+    if IS_LINUX and os.path.exists("/dev/mike"):
+        return "/dev/mike"
     try:
         from serial.tools import list_ports
     except ImportError:
@@ -1261,6 +1423,15 @@ class SerialManager:
                             pass
             except Exception as ex:
                 err_s = str(ex)[:60]
+                if IS_LINUX and ("Permission denied" in str(ex) or "Errno 13" in str(ex)):
+                    now_warn = time.monotonic()
+                    if now_warn - getattr(self, "_last_perm_warn_t", 0.0) >= 15.0:
+                        self._last_perm_warn_t = now_warn
+                        if self.on_log:
+                            self.on_log(
+                                f"⚠️ Sem permissão na porta {port} (Errno 13)! "
+                                "No Ubuntu/Linux rode: ./linux/install_ubuntu.sh ou 'sudo usermod -aG dialout $USER' e relogue."
+                            )
                 _close_serial()
                 next_port_scan = now_m + 1.5
                 self._update_status(connected=False, state="DISCONNECTED", port="", last_error=err_s)
@@ -1529,8 +1700,11 @@ DEFAULT_ALERT_RULES = [
 ]
 
 
+_LINUX_IDLE_CACHE = {"ts": 0.0, "val": 0.0}
+
+
 def get_system_idle_seconds() -> float:
-    """Retorna o tempo de inatividade do usuário (sem uso de mouse/teclado) em segundos no Windows."""
+    """Retorna o tempo de inatividade do usuário (sem uso de mouse/teclado) em segundos no Windows e Linux (Zorin OS Wayland/X11)."""
     try:
         if sys.platform == "win32":
             class LASTINPUTINFO(ctypes.Structure):
@@ -1541,6 +1715,85 @@ def get_system_idle_seconds() -> float:
             if ctypes.windll.user32.GetLastInputInfo(ctypes.byref(lii)):
                 millis = ctypes.windll.kernel32.GetTickCount() - lii.dwTime
                 return max(0.0, millis / 1000.0)
+        elif IS_LINUX:
+            now_m = time.monotonic()
+            if now_m - _LINUX_IDLE_CACHE["ts"] < 2.0:
+                return _LINUX_IDLE_CACHE["val"]
+            _LINUX_IDLE_CACHE["ts"] = now_m
+
+            # 1) Zorin OS / Ubuntu (GNOME Shell Mutter IdleMonitor via D-Bus - suporta Wayland e X11)
+            if shutil.which("gdbus"):
+                try:
+                    res = subprocess.run(
+                        [
+                            "gdbus", "call", "--session",
+                            "--dest", "org.gnome.Mutter.IdleMonitor",
+                            "--object-path", "/org/gnome/Mutter/IdleMonitor/Core",
+                            "--method", "org.gnome.Mutter.IdleMonitor.GetIdletime",
+                        ],
+                        capture_output=True, text=True, timeout=0.45,
+                    )
+                    if res.returncode == 0 and res.stdout:
+                        m = re.search(r"uint64\s+(\d+)|\((\d+),?\)", res.stdout)
+                        if m:
+                            ms = int(m.group(1) or m.group(2))
+                            val = max(0.0, ms / 1000.0)
+                            _LINUX_IDLE_CACHE["val"] = val
+                            return val
+                except Exception:
+                    pass
+
+            # 2) Utilitário leve xprintidle (X11 / Zorin OS Lite XFCE)
+            if shutil.which("xprintidle"):
+                try:
+                    res = subprocess.run(["xprintidle"], capture_output=True, text=True, timeout=0.35)
+                    if res.returncode == 0 and res.stdout.strip().isdigit():
+                        val = max(0.0, int(res.stdout.strip()) / 1000.0)
+                        _LINUX_IDLE_CACHE["val"] = val
+                        return val
+                except Exception:
+                    pass
+
+            # 3) X11 libXss.so.1 direta via ctypes
+            if os.environ.get("DISPLAY"):
+                try:
+                    class XScreenSaverInfo(ctypes.Structure):
+                        _fields_ = [
+                            ("window", ctypes.c_ulong),
+                            ("state", ctypes.c_int),
+                            ("kind", ctypes.c_int),
+                            ("til_or_since", ctypes.c_ulong),
+                            ("idle", ctypes.c_ulong),
+                            ("eventMask", ctypes.c_ulong),
+                        ]
+
+                    libX11 = ctypes.cdll.LoadLibrary("libX11.so.6")
+                    libXss = ctypes.cdll.LoadLibrary("libXss.so.1")
+                    libX11.XOpenDisplay.restype = ctypes.c_void_p
+                    libX11.XDefaultRootWindow.argtypes = [ctypes.c_void_p]
+                    libX11.XDefaultRootWindow.restype = ctypes.c_ulong
+                    libXss.XScreenSaverAllocInfo.restype = ctypes.POINTER(XScreenSaverInfo)
+                    libXss.XScreenSaverQueryInfo.argtypes = [
+                        ctypes.c_void_p, ctypes.c_ulong, ctypes.POINTER(XScreenSaverInfo)
+                    ]
+
+                    dpy = libX11.XOpenDisplay(None)
+                    if dpy:
+                        try:
+                            root = libX11.XDefaultRootWindow(dpy)
+                            xss_info = libXss.XScreenSaverAllocInfo()
+                            if xss_info:
+                                try:
+                                    if libXss.XScreenSaverQueryInfo(dpy, root, xss_info):
+                                        val = max(0.0, float(xss_info.contents.idle) / 1000.0)
+                                        _LINUX_IDLE_CACHE["val"] = val
+                                        return val
+                                finally:
+                                    libX11.XFree(xss_info)
+                        finally:
+                            libX11.XCloseDisplay(dpy)
+                except Exception:
+                    pass
     except Exception:
         pass
     return 0.0
@@ -2420,6 +2673,8 @@ class MediaCollector:
 
         if IS_WINDOWS:
             threading.Thread(target=self._worker_loop, daemon=True).start()
+        elif IS_LINUX:
+            threading.Thread(target=self._worker_loop_linux, daemon=True).start()
 
     def set_source_pref(self, pref: str):
         with self._lock:
@@ -2689,6 +2944,273 @@ class MediaCollector:
             except Exception:
                 pass
             time.sleep(0.85)
+
+    def _load_linux_art_url(self, art_url: str, title: str, artist: str) -> bytes:
+        """Carrega bytes da capa de álbum via file://, http(s):// ou fallback Deezer no Linux."""
+        if art_url:
+            try:
+                if art_url.startswith("file://"):
+                    local_path = urllib.parse.unquote(art_url[7:])
+                    if os.path.isfile(local_path):
+                        with open(local_path, "rb") as f:
+                            raw = f.read()
+                        if len(raw) > 256:
+                            return raw
+                elif art_url.startswith(("http://", "https://")):
+                    if art_url in self._online_cover_cache:
+                        return self._online_cover_cache[art_url]
+                    req = urllib.request.Request(art_url, headers={"User-Agent": "Mozilla/5.0"})
+                    with urllib.request.urlopen(req, timeout=2.8) as resp:
+                        raw = resp.read()
+                    if len(raw) > 256:
+                        if len(self._online_cover_cache) > 32:
+                            self._online_cover_cache.clear()
+                        self._online_cover_cache[art_url] = raw
+                        return raw
+            except Exception:
+                pass
+        return self._fetch_online_cover_fallback(title, artist)
+
+    def _poll_mpris_playerctl(self) -> list[dict]:
+        """Coleta sessões MPRIS2 ativas no Linux usando playerctl (se instalado)."""
+        if not shutil.which("playerctl"):
+            return []
+        fmt = "{{playerName}}\t{{status}}\t{{title}}\t{{artist}}\t{{album}}\t{{mpris:artUrl}}\t{{xesam:url}}\t{{position}}\t{{mpris:length}}"
+        try:
+            res = subprocess.run(
+                ["playerctl", "-a", "metadata", "--format", fmt],
+                capture_output=True, text=True, timeout=0.9,
+            )
+            if res.returncode != 0 or not res.stdout.strip():
+                return []
+            players = []
+            for ln in res.stdout.splitlines():
+                parts = ln.split("\t")
+                if len(parts) < 9:
+                    continue
+                p_name, status, title, artist, album, art_url, x_url, pos_us, len_us = parts[:9]
+                title = title.strip()
+                artist = artist.strip()
+                album = album.strip()
+                if not title and not artist:
+                    continue
+                try:
+                    pos_s = max(0, int(float(pos_us) / 1_000_000)) if pos_us.strip() else 0
+                except Exception:
+                    pos_s = 0
+                try:
+                    dur_s = max(0, int(float(len_us) / 1_000_000)) if len_us.strip() else 0
+                except Exception:
+                    dur_s = 0
+                players.append({
+                    "backend": "playerctl",
+                    "bus_name": p_name.strip(),
+                    "app_id": p_name.strip(),
+                    "playing": status.strip().lower() == "playing",
+                    "title": title,
+                    "artist": artist,
+                    "album": album,
+                    "art_url": art_url.strip(),
+                    "url": x_url.strip(),
+                    "pos": pos_s,
+                    "dur": dur_s,
+                })
+            return players
+        except Exception:
+            return []
+
+    def _poll_mpris_gdbus(self) -> list[dict]:
+        """Fallback MPRIS2 nativo via gdbus (pré-instalado no Zorin OS / Ubuntu / GNOME sem precisar de pacotes extras)."""
+        if not shutil.which("gdbus"):
+            return []
+        try:
+            res = subprocess.run(
+                [
+                    "gdbus", "call", "--session",
+                    "--dest", "org.freedesktop.DBus",
+                    "--object-path", "/org/freedesktop/DBus",
+                    "--method", "org.freedesktop.DBus.ListNames",
+                ],
+                capture_output=True, text=True, timeout=0.8,
+            )
+            if res.returncode != 0 or not res.stdout:
+                return []
+            buses = re.findall(r"'(org\.mpris\.MediaPlayer2\.[^']+)'", res.stdout)
+            players = []
+            for bus in buses:
+                try:
+                    p_res = subprocess.run(
+                        [
+                            "gdbus", "call", "--session",
+                            "--dest", bus,
+                            "--object-path", "/org/mpris/MediaPlayer2",
+                            "--method", "org.freedesktop.DBus.Properties.GetAll",
+                            "org.mpris.MediaPlayer2.Player",
+                        ],
+                        capture_output=True, text=True, timeout=0.8,
+                    )
+                    if p_res.returncode != 0 or not p_res.stdout:
+                        continue
+                    out = p_res.stdout
+                    is_playing = "'PlaybackStatus': <'Playing'>" in out
+
+                    def _extract_str(key: str) -> str:
+                        m = re.search(rf"'{re.escape(key)}':\s*<(?:\[\s*)?'([^']*)'", out)
+                        return m.group(1).strip() if m else ""
+
+                    title = _extract_str("xesam:title")
+                    artist = _extract_str("xesam:artist")
+                    album = _extract_str("xesam:album")
+                    art_url = _extract_str("mpris:artUrl")
+                    x_url = _extract_str("xesam:url")
+                    if not title and not artist:
+                        continue
+
+                    m_pos = re.search(r"'Position':\s*<(?:int64|uint64)\s+(\d+)>", out)
+                    pos_s = int(m_pos.group(1)) // 1_000_000 if m_pos else 0
+                    m_len = re.search(r"'mpris:length':\s*<(?:int64|uint64)\s+(\d+)>", out)
+                    dur_s = int(m_len.group(1)) // 1_000_000 if m_len else 0
+
+                    short_id = bus.replace("org.mpris.MediaPlayer2.", "")
+                    players.append({
+                        "backend": "gdbus",
+                        "bus_name": bus,
+                        "app_id": short_id,
+                        "playing": is_playing,
+                        "title": title,
+                        "artist": artist,
+                        "album": album,
+                        "art_url": art_url,
+                        "url": x_url,
+                        "pos": max(0, pos_s),
+                        "dur": max(0, dur_s),
+                    })
+                except Exception:
+                    continue
+            return players
+        except Exception:
+            return []
+
+    def _worker_loop_linux(self):
+        """Worker de mídia MPRIS2 / D-Bus para Linux (Zorin OS / Ubuntu / Debian)."""
+        while self._running:
+            try:
+                raw_players = self._poll_mpris_playerctl()
+                if not raw_players:
+                    raw_players = self._poll_mpris_gdbus()
+
+                with self._lock:
+                    pref = self._source_pref
+
+                candidates = []
+                for p in raw_players:
+                    app_id = p["app_id"]
+                    title = p["title"]
+                    artist = p["artist"]
+                    album = p["album"]
+                    x_url = (p.get("url") or "").lower()
+                    if artist.endswith(" - Topic"):
+                        artist = artist[:-8].strip()
+
+                    win_info = {
+                        "ytmusic_open": ("music.youtube.com" in x_url or "youtube.com" in x_url),
+                        "spotify_web_open": ("open.spotify.com" in x_url or "spotify.com" in x_url),
+                        "ytmusic_titles": [title] if "music.youtube.com" in x_url else [],
+                    }
+                    src_kind = self._classify_session(app_id, title, artist, album, win_info)
+                    if src_kind == "MEDIA":
+                        if "music.youtube.com" in x_url:
+                            src_kind = "YT MUSIC"
+                        elif "spotify.com" in x_url:
+                            src_kind = "SPOTIFY"
+
+                    if pref == "spotify" and src_kind != "SPOTIFY":
+                        continue
+                    if pref == "ytmusic" and src_kind != "YT MUSIC":
+                        continue
+
+                    score = (100 if p["playing"] else 0) + (40 if src_kind in ("SPOTIFY", "YT MUSIC") else 0)
+                    candidates.append((score, p, src_kind, title, artist, album))
+
+                if not candidates:
+                    while not self._cmd_queue.empty():
+                        try:
+                            self._cmd_queue.get_nowait()
+                        except Exception:
+                            break
+                    with self._lock:
+                        self._state.update({
+                            "source": "NONE",
+                            "playing": False,
+                            "pos": 0,
+                            "dur": 0,
+                        })
+                    time.sleep(0.95)
+                    continue
+
+                candidates.sort(key=lambda x: x[0], reverse=True)
+                _, best_p, src_kind, title, artist, album = candidates[0]
+
+                # Executa comandos de transporte (Play/Pause, Next, Prev) via MPRIS2
+                while not self._cmd_queue.empty():
+                    cmd = self._cmd_queue.get_nowait()
+                    try:
+                        if best_p["backend"] == "playerctl":
+                            pctl_cmd = {"play_pause": "play-pause", "next": "next", "prev": "previous"}.get(cmd)
+                            if pctl_cmd:
+                                subprocess.run(
+                                    ["playerctl", "-p", best_p["bus_name"], pctl_cmd],
+                                    capture_output=True, timeout=0.8,
+                                )
+                        else:
+                            mpris_m = {"play_pause": "PlayPause", "next": "Next", "prev": "Previous"}.get(cmd)
+                            if mpris_m:
+                                subprocess.run(
+                                    [
+                                        "gdbus", "call", "--session",
+                                        "--dest", best_p["bus_name"],
+                                        "--object-path", "/org/mpris/MediaPlayer2",
+                                        "--method", f"org.mpris.MediaPlayer2.Player.{mpris_m}",
+                                    ],
+                                    capture_output=True, timeout=0.8,
+                                )
+                    except Exception:
+                        pass
+
+                track_key = f"{src_kind}|{title}|{artist}|{album}"
+                cyd_bytes, prev_b64, cid = b"", "", ""
+                if track_key in self._processed_cover_cache:
+                    cyd_bytes, prev_b64, cid = self._processed_cover_cache[track_key]
+                else:
+                    raw_thumb = self._load_linux_art_url(best_p.get("art_url", ""), title, artist)
+                    if raw_thumb:
+                        try:
+                            cyd_bytes, prev_b64, cid = prepare_media_cover_for_cyd(raw_thumb)
+                            if len(self._processed_cover_cache) > 24:
+                                self._processed_cover_cache.clear()
+                            self._processed_cover_cache[track_key] = (cyd_bytes, prev_b64, cid)
+                        except Exception:
+                            pass
+
+                with self._lock:
+                    self._state.update({
+                        "source": src_kind,
+                        "app_id": best_p["app_id"],
+                        "playing": best_p["playing"],
+                        "title": title,
+                        "artist": artist,
+                        "album": album,
+                        "pos": best_p["pos"],
+                        "dur": best_p["dur"],
+                        "track_key": track_key,
+                        "cover_id": cid,
+                        "cover_b64": prev_b64,
+                        "cover_cyd_bytes": cyd_bytes,
+                        "updated_at": time.time(),
+                    })
+            except Exception:
+                pass
+            time.sleep(0.95)
 
 
 # ========================================== CLIMA REGIONAL & TEMPESTADES =====
@@ -3598,7 +4120,7 @@ class CyberDeckTerminalEngine:
                 elif verb == "neofetch":
                     user = getpass.getuser()
                     host = socket.gethostname()
-                    os_str = f"{platform.system()} {platform.release()}"
+                    os_str = get_linux_distro_name() if IS_LINUX else f"{platform.system()} {platform.release()}"
                     # Uptime
                     boot_t = psutil.boot_time()
                     up_s = int(time.time() - boot_t)
@@ -3607,7 +4129,7 @@ class CyberDeckTerminalEngine:
                     up_m, _ = divmod(rem, 60)
                     up_str = f"{up_d}d {up_h}h {up_m}m" if up_d > 0 else f"{up_h}h {up_m}m"
                     # CPU
-                    cpu_name = platform.processor() or "CPU"
+                    cpu_name = get_linux_cpu_name() if IS_LINUX else (platform.processor() or "CPU")
                     if IS_WINDOWS:
                         try:
                             import winreg
@@ -3627,6 +4149,8 @@ class CyberDeckTerminalEngine:
                     gpu_short = "N/A"
                     if self.collector and getattr(self.collector, "last_gpu_name", None):
                         gpu_short = self.collector.last_gpu_name[:22]
+                    elif IS_LINUX:
+                        gpu_short = (get_linux_gpu_model_name() or "GPU Linux")[:22]
                     elif IS_WINDOWS:
                         try:
                             w_res = subprocess.run(
@@ -4174,6 +4698,7 @@ def launch_flet_gui(
                 minimize_window()
 
         ico_file, png_file = get_app_icon_paths()
+        win_icon_path = (png_file if IS_LINUX and png_file else ico_file) or png_file or ico_file
         try:
             if hasattr(page, "window") and page.window is not None:
                 page.window.width = 1140
@@ -4182,11 +4707,11 @@ def launch_flet_gui(
                 page.window.min_height = 660
                 page.window.prevent_close = True
                 page.window.on_event = on_window_event
-                if ico_file and os.path.exists(ico_file):
-                    page.window.icon = ico_file
-            if ico_file and os.path.exists(ico_file) and hasattr(page, "window_icon"):
+                if win_icon_path and os.path.exists(win_icon_path):
+                    page.window.icon = win_icon_path
+            if win_icon_path and os.path.exists(win_icon_path) and hasattr(page, "window_icon"):
                 try:
-                    page.window_icon = ico_file
+                    page.window_icon = win_icon_path
                 except Exception:
                     pass
         except Exception:
@@ -4223,7 +4748,14 @@ def launch_flet_gui(
                 "CYD Cyber Deck v4.0 (Ativo em Segundo Plano)",
                 menu=tray_menu,
             )
-            threading.Thread(target=tray_icon.run, daemon=True).start()
+
+            def _run_tray_safe():
+                try:
+                    tray_icon.run()
+                except Exception:
+                    pass
+
+            threading.Thread(target=_run_tray_safe, daemon=True).start()
         except Exception:
             tray_icon = None
 
@@ -5173,18 +5705,48 @@ def launch_flet_gui(
         def on_click_upload(_e):
             def pick_native_file():
                 try:
-                    import tkinter as tk
-                    from tkinter import filedialog
-                    r = tk.Tk()
-                    r.withdraw()
-                    r.attributes("-topmost", True)
                     init_dir = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "imagens-referencia")
-                    p = filedialog.askopenfilename(
-                        initialdir=init_dir if os.path.isdir(init_dir) else None,
-                        title="Selecione uma imagem para o Cartão SD da CYD (JPG, PNG, BMP, GIF)",
-                        filetypes=[("Imagens", "*.jpg *.jpeg *.png *.bmp *.gif")],
-                    )
-                    r.destroy()
+                    p = ""
+                    # No Linux (Zorin OS / GNOME / KDE), prioriza diálogo GTK/Qt nativo (zenity / kdialog)
+                    if IS_LINUX:
+                        if shutil.which("zenity"):
+                            cmd = [
+                                "zenity", "--file-selection",
+                                "--title=Selecione uma imagem para o Cartão SD da CYD (JPG, PNG, BMP, GIF)",
+                                "--file-filter=Imagens (JPG, PNG, BMP, GIF) | *.jpg *.jpeg *.png *.bmp *.gif *.JPG *.JPEG *.PNG *.BMP *.GIF",
+                            ]
+                            if os.path.isdir(init_dir):
+                                cmd.append(f"--filename={init_dir}/")
+                            res = subprocess.run(cmd, capture_output=True, text=True)
+                            if res.returncode == 0 and res.stdout.strip():
+                                p = res.stdout.strip()
+                            else:
+                                return
+                        elif shutil.which("kdialog"):
+                            res = subprocess.run(
+                                [
+                                    "kdialog", "--getopenfilename",
+                                    init_dir if os.path.isdir(init_dir) else os.path.expanduser("~"),
+                                    "*.jpg *.jpeg *.png *.bmp *.gif|Imagens (JPG, PNG, BMP, GIF)",
+                                ],
+                                capture_output=True, text=True,
+                            )
+                            if res.returncode == 0 and res.stdout.strip():
+                                p = res.stdout.strip()
+                            else:
+                                return
+                    if not p:
+                        import tkinter as tk
+                        from tkinter import filedialog
+                        r = tk.Tk()
+                        r.withdraw()
+                        r.attributes("-topmost", True)
+                        p = filedialog.askopenfilename(
+                            initialdir=init_dir if os.path.isdir(init_dir) else None,
+                            title="Selecione uma imagem para o Cartão SD da CYD (JPG, PNG, BMP, GIF)",
+                            filetypes=[("Imagens", "*.jpg *.jpeg *.png *.bmp *.gif")],
+                        )
+                        r.destroy()
                     if p:
                         start_file_transfer(p)
                 except Exception as ex:
@@ -6256,7 +6818,7 @@ def launch_flet_gui(
             overflow=ft.TextOverflow.ELLIPSIS,
         )
         lbl_media_album = ft.Text(
-            "Integração Windows GSMTC (winrt) ativa",
+            "Integração Linux MPRIS2 / D-Bus ativa" if IS_LINUX else "Integração Windows GSMTC (winrt) ativa",
             size=11,
             color="#64748B",
             max_lines=1,
@@ -7373,11 +7935,8 @@ def launch_flet_gui(
         )
 
         def on_copy_logs(_e):
-            try:
-                if IS_WINDOWS and txt_console.value:
-                    subprocess.run(["clip"], input=txt_console.value.encode("utf-16le"), check=False)
-            except Exception:
-                pass
+            if txt_console.value:
+                copy_text_to_clipboard(txt_console.value, page)
 
         def on_clear_logs(_e):
             log_lines.clear()
@@ -7720,8 +8279,7 @@ def launch_flet_gui(
 
         def on_copy_url(_e):
             try:
-                if IS_WINDOWS:
-                    subprocess.run(["clip"], input=mobile_url.encode("utf-16le"), check=False)
+                copy_text_to_clipboard(mobile_url, page)
                 append_log(f"Link copiado: {mobile_url}")
             except Exception:
                 pass

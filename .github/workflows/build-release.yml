@@ -1,4 +1,4 @@
-name: CI/CD — Build Agent & Firmware Release
+name: CI/CD — Build Agent (Windows & Linux) & Firmware Release
 
 on:
   push:
@@ -59,7 +59,51 @@ jobs:
           if-no-files-found: error
 
   # ---------------------------------------------------------------------------
-  # Job 2: Build Firmware ESP32 CYD (PlatformIO)
+  # Job 2: Build Executável Ubuntu / Linux do Agente (PyInstaller)
+  # ---------------------------------------------------------------------------
+  build-agent-linux:
+    name: Build Linux Agent (Ubuntu x64)
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+          cache: 'pip'
+          cache-dependency-path: 'agent/requirements.txt'
+
+      - name: Install Linux System Libraries
+        run: |
+          sudo apt-get update -y
+          sudo apt-get install -y python3-tk libglib2.0-0
+          sudo apt-get install -y libgtk-3-0t64 || sudo apt-get install -y libgtk-3-0 || true
+
+      - name: Install Python Dependencies
+        run: |
+          python -m pip install --upgrade pip wheel pyinstaller
+          pip install -r agent/requirements.txt
+
+      - name: Build Linux Executable with PyInstaller
+        run: |
+          pyinstaller --noconfirm --clean --distpath dist --workpath build/linux linux/CYD-Hardware-Monitor-Linux.spec
+          chmod +x dist/CYD-Hardware-Monitor-Linux
+          ls -lh dist/CYD-Hardware-Monitor-Linux
+
+      - name: Upload Linux Agent Artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: CYD-Hardware-Monitor-Linux-x64
+          path: dist/CYD-Hardware-Monitor-Linux
+          if-no-files-found: error
+
+  # ---------------------------------------------------------------------------
+  # Job 3: Build Firmware ESP32 CYD (PlatformIO)
   # ---------------------------------------------------------------------------
   build-firmware:
     name: Build ESP32 CYD Firmware (.bin)
@@ -95,11 +139,11 @@ jobs:
           if-no-files-found: error
 
   # ---------------------------------------------------------------------------
-  # Job 3: Publicar Release no GitHub (Apenas em tags v*)
+  # Job 4: Publicar Release no GitHub (Apenas em tags v*)
   # ---------------------------------------------------------------------------
   release:
     name: Publish GitHub Release
-    needs: [build-agent, build-firmware]
+    needs: [build-agent, build-agent-linux, build-firmware]
     if: startsWith(github.ref, 'refs/tags/v')
     runs-on: ubuntu-latest
     permissions:
@@ -109,10 +153,16 @@ jobs:
       - name: Checkout Repository
         uses: actions/checkout@v4
 
-      - name: Download Agent Artifact
+      - name: Download Windows Agent Artifact
         uses: actions/download-artifact@v4
         with:
           name: CYD-Hardware-Monitor-Windows-x64
+          path: release-assets
+
+      - name: Download Linux Agent Artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: CYD-Hardware-Monitor-Linux-x64
           path: release-assets
 
       - name: Download Firmware Artifact
@@ -126,8 +176,9 @@ jobs:
         with:
           files: |
             release-assets/CYD-Hardware-Monitor.exe
+            release-assets/CYD-Hardware-Monitor-Linux
             release-assets/cyd_firmware.bin
-          name: Release ${{ github.ref_name }} — CYD Hardware, Clima Regional, Gemini Gems & Market Monitor
+          name: Release ${{ github.ref_name }} — CYD Cyber Deck (Windows, Zorin OS / Linux & ESP32 Firmware)
           generate_release_notes: true
           draft: false
           prerelease: false

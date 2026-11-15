@@ -23,7 +23,7 @@ mdurl==0.1.2
 msgpack==1.2.3
 oauthlib==4.0.0
 packaging==26.3
-pefile==2024.8.26
+pefile==2024.8.26 ; sys_platform == 'win32'
 pillow==13.0.0
 psutil==7.2.2
 Pygments==2.21.0
@@ -33,8 +33,8 @@ pyserial==3.5
 pystray==0.19.5
 python-dateutil==2.9.0.post0
 python-slugify==9.1.3
-pywin32==312
-pywin32-ctypes==0.2.3
+pywin32==312 ; sys_platform == 'win32'
+pywin32-ctypes==0.2.3 ; sys_platform == 'win32'
 PyYAML==6.0.3
 qrcode==8.2
 repath==0.9.0
@@ -47,10 +47,10 @@ typing_extensions==4.16.0
 tzdata==2026.5
 urllib3==2.8.0
 watchdog==6.0.0
-winrt-runtime==4.0.3
 paramiko>=3.4.0
-winrt-Windows.Foundation==4!10.0.28000.2705
-winrt-Windows.Foundation.Collections==4!10.0.28000.2705
-winrt-Windows.Media.Control==4!10.0.28000.2705
-winrt-Windows.Storage.Streams==4!10.0.28000.2705
-WMI==1.5.1
+winrt-runtime==4.0.3 ; sys_platform == 'win32'
+winrt-Windows.Foundation==4!10.0.28000.2705 ; sys_platform == 'win32'
+winrt-Windows.Foundation.Collections==4!10.0.28000.2705 ; sys_platform == 'win32'
+winrt-Windows.Media.Control==4!10.0.28000.2705 ; sys_platform == 'win32'
+winrt-Windows.Storage.Streams==4!10.0.28000.2705 ; sys_platform == 'win32'
+WMI==1.5.1 ; sys_platform == 'win32'

@@ -1,6 +1,7 @@
-# ⚡ CYD Cyber Deck: Hardware, Clima Regional, News Feed, Terminal Administrativo & Financial Market Monitor (v4.2)
+# ⚡ CYD Cyber Deck: Hardware, Clima Regional, News Feed, Terminal Administrativo & Financial Market Monitor (v4.3 — Windows & Ubuntu / Linux)
 
-![Versão](https://img.shields.io/badge/vers%C3%A3o-4.2.0-00FF00?style=for-the-badge)
+![Versão](https://img.shields.io/badge/vers%C3%A3o-4.3.0-00FF00?style=for-the-badge)
+![OS](https://img.shields.io/badge/OS-Ubuntu%20%7C%20Linux%20%7C%20Windows-E95420?style=for-the-badge&logo=ubuntu)
 ![Plataforma](https://img.shields.io/badge/ESP32-2432S028R%20(CYD)-blue?style=for-the-badge&logo=espressif)
 ![Interface PC](https://img.shields.io/badge/GUI%20PC-Flet%20%2F%20Flutter-02569B?style=for-the-badge&logo=flutter)
 ![CI/CD](https://img.shields.io/badge/CI%2FCD-GitHub%20Actions-2088FF?style=for-the-badge&logo=githubactions)
@@ -232,12 +233,24 @@ minimal-monitor/
 │   └── dist/
 │       └── CYD-Hardware-Monitor.exe # Executável standalone Windows pronto para uso (v4.0)
 │
+│
+├── linux/                           # 🐧 Suíte Nativa para Ubuntu / Debian / Linux
+│   ├── install_ubuntu.sh            # Instalador 1-comando (apt, udev, fix brltty, .venv e ícone no Menu do Ubuntu)
+│   ├── run_linux.sh                 # Launcher nativo Linux (GUI ou --headless)
+│   ├── build_linux.sh               # Empacotador PyInstaller para gerar binário Linux standalone
+│   ├── flash_firmware_linux.sh      # Script de compilação e gravação do firmware ESP32 no Linux
+│   ├── CYD-Hardware-Monitor-Linux.spec # Especificação PyInstaller para Linux x86_64
+│   ├── 99-cyd-cyber-deck.rules      # Regras udev (/dev/mike) para CH340/CP2102/CH9102/FT232 sem sudo
+│   ├── cyd-cyber-deck.desktop       # Atalho de aplicativo nativo Ubuntu / GNOME
+│   ├── cyd-cyber-deck.service       # Serviço systemd de usuário para inicialização automática
+│   └── README_LINUX.md              # Guia completo de instalação e arquitetura no Ubuntu / Linux
+│
 ├── mobile/                          # Projeto Flutter nativo para Android e iOS
 │   ├── README.md                    # Instruções de compilação do APK nativo
 │   ├── pubspec.yaml                 # Dependências do app Flutter
 │   └── lib/                         # Código Dart (telas, modelos e serviços SSE)
 │
-├── preview/                         # Capturas de tela reais do Painel Desktop v4.0 e da placa CYD
+├── preview/                         # Capturas de tela reais do Painel Desktop e da placa CYD
 ├── imgs/                            # Ícone oficial da aplicação (imgsCYD.ico)
 ├── platformio.ini                   # Manifesto de compilação PlatformIO para ESP32 (CYD)
 └── README.md                        # Documentação completa do projeto
@@ -245,7 +258,30 @@ minimal-monitor/
 
 ---
 
-## 🚀 Como Usar e Instalar
+## 🐧 Como Instalar e Rodar no Ubuntu / Linux (Nativo)
+
+O projeto possui suporte **100% nativo ao Ubuntu (22.04 LTS / 24.04 LTS+) e Debian** dentro da pasta [`linux/`](linux/), com integração **MPRIS2 / D-Bus** (Spotify & YouTube Music com capa no SD), detecção de inatividade **GNOME Mutter (Wayland & X11)**, telemetria de GPU (`amdgpu`, `nvidia-smi`, `i915`/`xe`), correção automática do conflito `brltty` com o chip CH340 e atalho na Grade de Aplicativos do Ubuntu:
+
+```bash
+# 1. Instale tudo automaticamente no Ubuntu (pacotes APT, regras udev, .venv e atalho no Menu):
+chmod +x linux/*.sh
+./linux/install_ubuntu.sh
+
+# 2. Inicie o Painel Desktop Flet no Ubuntu (ou abra pelo Menu de Aplicativos "CYD Cyber Deck"):
+./linux/run_linux.sh
+
+# 3. (Opcional) Gere o binário executável único para Linux (dist/CYD-Hardware-Monitor-Linux):
+./linux/build_linux.sh
+
+# 4. (Opcional) Compile e grave o firmware na placa CYD direto pelo Ubuntu:
+./linux/flash_firmware_linux.sh
+```
+
+> 📖 Consulte o guia detalhado em [`linux/README_LINUX.md`](linux/README_LINUX.md).
+
+---
+
+## 🚀 Como Usar e Instalar no Windows
 
 ### Opção A: Executável Pronto para Windows (Sem instalar Python)
 Basta executar o binário compilado:
