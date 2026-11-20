@@ -3992,52 +3992,53 @@ GeminiGemsEngine = NewsFeedCollector
 # ========================================== MÓDULO 2: O TERMINAL CYD (CYBER DECK) =
 class CyberDeckTerminalEngine:
     """
-    Motor do Terminal Administrativo Cyber Deck (`SCR_TERMINAL` - Tela 11):
-      - Processa comandos locais no Python (Linux-like) e envia o output enxuto linha a linha para a tela da CYD:
-        * `whoami`        : Usuario logado e nome do host (ex: matheus@z1popc).
-        * `neofetch`      : Resumo grafico em arte ASCII compacta do hardware do PC (OS, CPU, RAM, GPU).
-        * `df` / `df -h`  : Particoes de disco, tamanho, usado e livre via psutil.
-        * `free` / `free -m`: Memoria RAM e Swap usada/livre em MB.
-        * `uptime`        : Tempo de atividade continua do sistema.
-        * `ip addr` / `ip`: Interfaces de rede ativas (LAN, Wi-Fi, Tailscale) e IPv4.
-        * `netstat -tuln` : Portas locais abertas em estado LISTEN e processos.
-        * `ssh u@h [cmd]` : Executa comandos rapidos em servidores Linux remotos (Homelab/VPS).
-        * `docker ps`     : Lista containers Docker ativos no PC.
-        * `docker stats`  : Consumo instantaneo de CPU/RAM por container.
-        * `docker logs`   : Exibe as ultimas linhas de log de um container.
-        * `ping [alvo]`   : Dispara pings ICMP e transmite latencia linha a linha.
-        * `fetch [url]`   : Executa HTTP GET e mede status e tempo de resposta.
-      - Delega comandos nativos para o firmware ESP32 executar:
-        * `wifi scan`     : Envia {"cmd": "wifi_scan"} para escanear redes Wi-Fi 2.4GHz.
-        * `esp info`      : Envia {"cmd": "esp_info"} para imprimir IP, RSSI, MAC e firmware.
-        * `esp mem`       : Envia {"cmd": "esp_mem"} para imprimir Heap livre, Min e PSRAM.
-        * `esp reboot`    : Envia {"cmd": "esp_reboot"} para reiniciar a placa CYD.
-        * `cmatrix`       : Envia {"cmd": "cmatrix"} para ativar o easter egg Matrix Rain.
-        * `clear`         : Envia {"cmd": "term_clear"} para limpar o terminal.
+    Motor do Terminal Administrativo Cyber Deck v4.6 (`SCR_TERMINAL` - Tela 11):
+      - Display da CYD: 14 linhas x 48 colunas monospace ASCII (`TERM_COLS = 48`).
+      - 100% defensivo/passivo: telemetria RF passiva da ESP32-WROOM-32U, espectro 2.4 GHz,
+        auditoria passiva, OUI offline e diagnosticos de rede/gateway/DNS/TLS/MTU/jitter.
     """
 
-    def __init__(self, max_history: int = 150, collector=None):
+    TERM_COLS = 48
+    TERM_ROWS = 14
+
+    def __init__(self, max_history: int = 150, collector=None, wifi_scan_col=None, net_col=None):
         self._lock = threading.Lock()
         self.max_history = max_history
         self.collector = collector
+        self.wifi_scan_col = wifi_scan_col
+        self.net_col = net_col
         self._lines: list[str] = [
             "================================================",
-            " CYD CYBER DECK TERMINAL v4.2 [115200 bps READY]",
-            " Digite 'help' para listar todos os comandos.",
+            " CYD CYBER DECK TERMINAL v4.6 [115200 bps READY]",
+            " Digite 'help' (ou help rf / net / sys / esp)",
             "================================================",
         ]
         self._cmd_history: list[str] = []
         self._busy = False
         self._last_cmd = "ready"
+        self._total_seq = len(self._lines)
+
+    @staticmethod
+    def _rssi_ascii_bar(rssi: int) -> str:
+        if rssi >= -55:
+            return "####"
+        if rssi >= -67:
+            return "###."
+        if rssi >= -78:
+            return "##.."
+        if rssi >= -88:
+            return "#..."
+        return "...."
 
     def append_line(self, text: str):
         if not text:
             return
         with self._lock:
             for raw_ln in str(text).splitlines():
-                ln = raw_ln.rstrip()
+                ln = to_ascii_safe(raw_ln.rstrip())[: self.TERM_COLS]
                 if ln:
                     self._lines.append(ln)
+                    self._total_seq += 1
             if len(self._lines) > self.max_history:
                 self._lines = self._lines[-self.max_history :]
 
@@ -4049,23 +4050,33 @@ class CyberDeckTerminalEngine:
                 "busy": self._busy,
                 "last_cmd": self._last_cmd,
                 "history": list(self._cmd_history),
+                "seq": self._total_seq,
             }
 
     def clear(self, dispatch_fn=None):
         with self._lock:
             self._lines = [
-                "CYD CYBER DECK OS v4.2 - Terminal limpo.",
-                "Digite 'help' ou utilize os atalhos rapidos abaixo.",
+                "CYD CYBER DECK OS v4.6 - Terminal limpo.",
+                "Digite 'help' (help rf | net | sys | esp).",
             ]
             self._last_cmd = "clear"
+            self._total_seq += 2
         if dispatch_fn:
             dispatch_fn({"cmd": "term_clear"})
 
-    def execute_command(self, raw_cmd: str, dispatch_fn, log_fn=None, auto_switch_screen: bool = True):
-        """Interpreta e executa um comando em background sem travar a interface Flet nem a Serial."""
+    def execute_command(
+        self,
+        raw_cmd: str,
+        dispatch_fn,
+        log_fn=None,
+        auto_switch_screen: bool = True,
+        wait: bool = False,
+        timeout_s: float = 10.0,
+    ) -> list[str]:
+        """Interpreta e executa um comando em background (ou aguarda ate timeout_s se wait=True)."""
         cmd_str = (raw_cmd or "").strip()
         if not cmd_str:
-            return
+            return []
 
         with self._lock:
             if not self._cmd_history or self._cmd_history[-1] != cmd_str:
@@ -4074,12 +4085,25 @@ class CyberDeckTerminalEngine:
                     self._cmd_history = self._cmd_history[-60:]
             self._last_cmd = cmd_str
 
+        captured_lines: list[str] = []
+        done_ev = threading.Event()
+
+        def _record_and_append(line_s: str) -> str:
+            c_ln = to_ascii_safe(line_s)[: self.TERM_COLS]
+            if c_ln:
+                captured_lines.append(c_ln)
+                self.append_line(c_ln)
+            return c_ln
+
         def _send_cyd_lines(lines_list: list[str], switch_scr: bool = False):
-            clean_batch = [to_ascii_safe(x)[:96] for x in lines_list if x and str(x).strip()]
+            clean_batch = []
+            for x in lines_list:
+                if x is not None and str(x).strip():
+                    c_ln = _record_and_append(str(x))
+                    if c_ln:
+                        clean_batch.append(c_ln)
             if not clean_batch:
                 return
-            for c_ln in clean_batch:
-                self.append_line(c_ln)
             # Divide em pacotes enxutos de ate 4 linhas para nao saturar a Serial a 115200 bps
             for i in range(0, len(clean_batch), 4):
                 chunk = clean_batch[i : i + 4]
@@ -4093,63 +4117,64 @@ class CyberDeckTerminalEngine:
                 if dispatch_fn:
                     dispatch_fn(pkt)
                 if i + 4 < len(clean_batch):
-                    time.sleep(0.06)
+                    time.sleep(0.04)
 
         parts = cmd_str.split()
         verb = parts[0].lower()
         arg_rest = cmd_str[len(parts[0]) :].strip()
+        low_full = cmd_str.lower().strip()
 
         # 1) Comando Limpar Terminal
         if verb in ("clear", "cls", "reset"):
             self.clear(dispatch_fn)
-            return
+            return list(self._lines)
 
-        # 2) Comandos Nativos Delegados ao ESP32
-        # a) Wi-Fi Scan
-        if verb == "wifi" or cmd_str.lower().startswith("wifi scan") or cmd_str.lower() == "wifiscan":
-            self.append_line(f"$ {cmd_str}")
-            self.append_line("[PC->ESP32] Delegando 'wifi_scan' para execucao nativa na placa CYD...")
+        # 2) Comandos Nativos Delegados ao ESP32 (placa CYD)
+        # a) Wi-Fi Scan local na CYD
+        if verb == "wifi" or low_full.startswith("wifi scan") or low_full == "wifiscan":
+            _record_and_append(f"$ {cmd_str}")
+            _record_and_append("[WIFI] Scan 2.4GHz delegado ao radio da CYD...")
             if dispatch_fn:
                 dispatch_fn({"cmd": "wifi_scan"})
             if log_fn:
                 log_fn("💻 Terminal CYD: Trigger {'cmd': 'wifi_scan'} enviado ao ESP32!")
-            return
+            return captured_lines
 
         # b) Easter egg: Matrix Rain (cmatrix)
         if verb in ("cmatrix", "matrix"):
-            self.append_line(f"$ {cmd_str}")
-            self.append_line("[PC->ESP32] Ativando Easter Egg Matrix Rain na SCR_TERMINAL...")
+            _record_and_append(f"$ {cmd_str}")
+            _record_and_append("[OK] Ativando Matrix Rain na SCR_TERMINAL...")
             if dispatch_fn:
                 dispatch_fn({"cmd": "cmatrix"})
             if log_fn:
                 log_fn("🟢 Terminal CYD: Easter egg Matrix Rain iniciado no ESP32!")
-            return
+            return captured_lines
 
         # c) ESP32 Memoria Heap (esp mem)
-        if cmd_str.lower() in ("esp mem", "espmem"):
-            self.append_line(f"$ {cmd_str}")
-            self.append_line("[PC->ESP32] Requisitando diagnostico de Heap RAM para a placa CYD...")
+        if low_full in ("esp mem", "espmem"):
+            _record_and_append(f"$ {cmd_str}")
+            _record_and_append("[OK] Requisitando Heap RAM da placa CYD...")
             if dispatch_fn:
                 dispatch_fn({"cmd": "esp_mem"})
-            return
+            return captured_lines
 
         # d) ESP32 Reboot (esp reboot)
-        if cmd_str.lower() in ("esp reboot", "espreboot") or (verb == "reboot" and ("esp" in cmd_str.lower() or len(parts) == 1)):
-            self.append_line(f"$ {cmd_str}")
-            self.append_line("[PC->ESP32] Enviando sinal de REBOOT remoto para o hardware ESP32...")
+        if low_full in ("esp reboot", "espreboot") or (verb == "reboot" and ("esp" in low_full or len(parts) == 1)):
+            _record_and_append(f"$ {cmd_str}")
+            _record_and_append("[WARN] Enviando REBOOT remoto para a CYD...")
             if dispatch_fn:
                 dispatch_fn({"cmd": "esp_reboot"})
             if log_fn:
                 log_fn("⚠️ Terminal CYD: Reboot remoto enviado a placa CYD!")
-            return
+            return captured_lines
 
         # e) ESP32 Info (esp info / esp_info)
-        if cmd_str.lower() in ("esp info", "esp_info", "espinfo", "esp"):
-            self.append_line(f"$ {cmd_str}")
-            self.append_line("[PC->ESP32] Consultando telemetria de hardware interna do ESP32...")
+        if low_full in ("esp info", "esp_info", "espinfo", "esp"):
+            _record_and_append(f"$ {cmd_str}")
+            _record_and_append("[OK] Consultando telemetria interna da CYD...")
             if dispatch_fn:
                 dispatch_fn({"cmd": "esp_info"})
-            return
+            return captured_lines
 
         # 3) Comandos Processados no Agente Python em Thread Assincrona
         def _runner():
@@ -4158,33 +4183,411 @@ class CyberDeckTerminalEngine:
             try:
                 _send_cyd_lines([f"$ {cmd_str}"], switch_scr=auto_switch_screen)
 
-                # ================================== HELP ==================================
+                # ================================== HELP (CATEGORIZADO <= 14x48) ==========
                 if verb in ("help", "?", "man"):
+                    cat = (parts[1].lower() if len(parts) > 1 else "").strip()
+                    if cat in ("rf", "wifi", "radar", "32u"):
+                        _send_cyd_lines([
+                            "=== [HELP RF] ESP32-WROOM-32U & ESPECTRO ===",
+                            "rf status       : Status 32U, IP, APs e canais",
+                            "rf scan         : Varredura 2.4GHz + OUI vendor",
+                            "rf spectrum     : Ocupacao CH 1..13 + melhor CH",
+                            "rf track <alvo> : Sinal min/med/max, dB e dist",
+                            "rf audit        : Auditoria passiva (OPEN/Mesh)",
+                            "rf diff         : Redes novas (+), ausentes (-)",
+                            "rf export [fmt] : Salva JSON/CSV em reports/",
+                            "oui <mac>       : Fabricante OUI do MAC/BSSID",
+                            "wifi scan       : Scan local no radio da CYD",
+                        ])
+                    elif cat in ("net", "rede", "router", "wan"):
+                        _send_cyd_lines([
+                            "=== [HELP NET] DIAGNOSTICO DE REDE & FIBRA ===",
+                            "netcheck / diag : Bateria GW+WAN+DNS+LAN+32U",
+                            "router / gw     : Gateway, ping, HTTP e MAC",
+                            "jitter [alvo]   : Estabilidade ICMP (10 pkts)",
+                            "mtu [alvo]      : Descoberta Path MTU (DF)",
+                            "tls <dominio>   : Inspecao cert TLS/SSL :443",
+                            "route           : Tabela de rotas IPv4 kernel",
+                            "lan / arp       : Vizinhos ativos na rede local",
+                            "dns <dom>       : Tempo de resolucao DNS",
+                            "ping / trace    : Latencia ICMP e rota (8 hops)",
+                            "fetch / speed   : HTTP GET e Speedtest Fibra",
+                        ])
+                    elif cat in ("sys", "pc", "system", "docker"):
+                        _send_cyd_lines([
+                            "=== [HELP SYS] SISTEMA PC, HOMELAB & DOCKER ===",
+                            "whoami          : Usuario, host, OS e IP LAN",
+                            "neofetch        : Resumo ASCII CPU/RAM/GPU/OS",
+                            "df -h           : Uso de particoes de disco",
+                            "free -m         : Memoria RAM e Swap (MB)",
+                            "uptime          : Tempo ligado e carga atual",
+                            "top             : Top 5 processos por uso RAM",
+                            "ip addr         : Interfaces de rede e IPv4",
+                            "netstat -tuln   : Portas locais em LISTEN",
+                            "docker ps|stats : Containers ativos e recursos",
+                            "ssh u@host <c>  : Executa comando SSH remoto",
+                            "history         : Ultimos 10 comandos rodados",
+                        ])
+                    elif cat in ("esp", "cyd", "hw"):
+                        _send_cyd_lines([
+                            "=== [HELP ESP] HARDWARE NATIVO PLACA CYD ===",
+                            "esp info        : IP, RSSI, MAC e clock da CYD",
+                            "esp mem         : Heap livre, min e PSRAM",
+                            "esp reboot      : Reinicia a placa CYD",
+                            "wifi scan       : Scan 2.4GHz no radio da CYD",
+                            "cmatrix         : Chuva Matrix Rain na Tela 11",
+                            "clear           : Limpa buffer do terminal",
+                        ])
+                    else:
+                        _send_cyd_lines([
+                            "=== CYD TERMINAL v4.6 (14x48 DEFENSIVO/RF) ===",
+                            "Categorias (digite para detalhar):",
+                            "  help rf  : Radar 2.4GHz, Espectro, OUI, Audit",
+                            "  help net : Diag, Jitter, MTU, TLS, Rota, LAN",
+                            "  help sys : Hardware PC, Disco, RAM, Docker",
+                            "  help esp : Comandos nativos da placa CYD",
+                            "Atalhos rapidos:",
+                            "  rf scan  | rf spectrum | rf audit | rf track",
+                            "  netcheck | jitter      | mtu      | tls <dom>",
+                            "  router   | lan         | route    | oui <mac>",
+                            "  neofetch | history     | clear",
+                        ])
+
+                # ================================== HISTORY ===============================
+                elif verb in ("history", "hist"):
+                    with self._lock:
+                        h_slice = list(self._cmd_history[-10:])
+                    lines_hist = [f"[OK] Historico ({len(h_slice)} ultimos comandos):"]
+                    for idx_h, c_item in enumerate(h_slice, 1):
+                        lines_hist.append(f" {idx_h:02d}) {c_item[:42]}")
+                    _send_cyd_lines(lines_hist)
+
+                # ================================== OUI / VENDOR ==========================
+                elif verb in ("oui", "vendor"):
+                    mac_q = arg_rest.strip()
+                    if not mac_q:
+                        _send_cyd_lines([
+                            "[WARN] Uso: oui <mac_ou_bssid>",
+                            "Ex: oui 30:DE:4B:11:22:33 ou oui 20:50:0D",
+                        ])
+                    else:
+                        vend = wifi_scanner.lookup_oui(mac_q)
+                        hex_c = re.sub(r"[^0-9A-Fa-f]", "", mac_q).upper()
+                        pref = f"{hex_c[0:2]}:{hex_c[2:4]}:{hex_c[4:6]}" if len(hex_c) >= 6 else mac_q[:8].upper()
+                        tag = "[OK]" if vend != "Desconhecido" else "[WARN]"
+                        out_o = [
+                            f"[WIFI] Consulta OUI: {mac_q[:24]}",
+                            f"{tag} Prefixo {pref} -> {vend}",
+                        ]
+                        if self.wifi_scan_col is not None:
+                            matches = self.wifi_scan_col.track_ap(pref)
+                            if matches:
+                                m0 = matches[0]
+                                out_o.append(
+                                    f"AP ativo: {m0['ssid'][:14]} C{m0['ch']:02d} {m0['cur']}dBm"
+                                )
+                        _send_cyd_lines(out_o)
+
+                # ================================== RF / SPECTRUM / AUDIT / TRACK =========
+                elif verb in ("rf", "spectrum", "channels", "track", "audit"):
+                    if verb in ("spectrum", "channels"):
+                        rf_sub = "spectrum"
+                        rf_arg = arg_rest
+                    elif verb == "track":
+                        rf_sub = "track"
+                        rf_arg = arg_rest
+                    elif verb == "audit":
+                        rf_sub = "audit"
+                        rf_arg = arg_rest
+                    else:
+                        rf_sub = parts[1].lower() if len(parts) > 1 else "status"
+                        rf_arg = " ".join(parts[2:]).strip() if len(parts) > 2 else ""
+
+                    wcol = self.wifi_scan_col
+                    if wcol is None:
+                        _send_cyd_lines(["[ERR] Coletor WiFiScanner nao inicializado."])
+                    elif rf_sub in ("status", "info", "st"):
+                        ws = wcol.get_ui_snapshot()
+                        spec = wcol.get_spectrum_analysis()
+                        st_tag = "[OK] ONLINE" if ws["online"] else "[WARN] OFFLINE"
+                        src_s = ws["scanner_ip"] or ws["port"] or "UDP:8889"
+                        best_s = f"{ws['best_rssi']}dBm" if ws["total"] > 0 else "--"
+                        avg_s = f"{ws['avg_rssi']}dBm" if ws["total"] > 0 else "--"
+                        bch_s = f"CH{spec['busiest_channel']:02d}" if spec["busiest_channel"] > 0 else "--"
+                        _send_cyd_lines([
+                            "[WIFI] ESP32-WROOM-32U RADAR RF (2.4 GHz)",
+                            f"Estado : {st_tag} ({src_s[:18]})",
+                            f"Scans  : #{ws['scan_count']} ({ws['last_scan_str']}) | APs: {ws['total']}",
+                            f"Segur. : Open: {ws['open_count']} | Novas: {ws['new_count']}",
+                            f"Sinal  : Melhor {best_s} | Media {avg_s}",
+                            f"Canais : Livre CH{spec['best_channel']:02d} | Cheio {bch_s}",
+                            f"Recom. : {spec['recommendation'][:38]}",
+                        ])
+
+                    elif rf_sub == "scan":
+                        _send_cyd_lines(["[WIFI] Solicitando scan a ESP32-WROOM-32U..."])
+                        ws = wcol.wait_for_fresh_scan(timeout_s=6.0)
+                        nets = ws.get("networks", [])
+                        if not nets:
+                            _send_cyd_lines([
+                                "[WARN] 0 APs no buffer da ESP32-WROOM-32U.",
+                                "Verifique energia/UDP :8889 da antena 32U.",
+                            ])
+                        else:
+                            out_s = [
+                                f"[WIFI] {len(nets)} APs (Livre:CH{ws['free_ch']:02d} Cheio:CH{ws['busiest_ch']:02d})",
+                                "SSID          CH  dBm BAR  ENC  VENDOR",
+                            ]
+                            for n in nets[:10]:
+                                ssid_s = str(n.get("ssid_ascii") or n.get("ssid") or "<OCULTA>")[:13]
+                                ch_i = int(n.get("ch", 0))
+                                rssi_i = int(n.get("rssi", -100))
+                                bar_s = self._rssi_ascii_bar(rssi_i)
+                                enc_s = str(n.get("enc", "WPA"))[:4]
+                                vend_s = str(n.get("vendor") or wifi_scanner.lookup_oui(n.get("bssid", "")))[:8]
+                                out_s.append(
+                                    f"{ssid_s:<13} C{ch_i:02d} {rssi_i:>4d} {bar_s} {enc_s:<4} {vend_s}"
+                                )
+                            _send_cyd_lines(out_s)
+
+                    elif rf_sub in ("spectrum", "channels", "spec", "ch"):
+                        spec = wcol.get_spectrum_analysis()
+                        chs = spec["channels"]
+                        max_c = max(max((chs[c]["count"] for c in range(1, 14)), default=1), 1)
+
+                        def _fmt_ch_cell(c_num: int) -> str:
+                            ci = chs[c_num]
+                            cnt = ci["count"]
+                            filled = min(5, int(round((cnt / float(max_c)) * 5.0))) if cnt > 0 else 0
+                            if cnt > 0 and filled == 0:
+                                filled = 1
+                            bar = "#" * filled + "." * (5 - filled)
+                            return f"C{c_num:02d}[{bar}]{cnt:>2d} I:{ci['score']:>3.1f}"
+
+                        out_sp = ["[WIFI] ESPECTRO 2.4GHz (APs & INTERFERENCIA)"]
+                        for row_i in range(1, 8):
+                            left_s = _fmt_ch_cell(row_i)
+                            right_ch = row_i + 7
+                            if right_ch <= 13:
+                                right_s = _fmt_ch_cell(right_ch)
+                                out_sp.append(f"{left_s} | {right_s}")
+                            else:
+                                out_sp.append(left_s)
+
+                        rk = spec["ranking"]
+                        rk_str = " ".join(f"{i+1}o:CH{r['ch']:02d}({r['score']:.1f})" for i, r in enumerate(rk))
+                        out_sp.append(f"Rank 1/6/11: {rk_str}")
+                        out_sp.append(f"[OK] {spec['recommendation'][:42]}")
+                        _send_cyd_lines(out_sp)
+
+                    elif rf_sub == "track":
+                        matches = wcol.track_ap(rf_arg)
+                        if not matches:
+                            _send_cyd_lines([
+                                f"[WARN] Nenhum AP encontrado p/ '{rf_arg or '*'}'",
+                                "Rode 'rf scan' primeiro ou tente outro termo.",
+                            ])
+                        else:
+                            m0 = matches[0]
+                            st_lbl = "Estavel" if m0["spread"] <= 6 else ("Moderado" if m0["spread"] <= 12 else "Oscilante")
+                            st_tag = "[OK]" if m0["spread"] <= 8 else "[WARN]"
+                            out_tr = [
+                                f"[WIFI] TRACK: {m0['ssid'][:18]} ({m0['vendor'][:10]})",
+                                f"BSSID: {m0['bssid'] or '--'} | CH{m0['ch']:02d} | {m0['enc'][:4]}",
+                                f"RSSI : Cur {m0['cur']} | Min {m0['min']} | Med {m0['avg']} | Max {m0['max']}",
+                                f"Estab: Spread {m0['spread']}dB (Jit {m0['jitter_db']}dB) {st_tag} {st_lbl}",
+                                f"Dist : ~{m0['est_dist_m']}m indoor | Visto {m0['seen_count']}x",
+                            ]
+                            for extra in matches[1:4]:
+                                out_tr.append(
+                                    f"+ {extra['ssid'][:14]:<14} C{extra['ch']:02d} {extra['cur']:>4d}dBm ~{extra['est_dist_m']}m {extra['vendor'][:7]}"
+                                )
+                            _send_cyd_lines(out_tr)
+
+                    elif rf_sub == "audit":
+                        aud = wcol.get_rf_audit()
+                        open_n = aud["open_networks"]
+                        hid_n = aud["hidden_networks"]
+                        wep_n = aud["wep_networks"]
+                        multi_n = aud["multi_bssid_ssids"]
+                        cong_c = aud["congested_channels"]
+
+                        out_au = [
+                            f"[WIFI] AUDITORIA RF PASSIVA ({aud['total_aps']} APs):",
+                        ]
+                        if open_n:
+                            names = ", ".join(x["ssid"][:12] for x in open_n[:2])
+                            out_au.append(f"[WARN] OPEN ({len(open_n)}): {names}")
+                        else:
+                            out_au.append("[OK] Redes Abertas (OPEN): 0")
+
+                        if wep_n:
+                            out_au.append(f"[WARN] Criptografia WEP fraca: {len(wep_n)} AP(s)")
+                        else:
+                            out_au.append("[OK] Redes WEP legadas: 0")
+
+                        if hid_n:
+                            chs_h = ",".join(f"C{x['ch']}" for x in hid_n[:4])
+                            out_au.append(f"[WARN] SSIDs Ocultos (<OCULTA>): {len(hid_n)} ({chs_h})")
+                        else:
+                            out_au.append("[OK] SSIDs Ocultos (<OCULTA>): 0")
+
+                        if multi_n:
+                            m_desc = ", ".join(f"{m['ssid'][:11]}({m['count']}x)" for m in multi_n[:2])
+                            out_au.append(f"[WIFI] Multi-BSSID/Mesh: {m_desc}")
+                        else:
+                            out_au.append("[OK] Multi-BSSID / Mesh: 0 duplicados")
+
+                        if cong_c:
+                            c_desc = ", ".join(f"CH{c['ch']:02d}({c['count']}APs)" for c in cong_c[:3])
+                            out_au.append(f"[WARN] Canais cheios: {c_desc}")
+                        else:
+                            out_au.append("[OK] Canais congestionados (>=3 APs): 0")
+
+                        _send_cyd_lines(out_au)
+
+                    elif rf_sub == "diff":
+                        df = wcol.get_diff_report()
+                        added = df["added"]
+                        removed = df["removed"]
+                        changes = df["rssi_changes"]
+                        out_df = [
+                            f"[WIFI] RF DIFF (Base:{df['baseline_count']} -> Atual:{df['current_count']})",
+                        ]
+                        if not added and not removed and not changes:
+                            out_df.append("[OK] Sem alteracoes de APs no espectro.")
+                        for a in added[:3]:
+                            out_df.append(f"+ {a.get('ssid','<OCULTA>')[:16]:<16} C{int(a.get('ch',0)):02d} {int(a.get('rssi',-100))}dBm")
+                        for r in removed[:3]:
+                            out_df.append(f"- {r.get('ssid','<OCULTA>')[:16]:<16} C{int(r.get('ch',0)):02d} (saiu)")
+                        for chg in changes[:4]:
+                            sign = "+" if chg["delta"] > 0 else ""
+                            out_df.append(
+                                f"~ {chg['ssid'][:14]:<14} {chg['prev_rssi']}->{chg['cur_rssi']}dBm ({sign}{chg['delta']}dB)"
+                            )
+                        _send_cyd_lines(out_df)
+
+                    elif rf_sub == "export":
+                        fmt_e = (rf_arg or "json").strip().lower()
+                        try:
+                            saved_p = wcol.export_report(fmt=fmt_e, out_dir="reports")
+                            _send_cyd_lines([
+                                f"[OK] Relatorio RF ({fmt_e.upper()}) exportado:",
+                                f"Arq: {saved_p[:42]}",
+                            ])
+                        except Exception as ex_e:
+                            _send_cyd_lines([f"[ERR] Falha ao exportar: {str(ex_e)[:32]}"])
+
+                    else:
+                        _send_cyd_lines([
+                            f"[WARN] Subcomando RF desconhecido: '{rf_sub}'",
+                            "Use: rf status|scan|spectrum|track|audit|diff",
+                        ])
+
+                # ================================== JITTER ================================
+                elif verb == "jitter":
+                    raw_t = (arg_rest or "1.1.1.1").strip()
+                    if raw_t.lower() in ("gw", "router", "gateway", "roteador"):
+                        gw_ip, _if, _lip = net_analyzer.detect_default_route()
+                        target = gw_ip or "1.1.1.1"
+                        lbl_t = f"GW {target}"
+                    else:
+                        target = re.sub(r"[^a-zA-Z0-9.\-:]", "", raw_t) or "1.1.1.1"
+                        lbl_t = target
+                    _send_cyd_lines([f"[WIFI] Medindo Jitter (10 pkts) -> {lbl_t[:20]}..."])
+                    res = net_analyzer.run_jitter_test(target, count=10)
+                    tag = "[OK]" if res["grade"] in ("EXCELENTE", "BOM") else ("[WARN]" if res["grade"] == "INSTAVEL" else "[ERR]")
                     _send_cyd_lines([
-                        "=== GUIA DE COMANDOS CYD CYBER DECK v4.2 ===",
-                        "[SISTEMA PC & HOMELAB]:",
-                        "  whoami        : Usuario e nome da maquina",
-                        "  neofetch      : Banner de hardware compacto",
-                        "  df -h         : Discos e espaco livre",
-                        "  free -m       : RAM e Swap usados/livres",
-                        "  uptime        : Tempo ligado do sistema",
-                        "[REDE & INFRAESTRUTURA]:",
-                        "  ip addr       : IPs e interfaces de rede ativas",
-                        "  netstat -tuln : Portas abertas e servicos",
-                        "  ping <alvo>   : Latencia ICMP (ex: 8.8.8.8)",
-                        "  fetch <url>   : HTTP GET status (ex: github.com)",
-                        "  ssh u@h <cmd> : Executa comando remoto SSH",
-                        "[DOCKER]:",
-                        "  docker ps     : Lista containers ativos",
-                        "  docker stats  : CPU e RAM dos containers",
-                        "  docker logs <c>: Ultimas linhas de log",
-                        "[HARDWARE ESP32]:",
-                        "  esp info      : IP, RSSI, MAC e firmware CYD",
-                        "  esp mem       : Heap e diagnostico de memoria",
-                        "  esp reboot    : Reinicia o ESP32 remotamente",
-                        "  wifi scan     : Escaneia redes Wi-Fi 2.4GHz",
-                        "  cmatrix       : Easter egg Matrix Rain",
-                        "  clear         : Limpa o terminal",
+                        f"{tag} {res['host'][:18]}: {res['recv']}/{res['sent']} pkts (Loss {res['loss_pct']}%)",
+                        f"RTT : min {res['min_ms']:.1f} | med {res['avg_ms']:.1f} | max {res['max_ms']:.1f} ms",
+                        f"Jit : {res['jitter_ms']:.1f} ms | Status: {res['grade']}",
+                    ])
+
+                # ================================== TLS / SSL =============================
+                elif verb in ("tls", "ssl"):
+                    dom = (arg_rest or "").strip()
+                    if not dom:
+                        _send_cyd_lines([
+                            "[WARN] Uso: tls <dominio[:porta]>",
+                            "Ex: tls github.com ou tls cloudflare.com",
+                        ])
+                    else:
+                        _send_cyd_lines([f"[WIFI] Inspecionando TLS {dom[:26]}..."])
+                        res = net_analyzer.inspect_tls(dom)
+                        if res.get("ok"):
+                            d_left = res.get("days_left", -1)
+                            v_tag = "[OK]" if d_left >= 15 else "[WARN]"
+                            _send_cyd_lines([
+                                f"[OK] TLS {res['host'][:18]}:{res['port']} ({res['tls_version']})",
+                                f"CN   : {res['subject_cn'][:38]}",
+                                f"Emiss: {res['issuer'][:38]}",
+                                f"Valid: {d_left} dias restantes | HS: {res['handshake_ms']:.0f}ms {v_tag}",
+                            ])
+                        else:
+                            _send_cyd_lines([f"[ERR] TLS {dom[:18]}: {res.get('error', 'Falha')[:30]}"])
+
+                # ================================== MTU ===================================
+                elif verb == "mtu":
+                    raw_t = (arg_rest or "1.1.1.1").strip()
+                    if raw_t.lower() in ("gw", "router", "gateway"):
+                        target = net_analyzer.detect_default_route()[0] or "1.1.1.1"
+                    else:
+                        target = re.sub(r"[^a-zA-Z0-9.\-:]", "", raw_t) or "1.1.1.1"
+                    _send_cyd_lines([f"[WIFI] Descobrindo Path MTU (DF) -> {target[:16]}..."])
+                    res = net_analyzer.discover_path_mtu(target)
+                    if res.get("ok"):
+                        _send_cyd_lines([
+                            f"[OK] Path MTU {res['host'][:16]}: {res['mtu']} bytes",
+                            f"Payload max DF: {res['payload']} B (+28B IP/ICMP)",
+                            f"Diag: {res['diagnosis'][:40]}",
+                        ])
+                    else:
+                        _send_cyd_lines([f"[WARN] MTU {target[:16]}: {res.get('diagnosis', 'Falha')[:32]}"])
+
+                # ================================== ROUTE =================================
+                elif verb in ("route", "routes"):
+                    r_lines = net_analyzer.get_route_table()
+                    if not r_lines:
+                        gw_ip, iface, local_ip = net_analyzer.detect_default_route()
+                        r_lines = [f"default via {gw_ip} dev {iface} src {local_ip}"]
+                    out_rt = [f"[OK] Tabela de Rotas IPv4 ({len(r_lines)} rotas):"]
+                    for r_ln in r_lines[:8]:
+                        out_rt.append(f" {r_ln[:46]}")
+                    _send_cyd_lines(out_rt)
+
+                # ================================== NETCHECK / DIAG =======================
+                elif verb in ("netcheck", "diag"):
+                    _send_cyd_lines(["[WIFI] Executando bateria completa netcheck..."])
+                    gw_ip, iface, local_ip = net_analyzer.detect_default_route()
+                    gw_p = net_analyzer.ping_stats(gw_ip, count=3) if gw_ip else {"up": False, "avg_ms": 0.0, "jitter_ms": 0.0, "loss_pct": 100}
+                    wan_p = net_analyzer.ping_stats("1.1.1.1", count=3)
+                    dns_ms = net_analyzer.measure_dns_ms("cloudflare.com")
+                    h_code, h_hint = net_analyzer.check_router_http(gw_ip) if gw_ip else (0, "")
+                    scanner_ip = ""
+                    w_line = "[WARN] ESP32-32U: Offline (UDP :8889)"
+                    if self.wifi_scan_col is not None:
+                        ws = self.wifi_scan_col.get_ui_snapshot()
+                        scanner_ip = ws.get("scanner_ip", "")
+                        if ws.get("online"):
+                            w_line = f"[OK] 32U: {ws['total']} APs | Livre CH{ws['free_ch']:02d} ({ws['best_rssi']}dBm)"
+                        elif ws.get("total", 0) > 0:
+                            w_line = f"[WARN] 32U Cache: {ws['total']} APs | Livre CH{ws['free_ch']:02d}"
+                    hosts = net_analyzer.read_lan_neighbors(gw_ip=gw_ip, scanner_ip=scanner_ip)
+
+                    gw_tag = "[OK]" if gw_p["up"] else "[ERR]"
+                    wan_tag = "[OK]" if wan_p["up"] else "[ERR]"
+                    dns_tag = "[OK]" if dns_ms >= 0 else "[ERR]"
+                    http_tag = "[OK]" if h_code > 0 else "[WARN]"
+                    overall_ok = gw_p["up"] and wan_p["up"] and dns_ms >= 0
+
+                    _send_cyd_lines([
+                        f"{gw_tag} GW {gw_ip or '--'} ({iface[:6]}) {gw_p['avg_ms']:.1f}ms J:{gw_p['jitter_ms']:.1f}ms",
+                        f"{http_tag} Web GW: HTTP {h_code} {(h_hint or 'Admin')[:18]}",
+                        f"{wan_tag} WAN 1.1.1.1: {wan_p['avg_ms']:.1f}ms J:{wan_p['jitter_ms']:.1f}ms L:{wan_p['loss_pct']}%",
+                        f"{dns_tag} DNS cloudflare.com: {dns_ms if dns_ms >= 0 else 'ERR'} ms",
+                        f"[OK] LAN ARP: {len(hosts)} hosts | PC {local_ip}",
+                        w_line,
+                        "[OK] Status Geral: REDE INTEGRA" if overall_ok else "[WARN] Status Geral: VERIFICAR LINK",
                     ])
 
                 # ================================== WHOAMI ================================
@@ -4193,8 +4596,8 @@ class CyberDeckTerminalEngine:
                     host = socket.gethostname()
                     lan = get_local_lan_ip()
                     _send_cyd_lines([
-                        f"[WHOAMI] {user}@{host}",
-                        f"OS: {platform.system()} {platform.release()} ({platform.machine()})",
+                        f"[OK] {user}@{host}",
+                        f"OS: {platform.system()} {platform.release()[:20]} ({platform.machine()})",
                         f"LAN IP: {lan} | PID: {os.getpid()}",
                     ])
 
@@ -4203,14 +4606,12 @@ class CyberDeckTerminalEngine:
                     user = getpass.getuser()
                     host = socket.gethostname()
                     os_str = get_linux_distro_name() if IS_LINUX else f"{platform.system()} {platform.release()}"
-                    # Uptime
                     boot_t = psutil.boot_time()
                     up_s = int(time.time() - boot_t)
                     up_d, rem = divmod(up_s, 86400)
                     up_h, rem = divmod(rem, 3600)
                     up_m, _ = divmod(rem, 60)
                     up_str = f"{up_d}d {up_h}h {up_m}m" if up_d > 0 else f"{up_h}h {up_m}m"
-                    # CPU
                     cpu_name = get_linux_cpu_name() if IS_LINUX else (platform.processor() or "CPU")
                     if IS_WINDOWS:
                         try:
@@ -4223,11 +4624,9 @@ class CyberDeckTerminalEngine:
                     cpu_short = re.sub(r"(?i)\s*(Processor|8-Core|16-Thread|with Radeon Graphics|Six-Core|Eight-Core).*", "", cpu_name).strip()[:24]
                     if not cpu_short:
                         cpu_short = "x86_64 CPU"
-                    # RAM
                     vm = psutil.virtual_memory()
                     ram_used_gb = vm.used / (1024 ** 3)
                     ram_tot_gb = vm.total / (1024 ** 3)
-                    # GPU
                     gpu_short = "N/A"
                     if self.collector and getattr(self.collector, "last_gpu_name", None):
                         gpu_short = self.collector.last_gpu_name[:22]
@@ -4247,18 +4646,18 @@ class CyberDeckTerminalEngine:
                             gpu_short = "GPU Integrada / Dedicada"
 
                     _send_cyd_lines([
-                        f"  /\\_/\\     {user}@{host}",
+                        f"  /\\_/\\     {user}@{host}"[:48],
                         f" ( o.o )    OS: {os_str[:22]}",
                         f"  > ^ <     Host: {host[:18]}",
                         f" CYBERDECK  Uptime: {up_str}",
-                        f" v4.2 ESP   CPU: {cpu_short}",
+                        f" v4.6 ESP   CPU: {cpu_short}",
                         f" [===>  ]   RAM: {ram_used_gb:.1f}G/{ram_tot_gb:.1f}G ({vm.percent:.0f}%)",
                         f"            GPU: {gpu_short}",
                     ])
 
                 # ================================== DF -H =================================
-                elif verb == "df" or cmd_str.lower().startswith("df"):
-                    lines_df = ["Filesystem      Size   Used  Avail  Use%"]
+                elif verb == "df" or low_full.startswith("df"):
+                    lines_df = ["Filesystem    Size   Used  Avail Use%"]
                     parts_found = 0
                     for p in psutil.disk_partitions(all=False):
                         try:
@@ -4266,8 +4665,8 @@ class CyberDeckTerminalEngine:
                             tot_g = usage.total / (1024 ** 3)
                             used_g = usage.used / (1024 ** 3)
                             free_g = usage.free / (1024 ** 3)
-                            dev = (p.device or p.mountpoint)[:13]
-                            lines_df.append(f"{dev:<15} {tot_g:>5.0f}G {used_g:>5.0f}G {free_g:>5.0f}G {usage.percent:>4.0f}%")
+                            dev = (p.device or p.mountpoint)[:12]
+                            lines_df.append(f"{dev:<12} {tot_g:>5.0f}G {used_g:>5.0f}G {free_g:>5.0f}G {usage.percent:>3.0f}%")
                             parts_found += 1
                             if parts_found >= 6:
                                 break
@@ -4278,7 +4677,7 @@ class CyberDeckTerminalEngine:
                     _send_cyd_lines(lines_df)
 
                 # ================================== FREE -M ===============================
-                elif verb == "free" or cmd_str.lower().startswith("free"):
+                elif verb == "free" or low_full.startswith("free"):
                     vm = psutil.virtual_memory()
                     sw = psutil.swap_memory()
                     vm_tot = vm.total // (1024 * 1024)
@@ -4288,9 +4687,9 @@ class CyberDeckTerminalEngine:
                     sw_used = sw.used // (1024 * 1024)
                     sw_free = sw.free // (1024 * 1024)
                     _send_cyd_lines([
-                        "          total(MB)  used(MB)  free(MB)   %use",
-                        f"Mem:     {vm_tot:>9} {vm_used:>9} {vm_free:>9}  {vm.percent:>4.1f}%",
-                        f"Swap:    {sw_tot:>9} {sw_used:>9} {sw_free:>9}  {sw.percent:>4.1f}%",
+                        "        total(M)  used(M)  free(M)  %use",
+                        f"Mem:   {vm_tot:>8} {vm_used:>8} {vm_free:>8} {vm.percent:>5.1f}%",
+                        f"Swap:  {sw_tot:>8} {sw_used:>8} {sw_free:>8} {sw.percent:>5.1f}%",
                     ])
 
                 # ================================== UPTIME ================================
@@ -4303,38 +4702,45 @@ class CyberDeckTerminalEngine:
                     dt_boot = datetime.fromtimestamp(boot_t).strftime("%Y-%m-%d %H:%M:%S")
                     d_txt = f"{up_d}d " if up_d else ""
                     _send_cyd_lines([
-                        f"[UPTIME] {d_txt}{up_h:02d}:{up_m:02d}:{up_sec:02d}",
+                        f"[OK] Uptime: {d_txt}{up_h:02d}:{up_m:02d}:{up_sec:02d}",
                         f"Boot: {dt_boot}",
                         f"Carga: CPU {psutil.cpu_percent():.0f}% | RAM {psutil.virtual_memory().percent:.0f}%",
                     ])
 
                 # ================================== IP / IFCONFIG =========================
-                elif verb in ("ip", "ifconfig", "ipconfig") or cmd_str.lower().startswith("ip addr"):
-                    lines_ip = ["[NET] Interfaces de Rede Ativas:"]
-                    try:
-                        addrs = psutil.net_if_addrs()
-                        stats = psutil.net_if_stats()
-                        for if_name, if_addrs in addrs.items():
-                            st = stats.get(if_name)
-                            if st and not st.isup:
-                                continue
-                            for a in if_addrs:
-                                if a.family == socket.AF_INET:
-                                    ip_val = a.address
-                                    if ip_val.startswith("127."):
-                                        continue
-                                    alias = if_name[:16]
-                                    lines_ip.append(f"  * {alias}: {ip_val}")
-                    except Exception as e_ip:
-                        lines_ip.append(f"  [ERR] {str(e_ip)[:30]}")
-                    if len(lines_ip) == 1:
-                        lines_ip.append(f"  * IPv4 LAN: {get_local_lan_ip()}")
-                    lines_ip.append(f"Host: {socket.gethostname()}")
-                    _send_cyd_lines(lines_ip[:8])
+                elif verb in ("ip", "ifconfig", "ipconfig") or low_full.startswith("ip addr"):
+                    if len(parts) > 1 and parts[1].lower() in ("route", "r"):
+                        r_lines = net_analyzer.get_route_table()
+                        out_rt = [f"[OK] Tabela de Rotas IPv4 ({len(r_lines)} rotas):"]
+                        for r_ln in r_lines[:8]:
+                            out_rt.append(f" {r_ln[:46]}")
+                        _send_cyd_lines(out_rt)
+                    else:
+                        lines_ip = ["[OK] Interfaces de Rede Ativas:"]
+                        try:
+                            addrs = psutil.net_if_addrs()
+                            stats = psutil.net_if_stats()
+                            for if_name, if_addrs in addrs.items():
+                                st = stats.get(if_name)
+                                if st and not st.isup:
+                                    continue
+                                for a in if_addrs:
+                                    if a.family == socket.AF_INET:
+                                        ip_val = a.address
+                                        if ip_val.startswith("127."):
+                                            continue
+                                        alias = if_name[:14]
+                                        lines_ip.append(f" * {alias:<14}: {ip_val}")
+                        except Exception as e_ip:
+                            lines_ip.append(f" [ERR] {str(e_ip)[:30]}")
+                        if len(lines_ip) == 1:
+                            lines_ip.append(f" * IPv4 LAN: {get_local_lan_ip()}")
+                        lines_ip.append(f"Host: {socket.gethostname()[:30]}")
+                        _send_cyd_lines(lines_ip[:8])
 
                 # ================================== NETSTAT ===============================
-                elif verb in ("netstat", "ports") or cmd_str.lower().startswith("netstat"):
-                    lines_ns = ["[NETSTAT] Portas Abertas em Escuta (LISTEN):"]
+                elif verb in ("netstat", "ports") or low_full.startswith("netstat"):
+                    lines_ns = ["[OK] Portas Abertas em Escuta (LISTEN):"]
                     try:
                         conns = psutil.net_connections(kind="inet")
                         seen_ports = set()
@@ -4350,13 +4756,13 @@ class CyberDeckTerminalEngine:
                                         pname = psutil.Process(c.pid).name()[:14]
                                     except Exception:
                                         pass
-                                lines_ns.append(f"  :{port:<5} | PID {c.pid or 0:<5} ({pname})")
+                                lines_ns.append(f" :{port:<5} | PID {c.pid or 0:<6} ({pname})")
                                 if len(lines_ns) >= 7:
                                     break
                     except Exception as ex:
-                        lines_ns.append(f"  [Aviso] Requer admin: {str(ex)[:28]}")
+                        lines_ns.append(f" [WARN] Requer admin: {str(ex)[:26]}")
                     if len(lines_ns) == 1:
-                        lines_ns.append("  Nenhuma porta TCP/UDP em LISTEN identificada.")
+                        lines_ns.append(" Nenhuma porta TCP/UDP LISTEN visivel.")
                     _send_cyd_lines(lines_ns)
 
                 # ================================== SSH (Homelab/VPS) =====================
@@ -4364,9 +4770,8 @@ class CyberDeckTerminalEngine:
                     ssh_args = parts[1:]
                     if not ssh_args:
                         _send_cyd_lines([
-                            "[SSH] Uso: ssh <user>@<host> [comando]",
+                            "[WARN] Uso: ssh <user>@<host> [cmd]",
                             "Ex: ssh root@192.168.1.100 df -h",
-                            "Ex: ssh user@vps docker ps",
                         ])
                     else:
                         target_spec = ssh_args[0]
@@ -4382,7 +4787,7 @@ class CyberDeckTerminalEngine:
                                 port = int(port_str)
                             except Exception:
                                 pass
-                        _send_cyd_lines([f"[SSH] {user or 'auto'}@{host}:{port} -> '{remote_cmd[:24]}'"])
+                        _send_cyd_lines([f"[SSH] {user or 'auto'}@{host[:16]}:{port} -> {remote_cmd[:14]}"])
 
                         ran_ok = False
                         if paramiko is not None:
@@ -4401,11 +4806,11 @@ class CyberDeckTerminalEngine:
                                 out_s = stdout.read().decode("utf-8", errors="ignore")
                                 err_s = stderr.read().decode("utf-8", errors="ignore")
                                 client.close()
-                                out_lines = [ln.strip() for ln in (out_s + "\n" + err_s).splitlines() if ln.strip()]
+                                out_lines = [ln.strip()[:48] for ln in (out_s + "\n" + err_s).splitlines() if ln.strip()]
                                 if out_lines:
                                     _send_cyd_lines(out_lines[:8])
                                 else:
-                                    _send_cyd_lines(["[SSH OK] Comando executado sem retorno."])
+                                    _send_cyd_lines(["[OK] SSH executado sem retorno."])
                                 ran_ok = True
                             except Exception:
                                 pass
@@ -4424,23 +4829,26 @@ class CyberDeckTerminalEngine:
                                     creationflags=creation_flags,
                                 )
                                 out_txt = (res.stdout or "") + ("\n" + res.stderr if res.stderr else "")
-                                out_lines = [ln.strip() for ln in out_txt.splitlines() if ln.strip()]
+                                out_lines = [ln.strip()[:48] for ln in out_txt.splitlines() if ln.strip()]
                                 if out_lines:
                                     _send_cyd_lines(out_lines[:8])
                                 else:
-                                    _send_cyd_lines([f"[SSH Code {res.returncode}] Concluido."])
+                                    _send_cyd_lines([f"[OK] SSH Code {res.returncode} concluido."])
                             except FileNotFoundError:
-                                _send_cyd_lines(["[SSH ERR] Cliente SSH / OpenSSH nao encontrado no PC."])
+                                _send_cyd_lines(["[ERR] Cliente OpenSSH nao encontrado."])
                             except subprocess.TimeoutExpired:
-                                _send_cyd_lines(["[SSH ERR] Timeout (9s) aguardando resposta remota."])
+                                _send_cyd_lines(["[ERR] Timeout (9s) aguardando SSH."])
                             except Exception as ex_sub:
-                                _send_cyd_lines([f"[SSH ERR] {str(ex_sub)[:36]}"])
+                                _send_cyd_lines([f"[ERR] SSH: {str(ex_sub)[:34]}"])
 
                 # ================================== PING ==================================
                 elif verb == "ping":
                     target = arg_rest or "8.8.8.8"
-                    target = re.sub(r"[^a-zA-Z0-9.\-:]", "", target) or "8.8.8.8"
-                    _send_cyd_lines([f"[PING] Disparando 4 pacotes para {target}..."])
+                    if target.lower() in ("gw", "router", "gateway"):
+                        target = net_analyzer.detect_default_route()[0] or "8.8.8.8"
+                    else:
+                        target = re.sub(r"[^a-zA-Z0-9.\-:]", "", target) or "8.8.8.8"
+                    _send_cyd_lines([f"[PING] 4 pacotes ICMP -> {target[:22]}..."])
                     ping_cmd = ["ping", "-n", "4", "-w", "2000", target] if IS_WINDOWS else ["ping", "-c", "4", "-W", "2", target]
                     creation_flags = getattr(subprocess, "CREATE_NO_WINDOW", 0) if IS_WINDOWS else 0
                     proc = subprocess.Popen(
@@ -4465,64 +4873,64 @@ class CyberDeckTerminalEngine:
                             ms_val = float(m_time.group(1))
                             latencies.append(ms_val)
                             ttl_str = f" TTL={m_ttl.group(1)}" if m_ttl else ""
-                            _send_cyd_lines([f"  #{seq_n} {target}: {ms_val:.1f} ms{ttl_str} [OK]"])
+                            _send_cyd_lines([f" #{seq_n} {target[:16]}: {ms_val:.1f}ms{ttl_str} [OK]"])
                         elif "esgotado" in line_s.lower() or "timed out" in line_s.lower() or "unreachable" in line_s.lower():
                             seq_n += 1
-                            _send_cyd_lines([f"  #{seq_n} {target}: TIMEOUT [ERR]"])
+                            _send_cyd_lines([f" #{seq_n} {target[:16]}: TIMEOUT [ERR]"])
                     proc.wait(timeout=10)
                     if latencies:
                         avg_ms = sum(latencies) / len(latencies)
                         _send_cyd_lines([
-                            f"[OK] {target}: {len(latencies)}/4 pkts | min={min(latencies):.0f}ms med={avg_ms:.1f}ms max={max(latencies):.0f}ms"
+                            f"[OK] {len(latencies)}/4 pkts min={min(latencies):.0f} med={avg_ms:.1f} max={max(latencies):.0f}ms"
                         ])
                     else:
-                        _send_cyd_lines([f"[ERR] {target}: Sem resposta ICMP (100% perda)"])
+                        _send_cyd_lines([f"[ERR] {target[:20]}: Sem resposta (100% loss)"])
 
                 # ================================== FETCH =================================
                 elif verb in ("fetch", "curl", "http"):
                     url = arg_rest or "https://api.github.com"
                     if not url.startswith("http://") and not url.startswith("https://"):
                         url = "https://" + url
-                    _send_cyd_lines([f"[FETCH] GET {url[:36]}..."])
+                    _send_cyd_lines([f"[FETCH] GET {url[:34]}..."])
                     t0 = time.perf_counter()
                     try:
                         req = urllib.request.Request(
                             url,
                             headers={
-                                "User-Agent": "CYD-CyberDeck-Terminal/4.2",
+                                "User-Agent": "CYD-CyberDeck-Terminal/4.6",
                                 "Accept": "*/*",
                             },
                         )
                         with urllib.request.urlopen(req, timeout=6.0) as resp:
                             elapsed_ms = (time.perf_counter() - t0) * 1000.0
                             code = getattr(resp, "status", 200)
-                            srv = resp.headers.get("Server", "Web")[:16]
-                            ctype = (resp.headers.get("Content-Type", "text/html").split(";")[0])[:22]
+                            srv = resp.headers.get("Server", "Web")[:14]
+                            ctype = (resp.headers.get("Content-Type", "text/html").split(";")[0])[:20]
                             body_sample = resp.read(2048).decode("utf-8", errors="ignore")
                             _send_cyd_lines([
-                                f"[OK] ONLINE - Status {code} OK ({elapsed_ms:.0f} ms)",
+                                f"[OK] HTTP {code} OK ({elapsed_ms:.0f} ms)",
                                 f"Srv: {srv} | Tipo: {ctype}",
                             ])
                             m_tit = re.search(r"<title[^>]*>(.*?)</title>", body_sample, re.IGNORECASE | re.DOTALL)
                             if m_tit:
-                                clean_t = re.sub(r"\s+", " ", m_tit.group(1)).strip()[:44]
+                                clean_t = re.sub(r"\s+", " ", m_tit.group(1)).strip()[:39]
                                 if clean_t:
                                     _send_cyd_lines([f"Title: {clean_t}"])
                     except urllib.error.HTTPError as he:
                         elapsed_ms = (time.perf_counter() - t0) * 1000.0
-                        _send_cyd_lines([f"[WARN] HTTP Status {he.code} ({he.reason}) em {elapsed_ms:.0f} ms"])
+                        _send_cyd_lines([f"[WARN] HTTP {he.code} ({str(he.reason)[:16]}) em {elapsed_ms:.0f}ms"])
                     except Exception as ex:
-                        _send_cyd_lines([f"[ERR] OFFLINE / Falha ao conectar: {str(ex)[:40]}"])
+                        _send_cyd_lines([f"[ERR] Falha: {str(ex)[:34]}"])
 
                 # ================================== DOCKER ================================
                 elif verb == "docker":
                     sub_args = parts[1:]
                     if not sub_args or sub_args[0] == "ps":
-                        sub_args = ["ps", "--format", "table {{.Names}}\t{{.Status}}\t{{.Ports}}"]
+                        sub_args = ["ps", "--format", "table {{.Names}}\t{{.Status}}"]
                     elif sub_args[0] == "stats":
                         sub_args = ["stats", "--no-stream", "--format", "table {{.Name}}\t{{.CPUPerc}}\t{{.MemUsage}}"]
 
-                    _send_cyd_lines([f"[DOCKER] docker {' '.join(sub_args)[:32]}..."])
+                    _send_cyd_lines([f"[DOCKER] docker {' '.join(sub_args)[:30]}..."])
                     creation_flags = getattr(subprocess, "CREATE_NO_WINDOW", 0) if IS_WINDOWS else 0
                     try:
                         res = subprocess.run(
@@ -4535,21 +4943,21 @@ class CyberDeckTerminalEngine:
                             creationflags=creation_flags,
                         )
                         out_txt = (res.stdout or "") + ("\n" + res.stderr if res.stderr else "")
-                        out_lines = [ln.strip() for ln in out_txt.splitlines() if ln.strip()]
+                        out_lines = [ln.strip()[:48] for ln in out_txt.splitlines() if ln.strip()]
                         if res.returncode == 0:
                             if out_lines:
                                 _send_cyd_lines(out_lines[:10])
                             else:
-                                _send_cyd_lines(["[OK] Comando docker concluido (0 containers ativos)."])
+                                _send_cyd_lines(["[OK] Docker concluido (0 containers)."])
                         else:
-                            err_preview = out_lines[:4] if out_lines else ["Daemon Docker parado ou inacessivel."]
-                            _send_cyd_lines(["[ERR] Docker retornou codigo " + str(res.returncode)] + err_preview)
+                            err_preview = out_lines[:3] if out_lines else ["Daemon Docker inacessivel."]
+                            _send_cyd_lines([f"[ERR] Docker code {res.returncode}"] + err_preview)
                     except FileNotFoundError:
-                        _send_cyd_lines(["[ERR] Docker CLI nao encontrado no PATH deste PC."])
+                        _send_cyd_lines(["[ERR] Docker CLI nao instalado no PC."])
                     except subprocess.TimeoutExpired:
-                        _send_cyd_lines(["[ERR] Timeout (8s) aguardando resposta do Docker Daemon."])
+                        _send_cyd_lines(["[ERR] Timeout (8s) no Docker Daemon."])
                     except Exception as ex:
-                        _send_cyd_lines([f"[ERR] Falha ao executar docker: {str(ex)[:38]}"])
+                        _send_cyd_lines([f"[ERR] Docker: {str(ex)[:34]}"])
 
                 # ================================== TOP ===================================
                 elif verb in ("top", "procs"):
@@ -4562,33 +4970,42 @@ class CyberDeckTerminalEngine:
                         except Exception:
                             pass
                     procs.sort(reverse=True)
-                    lines_p = ["[TOP] Top 5 Processos por Uso de RAM no PC:"]
+                    lines_p = ["[OK] Top 5 Processos por Uso de RAM:"]
                     for idx_p, (mem_p, pname) in enumerate(procs[:5], 1):
-                        lines_p.append(f"  {idx_p}) {pname[:24]:<24} RAM: {mem_p:.1f}%")
+                        lines_p.append(f" {idx_p}) {pname[:22]:<22} RAM: {mem_p:>4.1f}%")
                     _send_cyd_lines(lines_p)
 
                 # ================================== ROUTER / GATEWAY ======================
                 elif verb in ("router", "gateway", "gw"):
-                    _send_cyd_lines(["[ROUTER] Diagnosticando roteador / gateway..."])
+                    _send_cyd_lines(["[WIFI] Diagnosticando roteador / gateway..."])
                     gw_ip, iface, local_ip = net_analyzer.detect_default_route()
                     gw_p = net_analyzer.ping_stats(gw_ip, count=3)
                     h_code, h_hint = net_analyzer.check_router_http(gw_ip)
                     hosts = net_analyzer.read_lan_neighbors(gw_ip=gw_ip)
                     gw_mac = next((h["mac"] for h in hosts if h["ip"] == gw_ip), "--")
+                    vend_gw = wifi_scanner.lookup_oui(gw_mac) if gw_mac != "--" else ""
+                    v_str = f" ({vend_gw[:10]})" if vend_gw and vend_gw != "Desconhecido" else ""
+                    tag = "[OK]" if gw_p["up"] else "[ERR]"
                     _send_cyd_lines([
-                        f"GW: {gw_ip} ({gw_mac}) via {iface}",
-                        f"PC: {local_ip} | Ping: {gw_p['avg_ms']:.1f}ms | Jit: {gw_p['jitter_ms']:.1f}ms | Loss: {gw_p['loss_pct']}%",
-                        f"Admin Web: http://{gw_ip} (HTTP {h_code} {h_hint})",
-                        f"Vizinhos ARP ativos na LAN: {len(hosts)} host(s)",
+                        f"{tag} GW: {gw_ip} via {iface[:10]}",
+                        f"MAC : {gw_mac}{v_str}",
+                        f"Ping: {gw_p['avg_ms']:.1f}ms | Jit: {gw_p['jitter_ms']:.1f}ms | Loss: {gw_p['loss_pct']}%",
+                        f"Web : http://{gw_ip} (HTTP {h_code} {h_hint[:10]})",
+                        f"LAN : {len(hosts)} vizinhos ARP | PC: {local_ip}",
                     ])
 
                 # ================================== LAN / ARP =============================
                 elif verb in ("lan", "arp", "hosts"):
                     gw_ip, _if, _ip = net_analyzer.detect_default_route()
                     hosts = net_analyzer.read_lan_neighbors(gw_ip=gw_ip)
-                    lines_h = [f"[LAN] Tabela ARP/Vizinhos ({len(hosts)} hosts):"]
-                    for h in hosts[:8]:
-                        lines_h.append(f"  {h['ip']:<15} {h['mac']:<17} {h['tag']}")
+                    lines_h = [f"[OK] Vizinhos ARP na LAN ({len(hosts)} hosts):"]
+                    for h in hosts[:9]:
+                        mac_s = h.get("mac", "")
+                        vend_h = wifi_scanner.lookup_oui(mac_s)
+                        tag_s = h.get("tag", "LAN")
+                        if tag_s == "LAN" and vend_h != "Desconhecido":
+                            tag_s = vend_h[:11]
+                        lines_h.append(f" {h['ip']:<15} {mac_s:<17} {tag_s[:11]}")
                     _send_cyd_lines(lines_h)
 
                 # ================================== DNS ===================================
@@ -4598,36 +5015,39 @@ class CyberDeckTerminalEngine:
                     try:
                         infos = socket.getaddrinfo(dom, 443, socket.AF_INET)
                         ms = (time.perf_counter() - t0) * 1000.0
-                        ips = sorted({x[4][0] for x in infos})[:4]
-                        _send_cyd_lines([f"[DNS] {dom} ({ms:.1f} ms): " + ", ".join(ips)])
+                        ips = sorted({x[4][0] for x in infos})[:3]
+                        _send_cyd_lines([
+                            f"[OK] DNS {dom[:24]} ({ms:.1f} ms):",
+                            f" IPs: {', '.join(ips)}"[:48],
+                        ])
                     except Exception as ex:
-                        _send_cyd_lines([f"[DNS ERR] {dom}: {str(ex)[:38]}"])
+                        _send_cyd_lines([f"[ERR] DNS {dom[:18]}: {str(ex)[:26]}"])
 
                 # ================================== TRACE / TRACEROUTE ====================
                 elif verb in ("trace", "traceroute", "tracepath"):
                     tgt = re.sub(r"[^a-zA-Z0-9.\-:]", "", arg_rest or "1.1.1.1") or "1.1.1.1"
-                    _send_cyd_lines([f"[TRACE] Rastreando rota ate {tgt} (max 8 saltos)..."])
+                    _send_cyd_lines([f"[WIFI] Traceroute -> {tgt[:22]} (8 hops)..."])
                     t_cmd = ["tracert", "-d", "-h", "8", "-w", "1000", tgt] if IS_WINDOWS else ["traceroute", "-n", "-m", "8", "-w", "1", "-q", "1", tgt]
                     out_t = net_analyzer._run_cmd(t_cmd, timeout=9.0)
-                    t_lines = [ln.strip() for ln in out_t.splitlines() if ln.strip()][:9]
-                    _send_cyd_lines(t_lines if t_lines else ["[TRACE] Sem resposta / traceroute indisponivel."])
+                    t_lines = [ln.strip()[:48] for ln in out_t.splitlines() if ln.strip()][:9]
+                    _send_cyd_lines(t_lines if t_lines else ["[WARN] Sem resposta / traceroute ausente."])
 
                 # ================================== SPEEDTEST =============================
                 elif verb in ("speed", "speedtest"):
-                    _send_cyd_lines(["[SPEED] Testando Download/Upload Fibra (~4s)..."])
+                    _send_cyd_lines(["[WIFI] Testando Download/Upload Fibra (~4s)..."])
                     res = net_analyzer.run_cloudflare_speedtest()
                     if res.get("ok"):
                         _send_cyd_lines([
-                            f"[OK] Download: {res['dl_mbps']:.1f} Mbps | Upload: {res['ul_mbps']:.1f} Mbps",
-                            f"Ping 1.1.1.1: {res['ping_ms']:.1f} ms | Jitter: {res['jitter_ms']:.1f} ms",
+                            f"[OK] DL: {res['dl_mbps']:.1f} Mbps | UL: {res['ul_mbps']:.1f} Mbps",
+                            f"Ping 1.1.1.1: {res['ping_ms']:.1f}ms | Jit: {res['jitter_ms']:.1f}ms",
                         ])
                     else:
                         _send_cyd_lines(["[ERR] Falha no teste de velocidade."])
 
                 else:
                     _send_cyd_lines([
-                        f"[ERR] Comando desconhecido: '{verb}'",
-                        "Digite 'help' para ver os comandos disponiveis.",
+                        f"[ERR] Comando desconhecido: '{verb[:22]}'",
+                        "Digite 'help' (help rf | net | sys | esp).",
                     ])
 
                 if log_fn:
@@ -4635,8 +5055,13 @@ class CyberDeckTerminalEngine:
             finally:
                 with self._lock:
                     self._busy = False
+                done_ev.set()
 
-        threading.Thread(target=_runner, daemon=True).start()
+        t_worker = threading.Thread(target=_runner, daemon=True)
+        t_worker.start()
+        if wait:
+            done_ev.wait(timeout=max(0.5, float(timeout_s or 10.0)))
+        return list(captured_lines)
 
 
 # ========================================== INTERFACE MODERNA EM FLET (FLUTTER) ==
@@ -4655,9 +5080,14 @@ def launch_flet_gui(
     import flet as ft
 
     if term_eng is None:
-        term_eng = CyberDeckTerminalEngine(collector=col)
-    elif term_eng.collector is None:
-        term_eng.collector = col
+        term_eng = CyberDeckTerminalEngine(collector=col, wifi_scan_col=wifi_scan_col, net_col=net_col)
+    else:
+        if term_eng.collector is None:
+            term_eng.collector = col
+        if term_eng.wifi_scan_col is None:
+            term_eng.wifi_scan_col = wifi_scan_col
+        if term_eng.net_col is None:
+            term_eng.net_col = net_col
 
     # Helpers compativeis entre Flet 0.2x e Flet 1.0+
     _ICONS = getattr(ft, "Icons", getattr(ft, "icons", None))
@@ -7730,11 +8160,11 @@ def launch_flet_gui(
 
         page.on_keyboard_event = on_term_keyboard_event
 
-        def run_terminal_command(cmd_raw: str = None):
+        def run_terminal_command(cmd_raw: str = None, wait: bool = False, timeout_s: float = 10.0) -> list[str]:
             nonlocal term_history_idx
             cmd_to_run = (cmd_raw if cmd_raw is not None else (txt_term_input.value or "")).strip()
             if not cmd_to_run:
-                return
+                return []
             term_history_idx = -1
             if cmd_raw is None:
                 txt_term_input.value = ""
@@ -7748,13 +8178,16 @@ def launch_flet_gui(
                 ui_event_queue.put(pkt)
                 refresh_terminal_ui()
 
-            term_eng.execute_command(
+            out_lines = term_eng.execute_command(
                 cmd_to_run,
                 dispatch_fn=_dispatch_to_cyd,
                 log_fn=lambda m: (append_log(m), refresh_terminal_ui()),
                 auto_switch_screen=bool(state.get("term_auto_switch", True)),
+                wait=wait,
+                timeout_s=timeout_s,
             )
             refresh_terminal_ui()
+            return out_lines
 
         txt_term_input.on_submit = lambda e: run_terminal_command()
 
@@ -7804,7 +8237,15 @@ def launch_flet_gui(
                     ),
                     ft.Row(
                         [
-                            make_cmd_chip("📡 wifi scan", "wifi scan", "#38BDF8"),
+                            make_cmd_chip("📡 rf scan", "rf scan", "#38BDF8"),
+                            make_cmd_chip("📊 rf spectrum", "rf spectrum", "#22C55E"),
+                            make_cmd_chip("🛡️ rf audit", "rf audit", "#FACC15"),
+                            make_cmd_chip("🔄 rf diff", "rf diff", "#38BDF8"),
+                            make_cmd_chip("🩺 netcheck", "netcheck", "#4ADE80"),
+                            make_cmd_chip("📈 jitter", "jitter", "#34D399"),
+                            make_cmd_chip("📏 mtu", "mtu", "#A855F7"),
+                            make_cmd_chip("🔀 route", "route", "#60A5FA"),
+                            make_cmd_chip("📶 wifi scan", "wifi scan", "#38BDF8"),
                             make_cmd_chip("ℹ️ esp info", "esp info", "#38BDF8"),
                             make_cmd_chip("🧠 esp mem", "esp mem", "#38BDF8"),
                             make_cmd_chip("🔄 esp reboot", "esp reboot", "#F87171"),
@@ -8514,8 +8955,27 @@ def launch_flet_gui(
 
                 elif p == "/api/terminal":
                     cmd_str = str(body.get("cmd", "")).strip()
+                    wait_flag = bool(body.get("wait", False))
                     if cmd_str:
-                        run_terminal_command(cmd_str)
+                        snap_pre = term_eng.get_snapshot()
+                        lines_before = len(snap_pre.get("lines", []))
+                        seq_before = snap_pre.get("seq", lines_before)
+                        out_lines = run_terminal_command(cmd_str, wait=wait_flag, timeout_s=10.0)
+                        res_t = {
+                            "ok": True,
+                            "state": get_ui_dict(),
+                            "seq": seq_before,
+                            "lines_before": lines_before,
+                            "output": out_lines,
+                        }
+                        content = json.dumps(res_t, ensure_ascii=False).encode("utf-8")
+                        self.send_response(200)
+                        self.send_header("Content-Type", "application/json; charset=utf-8")
+                        self.send_header("Content-Length", str(len(content)))
+                        self._send_cors()
+                        self.end_headers()
+                        self.wfile.write(content)
+                        return
                     else:
                         ok = False
                         err_msg = "Comando vazio"
@@ -9426,9 +9886,14 @@ def run_headless_daemon(
     import signal
 
     if term_eng is None:
-        term_eng = CyberDeckTerminalEngine(collector=col)
-    elif term_eng.collector is None:
-        term_eng.collector = col
+        term_eng = CyberDeckTerminalEngine(collector=col, wifi_scan_col=wifi_scan_col, net_col=net_col)
+    else:
+        if term_eng.collector is None:
+            term_eng.collector = col
+        if term_eng.wifi_scan_col is None:
+            term_eng.wifi_scan_col = wifi_scan_col
+        if term_eng.net_col is None:
+            term_eng.net_col = net_col
 
     cfg = load_ui_config()
     state = {
@@ -9906,10 +10371,36 @@ def run_headless_daemon(
                     ui_event_queue.put({"news": gems_eng.get_cyd_news_payload(include_queue=False, force=True)})
             elif p == "/api/terminal":
                 cmd_str = str(body.get("cmd", "")).strip()
+                wait_flag = bool(body.get("wait", False))
                 if cmd_str:
                     if state.get("term_auto_switch", True):
                         state["screen"] = 11
-                    term_eng.execute_command(cmd_str, dispatch_fn=lambda pkt: ui_event_queue.put(pkt), log_fn=log_h, auto_switch_screen=True)
+                    snap_pre = term_eng.get_snapshot()
+                    lines_before = len(snap_pre.get("lines", []))
+                    seq_before = snap_pre.get("seq", lines_before)
+                    out_lines = term_eng.execute_command(
+                        cmd_str,
+                        dispatch_fn=lambda pkt: ui_event_queue.put(pkt),
+                        log_fn=log_h,
+                        auto_switch_screen=True,
+                        wait=wait_flag,
+                        timeout_s=10.0,
+                    )
+                    res_t = {
+                        "ok": True,
+                        "state": get_ui_dict(),
+                        "seq": seq_before,
+                        "lines_before": lines_before,
+                        "output": out_lines,
+                    }
+                    content = json.dumps(res_t, ensure_ascii=False).encode("utf-8")
+                    self.send_response(200)
+                    self.send_header("Content-Type", "application/json; charset=utf-8")
+                    self.send_header("Content-Length", str(len(content)))
+                    self._send_cors()
+                    self.end_headers()
+                    self.wfile.write(content)
+                    return
                 else:
                     ok, err_msg = False, "Comando vazio"
             elif p == "/api/color":
@@ -10153,7 +10644,6 @@ def main():
         news_api_key=cfg.get("news_api_key", ""),
         rotate_sec=15.0,
     )
-    term_eng = CyberDeckTerminalEngine(collector=col)
     wifi_scan_col = wifi_scanner.WiFiScannerCollector(
         preferred_port=(args.scanner_port or str(cfg.get("scanner_port", "") or "")),
         scan_interval_s=float(cfg.get("scanner_interval_s", 8.0) or 8.0),
@@ -10164,6 +10654,11 @@ def main():
         plan_mbps=int(cfg.get("net_plan_mbps", 700) or 700),
         scanner_ip_fn=lambda: wifi_scan_col.get_ui_snapshot().get("scanner_ip", ""),
         auto_start=not (args.stdout or args.once),
+    )
+    term_eng = CyberDeckTerminalEngine(
+        collector=col,
+        wifi_scan_col=wifi_scan_col,
+        net_col=net_col,
     )
     time.sleep(0.55)
 

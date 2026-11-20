@@ -305,15 +305,28 @@ ln -sf "$(pwd)/linux/cyd_ctl.py" ~/.local/bin/cyd
 | `cyd lan` | Lista os dispositivos ativos na LAN via tabela ARP/vizinhos local |
 | `cyd speed` | Abre a Tela 13 e dispara o Speedtest Fibra multi-stream (Download/Upload Mbps + Ping) |
 | `cyd radar [--scan]` | Exibe as redes 2.4 GHz detectadas pela ESP32-WROOM-32U (`--scan` força nova varredura sem fio) |
+| `cyd rf [scan\|spectrum\|audit\|diff\|status\|export]` | Executa análise RF defensiva da ESP32-WROOM-32U no Terminal CYD (Tela 11) e imprime a saída no Linux |
+| `cyd rf track <filtro>` | Rastreia um AP por SSID/BSSID (RSSI atual/min/méd/máx, estabilidade dB, fabricante OUI e distância indoor) |
+| `cyd diag` | Executa bateria completa `netcheck` (Gateway + Jitter + WAN + DNS + HTTP + LAN ARP + ESP32-WROOM-32U) |
+| `cyd jitter [alvo]` | Mede estabilidade ICMP (10 pacotes: perda, RTT min/méd/máx, jitter em ms e classificação; aceita `gw`) |
+| `cyd mtu [alvo]` | Descobre o Path MTU com bit Don't Fragment (`1500` Ethernet vs `1492` PPPoE Vivo Fibra) |
+| `cyd tls <dominio>` | Inspeciona passivamente o certificado TLS/SSL (`CN`, emissor, dias restantes, versão TLS e handshake ms) |
 | `cyd plan <mbps>` | Configura a velocidade contratada do plano de internet (ex.: `cyd plan 700` para Vivo Fibra 700 Mb) |
 | `cyd brt <0..255>` | Ajusta o brilho PWM do display da CYD |
 | `cyd color "#00FFFF"` | Altera a cor tema RGB565 da CYD em tempo real |
-| `cyd cmd "<comando>"` | Envia comando para o Terminal CYD na Tela 11 (ex.: `cyd cmd "router"`, `cyd cmd "dns google.com"`, `cyd cmd "trace 1.1.1.1"`) |
+| `cyd cmd "<comando>"` | Executa comando no Terminal CYD (Tela 11) com retorno síncrono no terminal Linux (ex.: `cyd cmd "rf spectrum"`, `cyd cmd "oui 30:DE:4B"`, `cyd cmd "route"`) |
 
 #### Exemplos práticos
 ```bash
 cyd 12                  # Abre o Radar Wi-Fi RF (ESP32-WROOM-32U)
 cyd screen net          # Abre a Tela 13 (Análise de Rede & Roteador)
+cyd rf spectrum         # Analisa ocupação dos canais 1..13 e recomenda melhor canal (1, 6 ou 11)
+cyd rf audit            # Auditoria passiva: redes OPEN, ocultas, WEP, Mesh multi-BSSID e canais cheios
+cyd rf track Vivo       # Rastreia estabilidade de sinal (dBm/dB), OUI e distância indoor aproximada
+cyd diag                # Bateria completa GW + Jitter + WAN + DNS + LAN + ESP32-32U na Tela 11 e no Linux
+cyd jitter gw           # Testa jitter e perda de pacotes para o próprio roteador/gateway
+cyd mtu 1.1.1.1         # Descobre Path MTU (ex: 1492 PPPoE Vivo Fibra vs 1500 Ethernet)
+cyd tls github.com      # Inspeciona certificado TLSv1.3, validade e tempo de handshake
 cyd speed               # Mede velocidade da fibra ao vivo na Tela 13
 cyd router --open       # Diagnostica o gateway e abre o painel do roteador
 cyd radar --scan        # Dispara varredura remota sem fio na ESP32-WROOM-32U

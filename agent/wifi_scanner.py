@@ -13,6 +13,7 @@ ocupacao dos canais 1..13) para exibicao na Tela 12 da CYD (SCR_WIFI_RADAR),
 no Painel Desktop Flet e na interface Web/Mobile (:8088).
 """
 
+import csv
 import json
 import os
 import re
@@ -44,6 +45,191 @@ CYD_SIGNATURES = (
     "TERM_LOG:",
     "ACK_START",
 )
+
+# Dicionario offline OUI (Organizationally Unique Identifier) com prefixos MAC
+# reais comuns no Brasil, provedores de fibra (HGU) e equipamentos de homelab/IoT.
+OUI_VENDORS: dict[str, str] = {
+    # TP-Link
+    "30:DE:4B": "TP-Link",
+    "AC:15:A2": "TP-Link",
+    "C0:25:2F": "TP-Link",
+    "84:D8:1B": "TP-Link",
+    "B8:1E:61": "TP-Link",
+    "50:C7:BF": "TP-Link",
+    "F4:F2:6D": "TP-Link",
+    "18:D6:C7": "TP-Link",
+    "E8:DE:27": "TP-Link",
+    "98:DA:C4": "TP-Link",
+    "D8:07:B6": "TP-Link",
+    "60:32:B1": "TP-Link",
+    "B0:95:75": "TP-Link",
+    # Intelbras
+    "4C:1B:86": "Intelbras",
+    "58:10:8C": "Intelbras",
+    "00:1A:3F": "Intelbras",
+    "78:32:1B": "Intelbras",
+    "D4:7C:44": "Intelbras",
+    "38:71:DE": "Intelbras",
+    "80:7D:3A": "Intelbras",
+    # Huawei
+    "48:4C:29": "Huawei",
+    "00:E0:FC": "Huawei",
+    "28:6E:D4": "Huawei",
+    "88:28:B3": "Huawei",
+    "C8:D1:5E": "Huawei",
+    "F4:63:1F": "Huawei",
+    "04:F9:38": "Huawei",
+    "4C:FB:45": "Huawei",
+    # ZTE
+    "34:4B:50": "ZTE",
+    "74:A7:8E": "ZTE",
+    "9C:6F:52": "ZTE",
+    "D0:15:4A": "ZTE",
+    "EC:1D:7F": "ZTE",
+    # MitraStar (Vivo Fibra HGU)
+    "10:72:23": "MitraStar",
+    "B0:B3:69": "MitraStar",
+    "D8:FB:5E": "MitraStar",
+    "7C:26:64": "MitraStar",
+    "A8:4E:3F": "MitraStar",
+    "E8:AD:A6": "MitraStar",
+    # Askey (Vivo Fibra HGU)
+    "E4:AB:89": "Askey",
+    "70:5A:9E": "Askey",
+    "B8:D9:4D": "Askey",
+    "C8:B4:22": "Askey",
+    "38:3B:C8": "Askey",
+    # Ubiquiti (UniFi)
+    "24:5A:4C": "Ubiquiti",
+    "78:8A:20": "Ubiquiti",
+    "80:2A:A8": "Ubiquiti",
+    "F0:9F:C2": "Ubiquiti",
+    "B4:FB:E4": "Ubiquiti",
+    "68:D7:9A": "Ubiquiti",
+    "E0:63:DA": "Ubiquiti",
+    # MikroTik (RouterBOARD)
+    "4C:5E:0C": "MikroTik",
+    "64:D1:54": "MikroTik",
+    "B8:69:F4": "MikroTik",
+    "C4:AD:34": "MikroTik",
+    "DC:2C:6E": "MikroTik",
+    "E4:8D:8C": "MikroTik",
+    "18:FD:74": "MikroTik",
+    # Cisco / Linksys
+    "00:1B:D5": "Cisco",
+    "00:24:14": "Cisco",
+    "58:AC:78": "Cisco",
+    "F8:7B:20": "Cisco",
+    "C0:25:5C": "Cisco",
+    # Asus
+    "04:92:26": "Asus",
+    "2C:56:DC": "Asus",
+    "38:D5:47": "Asus",
+    "AC:9E:17": "Asus",
+    "F0:79:59": "Asus",
+    # D-Link
+    "00:1C:F0": "D-Link",
+    "1C:7E:E5": "D-Link",
+    "28:10:7B": "D-Link",
+    "C8:BE:19": "D-Link",
+    "BC:F6:85": "D-Link",
+    # Tenda
+    "C8:3A:35": "Tenda",
+    "D8:32:14": "Tenda",
+    "50:0F:F5": "Tenda",
+    "04:95:E6": "Tenda",
+    # Mercusys
+    "00:31:92": "Mercusys",
+    "7C:C2:C6": "Mercusys",
+    "C0:06:C3": "Mercusys",
+    "40:AE:30": "Mercusys",
+    # Espressif (ESP32 / ESP8266)
+    "20:50:0D": "Espressif",
+    "30:76:F5": "Espressif",
+    "24:6F:28": "Espressif",
+    "3C:71:BF": "Espressif",
+    "84:CC:A8": "Espressif",
+    "A4:CF:12": "Espressif",
+    "B4:E6:2D": "Espressif",
+    "C4:4F:33": "Espressif",
+    "EC:FA:BC": "Espressif",
+    "94:B9:7E": "Espressif",
+    "7C:9E:BD": "Espressif",
+    # Apple
+    "00:17:F2": "Apple",
+    "28:CF:E9": "Apple",
+    "3C:22:FB": "Apple",
+    "A4:83:E7": "Apple",
+    "F0:18:98": "Apple",
+    "BC:D0:74": "Apple",
+    # Samsung
+    "00:16:32": "Samsung",
+    "28:39:5E": "Samsung",
+    "50:01:BB": "Samsung",
+    "8C:77:12": "Samsung",
+    "BC:72:B1": "Samsung",
+    # Xiaomi
+    "28:6C:07": "Xiaomi",
+    "64:09:80": "Xiaomi",
+    "7C:1D:D9": "Xiaomi",
+    "F8:A4:5F": "Xiaomi",
+    "AC:C1:EE": "Xiaomi",
+    # Realtek
+    "00:E0:4C": "Realtek",
+    "52:54:00": "Realtek",
+    "74:DA:38": "Realtek",
+    # Raspberry Pi
+    "B8:27:EB": "RaspberryPi",
+    "DC:A6:32": "RaspberryPi",
+    "E4:5F:01": "RaspberryPi",
+    "28:CD:C1": "RaspberryPi",
+    "D8:3A:DD": "RaspberryPi",
+    # Intel / FiberHome / Sagemcom / Arris / Multilaser
+    "00:13:E8": "Intel",
+    "3C:97:0E": "Intel",
+    "8C:8D:28": "Intel",
+    "A4:34:D9": "Intel",
+    "00:0A:C2": "FiberHome",
+    "74:B5:7E": "FiberHome",
+    "F8:DF:A8": "FiberHome",
+    "68:A3:78": "Sagemcom",
+    "7C:03:D8": "Sagemcom",
+    "00:1D:CE": "Arris",
+    "90:03:B7": "Arris",
+    "00:01:36": "Multilaser",
+    "2C:3A:E8": "Multilaser",
+}
+
+
+def lookup_oui(bssid: str) -> str:
+    """Resolve o fabricante (OUI) offline a partir de um endereco MAC / BSSID."""
+    if not bssid:
+        return "Desconhecido"
+    hex_clean = re.sub(r"[^0-9A-Fa-f]", "", str(bssid)).upper()
+    if len(hex_clean) < 6:
+        return "Desconhecido"
+    prefix = f"{hex_clean[0:2]}:{hex_clean[2:4]}:{hex_clean[4:6]}"
+    if prefix in OUI_VENDORS:
+        return OUI_VENDORS[prefix]
+    try:
+        first_octet = int(hex_clean[0:2], 16)
+        if first_octet & 0x02:
+            return "Local/Mesh"
+    except Exception:
+        pass
+    return "Desconhecido"
+
+
+def estimate_distance_m(rssi: int, tx_power_1m: float = -40.0, path_loss_exp: float = 2.7) -> float:
+    """Estima a distancia indoor aproximada (em metros) via modelo log-distance / FSPL 2.4 GHz."""
+    try:
+        r = float(rssi)
+    except Exception:
+        return 99.9
+    if r >= -25.0:
+        return 0.5
+    dist = 10.0 ** ((tx_power_1m - r) / (10.0 * path_loss_exp))
+    return round(max(0.5, min(150.0, dist)), 1)
 
 
 def _ascii_clean(text: str, max_len: int = 24) -> str:
@@ -151,6 +337,15 @@ class WiFiScannerCollector:
         self._best_rssi: int = -100
         self._avg_rssi: int = -100
         self._history: list[dict] = []
+        self._ap_stats: dict[str, dict] = {}
+        self._baseline_bssids: set[str] = set()
+        self._prev_scan_map: dict[str, dict] = {}
+        self._last_diff: dict = {
+            "added": [],
+            "removed": [],
+            "rssi_changes": [],
+            "ts": "--:--:--",
+        }
 
         if auto_start:
             self.start()
@@ -356,6 +551,327 @@ class WiFiScannerCollector:
                 "history": list(self._history),
             }
 
+    # ------------------------------------------------------ inteligencia RF & analise
+    def wait_for_fresh_scan(self, timeout_s: float = 6.0) -> dict:
+        """Dispara force_scan() e aguarda scan_count incrementar (ou retorna o snapshot atual apos timeout)."""
+        with self._lock:
+            sc0 = self._scan_count
+            is_running = self._running
+            alive = self._is_alive_locked()
+        self.force_scan()
+        if not is_running or not alive:
+            # Em modo offline/teste sem socket ativo aguarda apenas uma janela curta
+            wait_limit = min(float(timeout_s or 0.0), 0.25) if not is_running else min(float(timeout_s or 0.0), 1.5)
+        else:
+            wait_limit = max(0.2, float(timeout_s or 6.0))
+        deadline = time.monotonic() + wait_limit
+        while time.monotonic() < deadline:
+            with self._lock:
+                if self._scan_count > sc0:
+                    break
+            time.sleep(0.1)
+        return self.get_ui_snapshot()
+
+    def get_spectrum_analysis(self) -> dict:
+        """
+        Analisa ocupacao e interferencia ponderada por canal 1..13 (co-canal + adjacentes +-2)
+        e classifica os 3 canais nao-sobrepostos (1, 6 e 11) com nota e recomendacao.
+        """
+        with self._lock:
+            ch_counts = list(self._ch_counts)
+            nets = [dict(n) for n in self._networks]
+
+        # Pesos de interferencia por sobreposicao de espectro 2.4 GHz (20 MHz bandwidth)
+        overlap_weights = {0: 1.0, 1: 0.55, 2: 0.25}
+        channels_info: dict[int, dict] = {}
+        channel_list: list[dict] = []
+
+        for ch in range(1, 14):
+            co_aps = [n for n in nets if int(n.get("ch", 0)) == ch]
+            cnt = ch_counts[ch - 1] if (0 <= ch - 1 < len(ch_counts)) else len(co_aps)
+            cnt = max(cnt, len(co_aps))
+            max_rssi = max((int(n.get("rssi", -100)) for n in co_aps), default=-100)
+
+            adj_cnt = 0
+            weighted_score = 0.0
+            if nets:
+                for n in nets:
+                    ap_ch = int(n.get("ch", 0))
+                    dist = abs(ap_ch - ch)
+                    if dist in overlap_weights:
+                        if dist > 0:
+                            adj_cnt += 1
+                        rssi_v = int(n.get("rssi", -85))
+                        # Peso por potencia do sinal: -45 dBm -> 1.35x, -70 dBm -> 0.85x, -90 dBm -> 0.45x
+                        sig_factor = max(0.35, min(1.5, (rssi_v + 112.0) / 50.0))
+                        weighted_score += overlap_weights[dist] * sig_factor
+            else:
+                for other_ch in range(1, 14):
+                    dist = abs(other_ch - ch)
+                    if dist in overlap_weights:
+                        c_other = ch_counts[other_ch - 1]
+                        if dist > 0:
+                            adj_cnt += c_other
+                        weighted_score += overlap_weights[dist] * float(c_other)
+
+            score_r = round(weighted_score, 2)
+            if score_r <= 0.8 and cnt == 0:
+                grade = "LIVRE"
+            elif score_r <= 2.5:
+                grade = "BOM"
+            elif score_r <= 4.5:
+                grade = "MODERADO"
+            else:
+                grade = "CONGESTIONADO"
+
+            info = {
+                "ch": ch,
+                "count": int(cnt),
+                "adj_count": int(adj_cnt),
+                "max_rssi": int(max_rssi),
+                "interference": score_r,
+                "score": score_r,
+                "grade": grade,
+            }
+            channels_info[ch] = info
+            channel_list.append(info)
+
+        non_overlap_chs = [1, 6, 11]
+        ranking = []
+        for ch in non_overlap_chs:
+            ci = dict(channels_info[ch])
+            # Nota de 0 a 10 (10 = espectro totalmente limpo)
+            rating = round(max(0.0, 10.0 - ci["score"] * 1.4), 1)
+            ci["rating"] = rating
+            ci["recommendation"] = f"CH{ch:02d}: {ci['grade']} ({ci['count']} APs, adj {ci['adj_count']}, nota {rating}/10)"
+            ranking.append(ci)
+
+        ranking.sort(key=lambda x: (x["score"], x["count"], x["adj_count"], x["max_rssi"]))
+        best = ranking[0]
+        busiest = max(channel_list, key=lambda x: (x["count"], x["score"])) if any(x["count"] > 0 for x in channel_list) else channels_info[1]
+
+        return {
+            "ch_counts": [channels_info[c]["count"] for c in range(1, 14)],
+            "channels": channels_info,
+            "channel_list": channel_list,
+            "non_overlapping": ranking,
+            "ranking": ranking,
+            "best_channel": best["ch"],
+            "best_grade": best["grade"],
+            "best_score": best["score"],
+            "busiest_channel": busiest["ch"] if busiest["count"] > 0 else 0,
+            "recommendation": f"Use CH{best['ch']:02d} ({best['grade']} | {best['count']} APs | nota {best['rating']}/10)",
+        }
+
+    def get_rf_audit(self) -> dict:
+        """
+        Auditoria passiva e defensiva do espectro Wi-Fi 2.4 GHz:
+        - Redes abertas (OPEN)
+        - Redes com SSID oculto (<OCULTA>)
+        - Redes com criptografia legada/fraca (WEP)
+        - SSIDs com multiplos BSSIDs (Mesh / Roaming / APs duplicados)
+        - Canais congestionados (>= 3 APs)
+        """
+        with self._lock:
+            nets = [dict(n) for n in self._networks]
+            ch_counts = list(self._ch_counts)
+
+        open_nets = [n for n in nets if str(n.get("enc", "")).upper() in ("OPEN", "NONE", "")]
+        hidden_nets = [n for n in nets if not n.get("ssid") or n.get("ssid") == "<OCULTA>"]
+        wep_nets = [n for n in nets if "WEP" in str(n.get("enc", "")).upper()]
+
+        by_ssid: dict[str, list[dict]] = {}
+        for n in nets:
+            s = str(n.get("ssid") or "").strip()
+            if not s or s == "<OCULTA>":
+                continue
+            by_ssid.setdefault(s, []).append(n)
+
+        multi_bssid = []
+        for s, items in by_ssid.items():
+            bssids = sorted({str(x.get("bssid") or "") for x in items if x.get("bssid")})
+            if len(bssids) >= 2 or len(items) >= 2:
+                multi_bssid.append({
+                    "ssid": s,
+                    "count": max(len(bssids), len(items)),
+                    "bssids": bssids,
+                    "channels": sorted({int(x.get("ch", 0)) for x in items}),
+                    "vendors": sorted({str(x.get("vendor") or lookup_oui(x.get("bssid", ""))) for x in items}),
+                })
+        multi_bssid.sort(key=lambda x: x["count"], reverse=True)
+
+        congested = []
+        for idx, c in enumerate(ch_counts):
+            ch_num = idx + 1
+            actual_c = max(int(c), sum(1 for n in nets if int(n.get("ch", 0)) == ch_num))
+            if actual_c >= 3:
+                congested.append({"ch": ch_num, "count": actual_c})
+        congested.sort(key=lambda x: x["count"], reverse=True)
+
+        findings = len(open_nets) + len(wep_nets) + len(congested)
+        status = "WARN" if findings > 0 else "OK"
+
+        return {
+            "total_aps": len(nets),
+            "open_networks": open_nets,
+            "hidden_networks": hidden_nets,
+            "wep_networks": wep_nets,
+            "multi_bssid_ssids": multi_bssid,
+            "congested_channels": congested,
+            "status": status,
+        }
+
+    def track_ap(self, query: str) -> list[dict]:
+        """
+        Busca por substring em SSID ou BSSID (case-insensitive) e retorna estatisticas
+        historicas (cur, min, avg, max, spread, ch, enc, vendor, est_dist_m).
+        """
+        q = (query or "").strip().lower()
+        with self._lock:
+            stats_all = [dict(v, rssi_samples=list(v.get("rssi_samples", []))) for v in self._ap_stats.values()]
+            active_bssids = {n.get("bssid") for n in self._networks if n.get("bssid")}
+            active_ssids = {n.get("ssid") for n in self._networks if n.get("ssid")}
+
+        results = []
+        for st in stats_all:
+            ssid = str(st.get("ssid") or "<OCULTA>")
+            bssid = str(st.get("bssid") or "")
+            vendor = str(st.get("vendor") or lookup_oui(bssid))
+            if q and q not in ("*", "all"):
+                if q not in ssid.lower() and q not in bssid.lower() and q not in vendor.lower():
+                    continue
+            samples = st.get("rssi_samples") or [int(st.get("rssi_cur", -100))]
+            cur_r = int(st.get("rssi_cur", samples[-1]))
+            min_r = int(st.get("rssi_min", min(samples)))
+            max_r = int(st.get("rssi_max", max(samples)))
+            avg_r = round(sum(samples) / float(len(samples)), 1)
+            spread_db = int(max_r - min_r)
+            if len(samples) > 1:
+                diffs = [abs(samples[i] - samples[i - 1]) for i in range(1, len(samples))]
+                jitter_db = round(sum(diffs) / float(len(diffs)), 1)
+            else:
+                jitter_db = 0.0
+
+            is_active = (bssid in active_bssids) if bssid else (ssid in active_ssids)
+            results.append({
+                "ssid": ssid,
+                "bssid": bssid,
+                "cur": cur_r,
+                "min": min_r,
+                "avg": avg_r,
+                "max": max_r,
+                "spread": spread_db,
+                "jitter_db": jitter_db,
+                "ch": int(st.get("ch", 0)),
+                "enc": str(st.get("enc", "WPA")),
+                "vendor": vendor,
+                "est_dist_m": estimate_distance_m(cur_r),
+                "seen_count": int(st.get("seen_count", 1)),
+                "first_seen": str(st.get("first_seen", "--:--:--")),
+                "last_seen": str(st.get("last_seen", "--:--:--")),
+                "active": bool(is_active),
+            })
+
+        results.sort(key=lambda x: (1 if x["active"] else 0, x["cur"], x["max"]), reverse=True)
+        return results
+
+    def get_diff_report(self) -> dict:
+        """Retorna diferencas de redes (novas, ausentes e variacoes de RSSI) vs scan anterior e baseline."""
+        with self._lock:
+            baseline = set(self._baseline_bssids)
+            cur_nets = [dict(n) for n in self._networks]
+            last_diff = {
+                "added": [dict(x) for x in self._last_diff.get("added", [])],
+                "removed": [dict(x) for x in self._last_diff.get("removed", [])],
+                "rssi_changes": [dict(x) for x in self._last_diff.get("rssi_changes", [])],
+                "ts": self._last_diff.get("ts", self._last_scan_str),
+            }
+            ap_stats_copy = {k: dict(v) for k, v in self._ap_stats.items()}
+
+        cur_bssids = {n.get("bssid") for n in cur_nets if n.get("bssid")}
+        base_added_bssids = cur_bssids - baseline if baseline else set()
+        base_removed_bssids = baseline - cur_bssids if baseline else set()
+
+        base_added = [n for n in cur_nets if n.get("bssid") in base_added_bssids]
+        base_removed = [
+            ap_stats_copy.get(b, {"bssid": b, "ssid": "<ANTERIOR>", "ch": 0, "rssi": -100})
+            for b in sorted(base_removed_bssids)
+        ]
+
+        added_out = last_diff["added"] if last_diff["added"] else base_added
+        removed_out = last_diff["removed"] if last_diff["removed"] else base_removed
+
+        return {
+            "baseline_count": len(baseline),
+            "current_count": len(cur_nets),
+            "added": added_out,
+            "removed": removed_out,
+            "rssi_changes": last_diff["rssi_changes"],
+            "baseline_added": base_added,
+            "baseline_removed": base_removed,
+            "ts": last_diff["ts"],
+        }
+
+    def export_report(self, fmt: str = "json", out_dir: str = "reports") -> str:
+        """Salva relatorio RF completo em reports/rf_report_YYYYMMDD_HHMMSS.json (ou .csv)."""
+        fmt_clean = (fmt or "json").strip().lower()
+        if fmt_clean not in ("json", "csv"):
+            fmt_clean = "json"
+        os.makedirs(out_dir, exist_ok=True)
+        ts_file = datetime.now().strftime("%Y%m%d_%H%M%S")
+        out_path = os.path.join(out_dir, f"rf_report_{ts_file}.{fmt_clean}")
+
+        snap = self.get_ui_snapshot()
+        spec = self.get_spectrum_analysis()
+        audit = self.get_rf_audit()
+        tracked = self.track_ap("*")
+        diff = self.get_diff_report()
+
+        if fmt_clean == "csv":
+            with open(out_path, "w", newline="", encoding="utf-8") as f:
+                writer = csv.writer(f)
+                writer.writerow([
+                    "ssid", "bssid", "vendor", "ch", "enc",
+                    "cur_rssi", "min_rssi", "avg_rssi", "max_rssi",
+                    "spread_db", "jitter_db", "est_dist_m",
+                    "seen_count", "first_seen", "last_seen", "active",
+                ])
+                for row in tracked:
+                    writer.writerow([
+                        row["ssid"], row["bssid"], row["vendor"], row["ch"], row["enc"],
+                        row["cur"], row["min"], row["avg"], row["max"],
+                        row["spread"], row["jitter_db"], row["est_dist_m"],
+                        row["seen_count"], row["first_seen"], row["last_seen"], row["active"],
+                    ])
+        else:
+            report_doc = {
+                "generated_at": datetime.now().isoformat(timespec="seconds"),
+                "scanner": {
+                    "online": snap["online"],
+                    "transport": snap["transport"],
+                    "scanner_ip": snap["scanner_ip"],
+                    "scan_count": snap["scan_count"],
+                    "last_scan_str": snap["last_scan_str"],
+                },
+                "summary": {
+                    "total_aps": snap["total"],
+                    "open_count": snap["open_count"],
+                    "best_rssi": snap["best_rssi"],
+                    "avg_rssi": snap["avg_rssi"],
+                    "free_ch": spec["best_channel"],
+                    "busiest_ch": spec["busiest_channel"],
+                    "recommendation": spec["recommendation"],
+                },
+                "spectrum": spec,
+                "audit": audit,
+                "diff": diff,
+                "ap_history": tracked,
+            }
+            with open(out_path, "w", encoding="utf-8") as f:
+                json.dump(report_doc, f, indent=2, ensure_ascii=False)
+
+        return out_path
+
     # ------------------------------------------------------ ingestao JSON
     def _ingest_packet(self, doc: dict, src_ip: str = "", transport: str = "UDP"):
         blk = doc.get("wrad_full") or doc.get("wrad")
@@ -381,6 +897,7 @@ class WiFiScannerCollector:
             if key in seen_bssid:
                 continue
             seen_bssid.add(key)
+            vendor = lookup_oui(bssid)
             networks.append({
                 "ssid": ssid_raw or "<OCULTA>",
                 "ssid_ascii": _ascii_clean(ssid_raw, 24),
@@ -388,9 +905,11 @@ class WiFiScannerCollector:
                 "rssi": rssi,
                 "bssid": bssid,
                 "oui": bssid[:8] if len(bssid) >= 8 else "",
+                "vendor": vendor,
                 "enc": enc,
                 "quality": rssi_to_quality_pct(rssi),
                 "label": rssi_to_label(rssi),
+                "est_dist_m": estimate_distance_m(rssi),
             })
 
         networks.sort(key=lambda x: x["rssi"], reverse=True)
@@ -416,11 +935,79 @@ class WiFiScannerCollector:
         now_m = time.monotonic()
         now_str = datetime.now().strftime("%H:%M:%S")
         cur_bssids = {n["bssid"] for n in networks if n["bssid"]}
+        cur_map = {(n["bssid"] or f"{n['ssid']}_{n['ch']}"): dict(n) for n in networks}
 
         first_online = False
         with self._lock:
             was_online = self._is_alive_locked()
             first_online = not was_online
+            if not self._baseline_bssids and cur_bssids:
+                self._baseline_bssids = set(cur_bssids)
+
+            if self._prev_scan_map:
+                prev_keys = set(self._prev_scan_map.keys())
+                cur_keys = set(cur_map.keys())
+                added_list = [dict(cur_map[k]) for k in sorted(cur_keys - prev_keys)]
+                removed_list = [dict(self._prev_scan_map[k]) for k in sorted(prev_keys - cur_keys)]
+                rssi_changes = []
+                for k in (cur_keys & prev_keys):
+                    prev_r = int(self._prev_scan_map[k].get("rssi", -100))
+                    cur_r = int(cur_map[k].get("rssi", -100))
+                    delta = cur_r - prev_r
+                    if delta != 0:
+                        rssi_changes.append({
+                            "bssid": cur_map[k].get("bssid", ""),
+                            "ssid": cur_map[k].get("ssid", "<OCULTA>"),
+                            "ch": cur_map[k].get("ch", 0),
+                            "prev_rssi": prev_r,
+                            "cur_rssi": cur_r,
+                            "delta": delta,
+                        })
+                rssi_changes.sort(key=lambda x: abs(x["delta"]), reverse=True)
+                self._last_diff = {
+                    "added": added_list,
+                    "removed": removed_list,
+                    "rssi_changes": rssi_changes,
+                    "ts": now_str,
+                }
+            if cur_map:
+                self._prev_scan_map = cur_map
+
+            for n in networks:
+                bkey = n["bssid"] or f"{n['ssid']}_CH{n['ch']}"
+                st = self._ap_stats.get(bkey)
+                if st is None:
+                    self._ap_stats[bkey] = {
+                        "bssid": n["bssid"],
+                        "ssid": n["ssid"],
+                        "ch": n["ch"],
+                        "enc": n["enc"],
+                        "vendor": n["vendor"],
+                        "first_seen": now_str,
+                        "last_seen": now_str,
+                        "seen_count": 1,
+                        "rssi_cur": n["rssi"],
+                        "rssi_min": n["rssi"],
+                        "rssi_max": n["rssi"],
+                        "rssi_samples": [n["rssi"]],
+                    }
+                else:
+                    if n["ssid"] and n["ssid"] != "<OCULTA>":
+                        st["ssid"] = n["ssid"]
+                    st["ch"] = n["ch"]
+                    st["enc"] = n["enc"]
+                    st["vendor"] = n["vendor"]
+                    st["last_seen"] = now_str
+                    st["seen_count"] = int(st.get("seen_count", 0)) + 1
+                    st["rssi_cur"] = n["rssi"]
+                    st["rssi_min"] = min(int(st.get("rssi_min", n["rssi"])), n["rssi"])
+                    st["rssi_max"] = max(int(st.get("rssi_max", n["rssi"])), n["rssi"])
+                    samples = list(st.get("rssi_samples", []))
+                    samples.append(n["rssi"])
+                    if len(samples) > 12:
+                        samples = samples[-12:]
+                    st["rssi_samples"] = samples
+
             new_cnt = len(cur_bssids - self._prev_bssids) if self._prev_bssids else 0
             if cur_bssids:
                 self._prev_bssids = cur_bssids

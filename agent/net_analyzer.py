@@ -18,6 +18,7 @@ import os
 import platform
 import re
 import socket
+import ssl
 import subprocess
 import threading
 import time
@@ -130,6 +131,272 @@ def ping_stats(host: str, count: int = 3) -> dict:
         "jitter_ms": jit_ms,
         "loss_pct": loss_pct,
     }
+
+
+def run_jitter_test(host: str = "1.1.1.1", count: int = 10) -> dict:
+    """
+    Executa teste de estabilidade ICMP (Jitter + Perda + Min/Med/Max) com multiplos pacotes
+    e classifica a saude da rota em EXCELENTE / BOM / INSTAVEL / OFFLINE.
+    """
+    clean_host = re.sub(r"[^a-zA-Z0-9.\-:]", "", (host or "1.1.1.1").strip()) or "1.1.1.1"
+    cnt = max(2, min(30, int(count or 10)))
+
+    if IS_WINDOWS:
+        cmd = ["ping", "-n", str(cnt), "-w", "1000", clean_host]
+    else:
+        cmd = ["ping", "-c", str(cnt), "-i", "0.18", "-W", "1", clean_host]
+
+    out = _run_cmd(cmd, timeout=max(4.5, cnt * 1.15))
+    if not out:
+        return {
+            "host": clean_host,
+            "sent": cnt,
+            "recv": 0,
+            "loss_pct": 100,
+            "min_ms": 0.0,
+            "avg_ms": 0.0,
+            "max_ms": 0.0,
+            "jitter_ms": 0.0,
+            "grade": "OFFLINE",
+        }
+
+    times = [float(x) for x in re.findall(r"(?:time|tempo)[=<]\s*([\d.]+)\s*ms", out, re.IGNORECASE)]
+    recv = len(times)
+    m_txrx = re.search(r"(\d+)\s+packets\s+transmitted,\s+(\d+)\s+(?:packets\s+)?received", out, re.IGNORECASE)
+    if m_txrx:
+        sent_parsed = int(m_txrx.group(1))
+        recv_parsed = int(m_txrx.group(2))
+        if sent_parsed > 0:
+            cnt = sent_parsed
+        if recv == 0 and recv_parsed > 0:
+            recv = recv_parsed
+
+    loss_pct = 100
+    m_loss = re.search(r"(\d+(?:\.\d+)?)%\s*(?:packet\s+loss|perda)", out, re.IGNORECASE)
+    if m_loss:
+        loss_pct = int(round(float(m_loss.group(1))))
+    elif cnt > 0:
+        loss_pct = max(0, min(100, int(round((cnt - recv) * 100.0 / float(cnt)))))
+
+    min_ms = avg_ms = max_ms = jit_ms = 0.0
+    m_rtt = re.search(r"=\s*([\d.]+)/([\d.]+)/([\d.]+)/([\d.]+)\s*ms", out, re.IGNORECASE)
+    if times:
+        min_ms = round(min(times), 1)
+        avg_ms = round(sum(times) / float(len(times)), 1)
+        max_ms = round(max(times), 1)
+        if len(times) > 1:
+            diffs = [abs(times[i] - times[i - 1]) for i in range(1, len(times))]
+            jit_ms = round(sum(diffs) / float(len(diffs)), 1)
+        elif m_rtt:
+            jit_ms = round(float(m_rtt.group(4)), 1)
+    elif m_rtt:
+        min_ms = round(float(m_rtt.group(1)), 1)
+        avg_ms = round(float(m_rtt.group(2)), 1)
+        max_ms = round(float(m_rtt.group(3)), 1)
+        jit_ms = round(float(m_rtt.group(4)), 1)
+
+    if recv == 0 or loss_pct >= 100:
+        grade = "OFFLINE"
+    elif loss_pct == 0 and jit_ms <= 5.0 and avg_ms <= 45.0:
+        grade = "EXCELENTE"
+    elif loss_pct <= 10 and jit_ms <= 18.0 and avg_ms <= 100.0:
+        grade = "BOM"
+    else:
+        grade = "INSTAVEL"
+
+    return {
+        "host": clean_host,
+        "sent": int(cnt),
+        "recv": int(recv),
+        "loss_pct": int(loss_pct),
+        "min_ms": min_ms,
+        "avg_ms": avg_ms,
+        "max_ms": max_ms,
+        "jitter_ms": jit_ms,
+        "grade": grade,
+    }
+
+
+def inspect_tls(host: str, port: int = 443) -> dict:
+    """
+    Inspeciona passivamente o certificado TLS/SSL de um servidor usando ssl + socket da stdlib.
+    Retorna subject_cn, issuer, days_left, tls_version, handshake_ms, ok, error.
+    """
+    raw_h = (host or "").strip()
+    raw_h = re.sub(r"^https?://", "", raw_h, flags=re.IGNORECASE)
+    raw_h = raw_h.split("/", 1)[0].strip()
+    p = int(port or 443)
+    if ":" in raw_h and not raw_h.startswith("["):
+        h_part, p_part = raw_h.rsplit(":", 1)
+        if p_part.isdigit():
+            raw_h = h_part
+            p = int(p_part)
+    clean_host = re.sub(r"[^a-zA-Z0-9.\-]", "", raw_h)
+    if not clean_host:
+        return {
+            "host": "",
+            "port": p,
+            "subject_cn": "",
+            "issuer": "",
+            "days_left": -1,
+            "tls_version": "",
+            "handshake_ms": 0.0,
+            "ok": False,
+            "error": "Host invalido",
+        }
+
+    ctx = ssl.create_default_context()
+    t0 = time.perf_counter()
+    try:
+        with socket.create_connection((clean_host, p), timeout=4.5) as sock:
+            with ctx.wrap_socket(sock, server_hostname=clean_host) as ssock:
+                hs_ms = round((time.perf_counter() - t0) * 1000.0, 1)
+                cert = ssock.getpeercert() or {}
+                tls_ver = str(ssock.version() or "TLS")
+
+        subject_cn = ""
+        for rdn in cert.get("subject", ()):
+            for k, v in rdn:
+                if k == "commonName" and v:
+                    subject_cn = str(v)
+                    break
+        if not subject_cn:
+            for k, v in cert.get("subjectAltName", ()):
+                if k.lower() == "dns" and v:
+                    subject_cn = str(v)
+                    break
+        if not subject_cn:
+            subject_cn = clean_host
+
+        issuer_org = ""
+        issuer_cn = ""
+        for rdn in cert.get("issuer", ()):
+            for k, v in rdn:
+                if k == "organizationName" and v and not issuer_org:
+                    issuer_org = str(v)
+                elif k == "commonName" and v and not issuer_cn:
+                    issuer_cn = str(v)
+        issuer = issuer_org or issuer_cn or "CA Desconhecida"
+
+        not_after = str(cert.get("notAfter", "") or "")
+        days_left = -1
+        if not_after:
+            try:
+                exp_ts = ssl.cert_time_to_seconds(not_after)
+                days_left = int((exp_ts - time.time()) // 86400)
+            except Exception:
+                pass
+
+        return {
+            "host": clean_host,
+            "port": p,
+            "subject_cn": subject_cn,
+            "issuer": issuer,
+            "not_after": not_after,
+            "days_left": days_left,
+            "tls_version": tls_ver,
+            "handshake_ms": hs_ms,
+            "ok": True,
+            "error": "",
+        }
+    except Exception as ex:
+        hs_ms = round((time.perf_counter() - t0) * 1000.0, 1)
+        return {
+            "host": clean_host,
+            "port": p,
+            "subject_cn": "",
+            "issuer": "",
+            "days_left": -1,
+            "tls_version": "",
+            "handshake_ms": hs_ms,
+            "ok": False,
+            "error": str(ex)[:64],
+        }
+
+
+def discover_path_mtu(host: str = "1.1.1.1") -> dict:
+    """
+    Descobre o Path MTU (Don't Fragment) testando payloads ICMP tipicos:
+      1472 -> MTU 1500 (Ethernet/DHCP)
+      1464 -> MTU 1492 (PPPoE Vivo Fibra)
+      1452 -> MTU 1480 (PPPoE/VLAN)
+      1400 -> MTU 1428 (Tunel/VPN)
+      1200 -> MTU 1228 (Link reduzido)
+    """
+    clean_host = re.sub(r"[^a-zA-Z0-9.\-:]", "", (host or "1.1.1.1").strip()) or "1.1.1.1"
+    candidates = [
+        (1472, 1500, "1500 (Ethernet/DHCP)"),
+        (1464, 1492, "1492 (PPPoE Vivo Fibra)"),
+        (1452, 1480, "1480 (PPPoE/VLAN)"),
+        (1400, 1428, "1428 (Tunel/VPN)"),
+        (1200, 1228, "1228 (MTU Reduzido)"),
+    ]
+
+    def _probe_df(payload_sz: int) -> bool:
+        if IS_WINDOWS:
+            cmd = ["ping", "-n", "1", "-w", "1000", "-f", "-l", str(payload_sz), clean_host]
+        else:
+            cmd = ["ping", "-c", "1", "-W", "1", "-M", "do", "-s", str(payload_sz), clean_host]
+        try:
+            cflags = getattr(subprocess, "CREATE_NO_WINDOW", 0) if IS_WINDOWS else 0
+            res = subprocess.run(
+                cmd,
+                capture_output=True,
+                text=True,
+                timeout=2.2,
+                encoding="utf-8",
+                errors="ignore",
+                creationflags=cflags,
+            )
+            out_l = ((res.stdout or "") + "\n" + (res.stderr or "")).lower()
+            if "frag needed" in out_l or "message too long" in out_l or "packet needs to be fragmented" in out_l:
+                return False
+            return res.returncode == 0 and ("ttl=" in out_l or "1 received" in out_l or "recebidos = 1" in out_l)
+        except Exception:
+            return False
+
+    for payload_sz, mtu_val, diag_lbl in candidates:
+        if _probe_df(payload_sz):
+            return {
+                "host": clean_host,
+                "mtu": mtu_val,
+                "payload": payload_sz,
+                "diagnosis": diag_lbl,
+                "ok": True,
+            }
+
+    return {
+        "host": clean_host,
+        "mtu": 0,
+        "payload": 0,
+        "diagnosis": "Indisponivel (ICMP bloqueado/offline)",
+        "ok": False,
+    }
+
+
+def get_route_table() -> list[str]:
+    """Retorna linhas limpas da tabela de rotas IPv4 do kernel (ip -4 route show)."""
+    lines: list[str] = []
+    if IS_LINUX:
+        out = _run_cmd(["ip", "-4", "route", "show"], timeout=2.0)
+        for raw_ln in out.splitlines():
+            s = re.sub(r"\s+", " ", raw_ln).strip()
+            if not s:
+                continue
+            # Mantem os campos principais (destino, via/dev, src) de forma enxuta
+            s_short = re.sub(r"\bproto\s+\S+\s*", "", s)
+            s_short = re.sub(r"\bscope\s+\S+\s*", "", s_short)
+            s_short = re.sub(r"\bmetric\s+\d+\s*", "", s_short)
+            s_short = re.sub(r"\blinkdown\b", "", s_short)
+            s_short = re.sub(r"\s+", " ", s_short).strip()
+            lines.append(s_short)
+    else:
+        out = _run_cmd(["route", "print", "-4"], timeout=2.5)
+        for raw_ln in out.splitlines():
+            s = re.sub(r"\s+", " ", raw_ln).strip()
+            if re.match(r"^\d+\.\d+\.\d+\.\d+\s+", s):
+                lines.append(s)
+    return lines
 
 
 def check_router_http(gw_ip: str) -> tuple[int, str]:

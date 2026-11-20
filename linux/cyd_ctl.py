@@ -14,10 +14,15 @@ Exemplos:
   cyd lan                 # Lista dispositivos ativos na LAN (tabela ARP local)
   cyd speed               # Dispara Speedtest Fibra na Tela 13 e exibe o resultado
   cyd radar [--scan]      # Mostra redes detectadas pela ESP32-WROOM-32U
+  cyd rf [acao]           # Analise RF no Terminal CYD (scan|spectrum|audit|diff|status|export|track <alvo>)
+  cyd diag                # Executa bateria completa netcheck (GW + Jitter + WAN + DNS + LAN + 32U)
+  cyd jitter [alvo]       # Teste de estabilidade ICMP / jitter (padrao 1.1.1.1 ou gw)
+  cyd mtu [alvo]          # Descoberta de Path MTU (PPPoE 1492 vs Ethernet 1500)
+  cyd tls <host>          # Inspecao passiva de certificado TLS/SSL (:443)
   cyd plan 700            # Define plano de internet contratado (ex: 700 Mbps Vivo Fibra)
   cyd brt 200             # Ajusta brilho PWM (0..255)
   cyd color "#00FFFF"     # Altera cor tema em tempo real
-  cyd cmd "ping 1.1.1.1"  # Envia comando para o Terminal CYD (Tela 11)
+  cyd cmd "rf spectrum"   # Executa comando no Terminal CYD (Tela 11) e imprime a saida no Linux
 """
 
 import argparse
@@ -222,9 +227,52 @@ def cmd_speed(args):
     print("Speedtest ainda em andamento (confira na Tela 13 da CYD).")
 
 
+def run_term_cmd(cmd_str: str, timeout: float = 15.0):
+    """Envia comando ao Terminal CYD (Tela 11) com wait=True e imprime as linhas retornadas."""
+    st_before = None
+    try:
+        res = api_post("/api/terminal", {"cmd": cmd_str, "wait": True}, timeout=timeout)
+    except Exception:
+        res = api_post("/api/terminal", {"cmd": cmd_str}, timeout=timeout)
+
+    out_lines = res.get("output")
+    if isinstance(out_lines, list) and out_lines:
+        for ln in out_lines:
+            print(ln)
+        return
+
+    # Fallback para daemons que ainda nao retornam "output" sincrono no POST /api/terminal
+    seq_before = res.get("lines_before", res.get("seq"))
+    t0 = time.time()
+    while time.time() - t0 < 8.0:
+        time.sleep(0.35)
+        st_before = api_get("/api/status")
+        term = st_before.get("terminal", {})
+        if not term.get("busy", False):
+            break
+    if st_before is None:
+        st_before = api_get("/api/status")
+    all_lines = st_before.get("terminal", {}).get("lines", [])
+    if isinstance(seq_before, int) and 0 <= seq_before < len(all_lines):
+        sliced = all_lines[seq_before:]
+    else:
+        marker = f"$ {cmd_str}".strip()
+        idx = -1
+        for i in range(len(all_lines) - 1, -1, -1):
+            if all_lines[i].strip() == marker:
+                idx = i
+                break
+        sliced = all_lines[idx:] if idx >= 0 else all_lines[-12:]
+    if sliced:
+        for ln in sliced:
+            print(ln)
+    else:
+        print(f"Comando enviado ao Terminal CYD: {cmd_str}")
+
+
 def main():
-    # Atalho super pratico: `cyd 12` ou `cyd 13`
-    if len(sys.argv) == 2 and (sys.argv[1].isdigit() or sys.argv[1].lower() in ("next", "prev", "list", "status", "lan")):
+    # Atalho super pratico: `cyd 12`, `cyd 13`, `cyd diag`
+    if len(sys.argv) == 2 and (sys.argv[1].isdigit() or sys.argv[1].lower() in ("next", "prev", "list", "status", "lan", "diag")):
         tok = sys.argv[1].lower()
         if tok.isdigit():
             cmd_screen(tok)
@@ -235,8 +283,11 @@ def main():
         if tok == "prev":
             cmd_step(-1)
             return
+        if tok == "diag":
+            run_term_cmd("netcheck")
+            return
 
-    ap = argparse.ArgumentParser(prog="cyd", description="CLI Linux do CYD Cyber Deck (troca de telas, Radar Wi-Fi e Analise de Rede)")
+    ap = argparse.ArgumentParser(prog="cyd", description="CLI Linux do CYD Cyber Deck (troca de telas, Radar Wi-Fi RF, Terminal e Analise de Rede)")
     sub = ap.add_subparsers(dest="command")
 
     p_scr = sub.add_parser("screen", aliases=["s"], help="Muda a tela da CYD (numero 0..13 ou apelido)")
@@ -249,6 +300,20 @@ def main():
 
     p_rad = sub.add_parser("radar", help="Mostra redes do Radar Wi-Fi (ESP32-WROOM-32U)")
     p_rad.add_argument("--scan", action="store_true", help="Dispara nova varredura antes de exibir")
+
+    p_rf = sub.add_parser("rf", help="Comandos de inteligencia RF no Terminal CYD (scan, spectrum, audit, diff, status, export, track)")
+    p_rf.add_argument("args", nargs="*", help="Subcomando RF (ex: scan, spectrum, audit, diff, status, export, track <filtro>)")
+
+    sub.add_parser("diag", aliases=["netcheck"], help="Executa bateria completa de diagnostico (GW + Jitter + WAN + DNS + LAN + 32U)")
+
+    p_jit = sub.add_parser("jitter", help="Mede estabilidade ICMP e jitter (padrao 1.1.1.1 ou gw)")
+    p_jit.add_argument("target", nargs="?", default="1.1.1.1", help="Host ou IP alvo (use 'gw' para testar o roteador)")
+
+    p_mtu = sub.add_parser("mtu", help="Descobre o Path MTU (Don't Fragment) da rota")
+    p_mtu.add_argument("target", nargs="?", default="1.1.1.1", help="Host ou IP alvo (padrao: 1.1.1.1)")
+
+    p_tls = sub.add_parser("tls", aliases=["ssl"], help="Inspeciona certificado TLS/SSL de um dominio (:443)")
+    p_tls.add_argument("host", help="Dominio ou host:porta (ex: github.com)")
 
     p_rt = sub.add_parser("router", aliases=["gw"], help="Diagnostico do roteador/gateway")
     p_rt.add_argument("--open", action="store_true", help="Abre a pagina de admin do roteador no navegador")
@@ -267,7 +332,7 @@ def main():
     p_col = sub.add_parser("color", help="Altera cor tema da CYD (ex: #00FFFF)")
     p_col.add_argument("hex_color")
 
-    p_cmd = sub.add_parser("cmd", help="Executa comando no Terminal CYD (Tela 11)")
+    p_cmd = sub.add_parser("cmd", help="Executa comando no Terminal CYD (Tela 11) e exibe a saida")
     p_cmd.add_argument("text", nargs="+")
 
     args = ap.parse_args()
@@ -285,6 +350,17 @@ def main():
         cmd_status(args)
     elif c == "radar":
         cmd_radar(args)
+    elif c == "rf":
+        sub_rf = " ".join(args.args).strip() if args.args else "status"
+        run_term_cmd(f"rf {sub_rf}".strip())
+    elif c in ("diag", "netcheck"):
+        run_term_cmd("netcheck")
+    elif c == "jitter":
+        run_term_cmd(f"jitter {args.target}".strip())
+    elif c == "mtu":
+        run_term_cmd(f"mtu {args.target}".strip())
+    elif c in ("tls", "ssl"):
+        run_term_cmd(f"tls {args.host}".strip())
     elif c in ("router", "gw"):
         cmd_router(args)
     elif c in ("lan", "arp"):
@@ -303,8 +379,7 @@ def main():
         print(f"Cor CYD ajustada para {args.hex_color}.")
     elif c == "cmd":
         txt = " ".join(args.text)
-        api_post("/api/terminal", {"cmd": txt})
-        print(f"Comando enviado ao Terminal CYD: {txt}")
+        run_term_cmd(txt)
     else:
         ap.print_help()
 

@@ -905,16 +905,20 @@ HTML_MOBILE_APP = r"""<!DOCTYPE html>
         <button class="btn btn-secondary" onclick="newsAction('refresh')" style="font-size:11px;">🔄 Atualizar RSS</button>
       </div>
 
-      <div style="background:#030508; border:1px solid #15803D; border-radius:8px; padding:8px; font-family:monospace; font-size:10.5px; color:#22C55E; max-height:130px; overflow-y:auto; white-space:pre-wrap; margin-bottom:8px;" id="mTermBox">CYD CYBER DECK TERMINAL v4.0 READY</div>
+      <div style="background:#030508; border:1px solid #15803D; border-radius:8px; padding:8px; font-family:monospace; font-size:10.5px; color:#22C55E; max-height:130px; overflow-y:auto; white-space:pre-wrap; margin-bottom:8px;" id="mTermBox">CYD CYBER DECK TERMINAL v4.6 READY</div>
       <div style="display:flex; gap:6px; margin-bottom:8px;">
-        <input type="text" id="mTermInput" placeholder="ping 8.8.8.8 | fetch github.com | wifi scan" style="flex:1; background:#030508; color:#22C55E; border:1px solid #22C55E; border-radius:8px; padding:9px; font-family:monospace; font-size:12px; outline:none;">
+        <input type="text" id="mTermInput" placeholder="rf spectrum | rf audit | netcheck | jitter | mtu" style="flex:1; background:#030508; color:#22C55E; border:1px solid #22C55E; border-radius:8px; padding:9px; font-family:monospace; font-size:12px; outline:none;">
         <button class="btn" onclick="sendTermCmd()" style="flex:0 0 auto; padding:9px 14px;">▶ Run</button>
       </div>
       <div class="brt-presets">
-        <div class="brt-btn" onclick="sendTermCmd('wifi scan')" style="color:#38BDF8;">📡 wifi scan</div>
+        <div class="brt-btn" onclick="sendTermCmd('rf scan')" style="color:#38BDF8;">📡 rf scan</div>
+        <div class="brt-btn" onclick="sendTermCmd('rf spectrum')" style="color:#22C55E;">📊 rf spectrum</div>
+        <div class="brt-btn" onclick="sendTermCmd('rf audit')" style="color:#FACC15;">🛡️ rf audit</div>
+        <div class="brt-btn" onclick="sendTermCmd('netcheck')" style="color:#38BDF8;">🩺 netcheck</div>
+        <div class="brt-btn" onclick="sendTermCmd('jitter')" style="color:#4ADE80;">📈 jitter</div>
+        <div class="brt-btn" onclick="sendTermCmd('mtu')" style="color:#A855F7;">📏 mtu</div>
+        <div class="brt-btn" onclick="sendTermCmd('wifi scan')" style="color:#38BDF8;">📶 wifi scan</div>
         <div class="brt-btn" onclick="sendTermCmd('ping 8.8.8.8')" style="color:#22C55E;">⚡ ping 8.8.8.8</div>
-        <div class="brt-btn" onclick="sendTermCmd('fetch https://api.github.com')" style="color:#A855F7;">🌐 fetch api</div>
-        <div class="brt-btn" onclick="sendTermCmd('docker ps')" style="color:#F59E0B;">🐳 docker ps</div>
       </div>
     </div>
   </div>
