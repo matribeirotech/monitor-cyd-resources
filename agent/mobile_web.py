@@ -905,21 +905,38 @@ HTML_MOBILE_APP = r"""<!DOCTYPE html>
         <button class="btn btn-secondary" onclick="newsAction('refresh')" style="font-size:11px;">🔄 Atualizar RSS</button>
       </div>
 
-      <div style="background:#030508; border:1px solid #15803D; border-radius:8px; padding:8px; font-family:monospace; font-size:10.5px; color:#22C55E; max-height:130px; overflow-y:auto; white-space:pre-wrap; margin-bottom:8px;" id="mTermBox">CYD CYBER DECK TERMINAL v4.6 READY</div>
+      <div style="background:#030508; border:1px solid #15803D; border-radius:8px; padding:8px; font-family:monospace; font-size:10.5px; color:#22C55E; max-height:130px; overflow-y:auto; white-space:pre-wrap; margin-bottom:8px;" id="mTermBox">CYD CYBER DECK TERMINAL v4.7 READY</div>
       <div style="display:flex; gap:6px; margin-bottom:8px;">
-        <input type="text" id="mTermInput" placeholder="rf spectrum | rf audit | netcheck | jitter | mtu" style="flex:1; background:#030508; color:#22C55E; border:1px solid #22C55E; border-radius:8px; padding:9px; font-family:monospace; font-size:12px; outline:none;">
+        <input type="text" id="mTermInput" placeholder="ai report | ai rf | rf spectrum | netcheck | mtu" style="flex:1; background:#030508; color:#22C55E; border:1px solid #22C55E; border-radius:8px; padding:9px; font-family:monospace; font-size:12px; outline:none;">
         <button class="btn" onclick="sendTermCmd()" style="flex:0 0 auto; padding:9px 14px;">▶ Run</button>
       </div>
       <div class="brt-presets">
+        <div class="brt-btn" onclick="sendTermCmd('ai report')" style="color:#C084FC;">🤖 ai report</div>
+        <div class="brt-btn" onclick="sendTermCmd('ai rf')" style="color:#E879F9;">🧠 ai rf</div>
         <div class="brt-btn" onclick="sendTermCmd('rf scan')" style="color:#38BDF8;">📡 rf scan</div>
         <div class="brt-btn" onclick="sendTermCmd('rf spectrum')" style="color:#22C55E;">📊 rf spectrum</div>
         <div class="brt-btn" onclick="sendTermCmd('rf audit')" style="color:#FACC15;">🛡️ rf audit</div>
         <div class="brt-btn" onclick="sendTermCmd('netcheck')" style="color:#38BDF8;">🩺 netcheck</div>
         <div class="brt-btn" onclick="sendTermCmd('jitter')" style="color:#4ADE80;">📈 jitter</div>
         <div class="brt-btn" onclick="sendTermCmd('mtu')" style="color:#A855F7;">📏 mtu</div>
-        <div class="brt-btn" onclick="sendTermCmd('wifi scan')" style="color:#38BDF8;">📶 wifi scan</div>
-        <div class="brt-btn" onclick="sendTermCmd('ping 8.8.8.8')" style="color:#22C55E;">⚡ ping 8.8.8.8</div>
       </div>
+    </div>
+
+    <div class="sec-header">
+      <div class="sec-title">🤖 AGENTE IA (GEMINI + IA LOCAL)</div>
+      <span style="font-size:10px; font-family:monospace; color:#C084FC;" id="mAiBadge">AUTO</span>
+    </div>
+    <div class="action-card">
+      <div style="font-size:11px; color:#C084FC; font-family:monospace; margin-bottom:8px;" id="mAiStatus">Carregando status do Agente IA...</div>
+      <div class="btn-row" style="margin-bottom:8px;">
+        <button class="btn" onclick="aiAction('report')" style="font-size:11px;">🧠 Relatório Completo</button>
+        <button class="btn btn-secondary" onclick="aiAction('rf')" style="font-size:11px;">📡 Analisar RF</button>
+      </div>
+      <div style="display:flex; gap:6px; margin-bottom:8px;">
+        <input type="text" id="mAiQuestion" placeholder="Pergunte sobre sua rede ou espectro RF..." style="flex:1; background:#030508; color:#E2E8F0; border:1px solid #6B21A8; border-radius:8px; padding:8px; font-size:12px; outline:none;">
+        <button class="btn btn-secondary" onclick="aiAction('ask')" style="flex:0 0 auto; padding:8px 12px;">💬</button>
+      </div>
+      <div style="background:#05070B; border:1px solid #2E1065; border-radius:8px; padding:8px; font-family:monospace; font-size:10.5px; color:#E2E8F0; max-height:170px; overflow-y:auto; white-space:pre-wrap;" id="mAiOutput">Clique em Relatório Completo ou Analisar RF para gerar uma análise inteligente com Gemini / Ollama Local.</div>
     </div>
   </div>
 
@@ -1442,6 +1459,35 @@ HTML_MOBILE_APP = r"""<!DOCTYPE html>
       }
     }
 
+    async function aiAction(mode) {
+      vibrate(20);
+      const outEl = document.getElementById("mAiOutput");
+      const qEl = document.getElementById("mAiQuestion");
+      const question = qEl ? qEl.value.trim() : "";
+      if (mode === "ask" && !question) {
+        showToast("Digite uma pergunta para o Agente IA", "⚠️");
+        return;
+      }
+      if (outEl) outEl.innerText = "⏳ Agente IA analisando telemetria da rede e RF...";
+      showToast("Agente IA gerando análise (" + mode + ")...", "🤖");
+      try {
+        const resp = await fetch("/api/ai", {
+          method: "POST",
+          headers: {"Content-Type": "application/json"},
+          body: JSON.stringify({action: mode, question: question, push_cyd: true})
+        });
+        const res = await resp.json();
+        if (res.ok) {
+          if (outEl) outEl.innerText = res.markdown || (res.cyd_lines || []).join("\n");
+          showToast(`IA (${res.provider_used}/${res.model_used}) concluída em ${res.elapsed_s}s`, "🤖");
+        } else {
+          if (outEl) outEl.innerText = "Erro: " + (res.error || "Falha na IA");
+        }
+      } catch (err) {
+        if (outEl) outEl.innerText = "Erro de conexão com /api/ai";
+      }
+    }
+
     async function togglePower(kind) {
       vibrate(15);
       const payload = {};
@@ -1836,6 +1882,23 @@ HTML_MOBILE_APP = r"""<!DOCTYPE html>
         }
         if (sc13) {
           sc13.innerText = `GW ${Number(na.gw_ms||0).toFixed(1)}ms • WAN ${Number(na.wan_ms||0).toFixed(0)}ms • ${na.lan_count || 0} hosts`;
+        }
+      }
+
+      // Agente IA (Gemini + Local)
+      if (data.ai) {
+        const ai = data.ai;
+        const bEl = document.getElementById("mAiBadge");
+        const sEl = document.getElementById("mAiStatus");
+        const oEl = document.getElementById("mAiOutput");
+        if (bEl) bEl.innerText = String(ai.ai_provider || "auto").toUpperCase();
+        if (sEl) {
+          const gTxt = ai.gemini_key_set ? `Gemini OK (${ai.gemini_model})` : "Gemini sem chave";
+          const lTxt = ai.local_online ? `Local ON (${ai.active_local_model || "ollama"})` : "Local OFF";
+          sEl.innerText = `${ai.busy ? "⏳ Processando... • " : ""}${gTxt} • ${lTxt}`;
+        }
+        if (oEl && ai.last_markdown_preview && oEl.innerText.startsWith("Clique em Relatório")) {
+          oEl.innerText = ai.last_markdown_preview;
         }
       }
 

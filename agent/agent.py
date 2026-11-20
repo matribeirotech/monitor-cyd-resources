@@ -75,6 +75,14 @@ except ImportError:
     except Exception:
         import agent.net_analyzer as net_analyzer
 
+try:
+    import ai_analyst
+except ImportError:
+    try:
+        from . import ai_analyst
+    except Exception:
+        import agent.ai_analyst as ai_analyst
+
 IS_WINDOWS = platform.system() == "Windows"
 IS_LINUX = platform.system() == "Linux"
 if sys.stdout is None:
@@ -2057,8 +2065,11 @@ def load_ui_config():
         "news_topics": list(DEFAULT_NEWS_TOPICS),
         "news_api_key": os.environ.get("NEWS_API_KEY", ""),
         "news_rotate_sec": 15,
+        "ai_provider": "auto",
         "gemini_api_key": os.environ.get("GEMINI_API_KEY", ""),
-        "gemini_model": "gemini-3.8-flash",
+        "gemini_model": "gemini-2.5-flash",
+        "local_ai_url": "http://127.0.0.1:11434",
+        "local_ai_model": "",
         "gems": [dict(g) for g in DEFAULT_GEMS],
         "active_gem_id": "gem_embedded",
         "gem_auto_rotate": True,
@@ -4001,16 +4012,17 @@ class CyberDeckTerminalEngine:
     TERM_COLS = 48
     TERM_ROWS = 14
 
-    def __init__(self, max_history: int = 150, collector=None, wifi_scan_col=None, net_col=None):
+    def __init__(self, max_history: int = 150, collector=None, wifi_scan_col=None, net_col=None, ai_eng=None):
         self._lock = threading.Lock()
         self.max_history = max_history
         self.collector = collector
         self.wifi_scan_col = wifi_scan_col
         self.net_col = net_col
+        self.ai_eng = ai_eng
         self._lines: list[str] = [
             "================================================",
-            " CYD CYBER DECK TERMINAL v4.6 [115200 bps READY]",
-            " Digite 'help' (ou help rf / net / sys / esp)",
+            " CYD CYBER DECK TERMINAL v4.7 [RF + IA HIBRIDA]",
+            " Digite 'help' (rf | net | ai | sys | esp)",
             "================================================",
         ]
         self._cmd_history: list[str] = []
@@ -4056,8 +4068,8 @@ class CyberDeckTerminalEngine:
     def clear(self, dispatch_fn=None):
         with self._lock:
             self._lines = [
-                "CYD CYBER DECK OS v4.6 - Terminal limpo.",
-                "Digite 'help' (help rf | net | sys | esp).",
+                "CYD CYBER DECK OS v4.7 - Terminal limpo.",
+                "Digite 'help' (rf | net | ai | sys | esp).",
             ]
             self._last_cmd = "clear"
             self._total_seq += 2
@@ -4238,19 +4250,30 @@ class CyberDeckTerminalEngine:
                             "cmatrix         : Chuva Matrix Rain na Tela 11",
                             "clear           : Limpa buffer do terminal",
                         ])
+                    elif cat in ("ai", "ia", "gemini", "ollama"):
+                        _send_cyd_lines([
+                            "=== [HELP AI] AGENTE IA (GEMINI + LOCAL) ===",
+                            "ai status       : Status Gemini + IA Local",
+                            "ai models       : Lista modelos Ollama/Local",
+                            "ai provider <p> : Alterna auto | gemini | local",
+                            "ai report [p]   : Relatorio completo rede + RF",
+                            "ai rf [p]       : Analise espectro 2.4GHz 32U",
+                            "ai ask <perg.>  : Pergunta sobre a rede atual",
+                            "Obs: Relatorios .md salvos em reports/",
+                        ])
                     else:
                         _send_cyd_lines([
-                            "=== CYD TERMINAL v4.6 (14x48 DEFENSIVO/RF) ===",
+                            "=== CYD TERMINAL v4.7 (RF + REDE + IA) ===",
                             "Categorias (digite para detalhar):",
                             "  help rf  : Radar 2.4GHz, Espectro, OUI, Audit",
                             "  help net : Diag, Jitter, MTU, TLS, Rota, LAN",
+                            "  help ai  : Agente Gemini + IA Local (Ollama)",
                             "  help sys : Hardware PC, Disco, RAM, Docker",
                             "  help esp : Comandos nativos da placa CYD",
                             "Atalhos rapidos:",
-                            "  rf scan  | rf spectrum | rf audit | rf track",
-                            "  netcheck | jitter      | mtu      | tls <dom>",
-                            "  router   | lan         | route    | oui <mac>",
-                            "  neofetch | history     | clear",
+                            "  ai report | ai rf    | ai status  | ai models",
+                            "  rf scan   | rf audit | netcheck   | jitter",
+                            "  mtu       | tls <d>  | router     | clear",
                         ])
 
                 # ================================== HISTORY ===============================
@@ -5044,10 +5067,79 @@ class CyberDeckTerminalEngine:
                     else:
                         _send_cyd_lines(["[ERR] Falha no teste de velocidade."])
 
+                # ================================== AGENTE IA (GEMINI + LOCAL) ============
+                elif verb in ("ai", "ia", "gemini"):
+                    if self.ai_eng is None:
+                        _send_cyd_lines(["[ERR] Modulo ai_analyst nao inicializado."])
+                    else:
+                        sub_ai = (parts[1].lower() if len(parts) > 1 else "status").strip()
+                        rest_ai = " ".join(parts[2:]).strip() if len(parts) > 2 else ""
+                        if sub_ai in ("status", "st", "info"):
+                            st_ai = self.ai_eng.get_status_snapshot(probe_local=True)
+                            g_ok = "PRONTO" if st_ai.get("gemini_key_set") else "SEM CHAVE"
+                            l_ok = "ONLINE" if st_ai.get("local_online") else "OFFLINE"
+                            l_mod = st_ai.get("active_local_model") or "--"
+                            lines_ai = [
+                                f"[OK] AGENTE IA | Modo: {st_ai.get('ai_provider','auto').upper()}",
+                                f"Gemini: {g_ok} ({st_ai.get('gemini_model','')[:22]})",
+                                f"Local : {l_ok} [{st_ai.get('local_kind','ollama')}] {l_mod[:18]}",
+                                f"URL   : {st_ai.get('local_ai_url','')[:38]}",
+                                f"Models: {len(st_ai.get('local_models', []))} local(is) detectados",
+                            ]
+                            if st_ai.get("last_report_path"):
+                                lines_ai.append(f"Ultimo: {os.path.basename(st_ai['last_report_path'])[:38]}")
+                            _send_cyd_lines(lines_ai)
+                        elif sub_ai in ("models", "modelos", "list"):
+                            online_l, mods_l, kind_l = self.ai_eng.list_local_models(timeout=2.5, force=True)
+                            pub_ai = self.ai_eng.get_config_public()
+                            lines_m = [
+                                f"[OK] Gemini: {pub_ai.get('gemini_model','')} ({'OK' if pub_ai.get('gemini_key_set') else 'NO KEY'})",
+                                f"[{'OK' if online_l else 'WARN'}] Local ({kind_l}): {len(mods_l)} modelo(s)",
+                            ]
+                            for m_name in mods_l[:7]:
+                                lines_m.append(f" - {m_name[:43]}")
+                            if not mods_l:
+                                lines_m.append("Nenhum modelo local detectado.")
+                            _send_cyd_lines(lines_m)
+                        elif sub_ai in ("provider", "modo", "mode"):
+                            if rest_ai.lower() in ("auto", "gemini", "local", "ollama"):
+                                pub_new = self.ai_eng.configure(ai_provider=rest_ai.lower(), persist=True)
+                                _send_cyd_lines([f"[OK] Provedor IA ajustado: {pub_new['ai_provider'].upper()}"])
+                            else:
+                                _send_cyd_lines(["[WARN] Uso: ai provider auto|gemini|local"])
+                        elif sub_ai in ("report", "relatorio", "diag", "full", "rf", "spectrum"):
+                            mode_req = "rf" if sub_ai in ("rf", "spectrum") else "full"
+                            prov_override = rest_ai.lower() if rest_ai.lower() in ("auto", "gemini", "local") else None
+                            _send_cyd_lines([f"[WIFI] IA analisando {'espectro RF' if mode_req == 'rf' else 'rede completa'}..."])
+                            res_ai = self.ai_eng.generate_report(mode=mode_req, provider=prov_override, save_file=True)
+                            if res_ai.get("ok"):
+                                _send_cyd_lines(res_ai.get("cyd_lines", ["[OK] Relatorio IA gerado."]))
+                            else:
+                                _send_cyd_lines([f"[ERR] IA: {str(res_ai.get('error','falha'))[:40]}"])
+                        elif sub_ai in ("ask", "perguntar", "q"):
+                            if not rest_ai:
+                                _send_cyd_lines(["[WARN] Uso: ai ask <sua pergunta sobre a rede>"])
+                            else:
+                                _send_cyd_lines(["[WIFI] Consultando Agente IA sobre a rede..."])
+                                res_ai = self.ai_eng.generate_report(mode="ask", question=rest_ai, save_file=False)
+                                if res_ai.get("ok"):
+                                    _send_cyd_lines(res_ai.get("cyd_lines", ["[OK] Resposta IA recebida."]))
+                                else:
+                                    _send_cyd_lines([f"[ERR] IA: {str(res_ai.get('error','falha'))[:40]}"])
+                        else:
+                            # Permite `ai <pergunta direta>` como atalho para `ai ask`
+                            q_direct = " ".join(parts[1:]).strip()
+                            _send_cyd_lines(["[WIFI] Consultando Agente IA..."])
+                            res_ai = self.ai_eng.generate_report(mode="ask", question=q_direct, save_file=False)
+                            if res_ai.get("ok"):
+                                _send_cyd_lines(res_ai.get("cyd_lines", ["[OK] Resposta IA recebida."]))
+                            else:
+                                _send_cyd_lines([f"[ERR] IA: {str(res_ai.get('error','falha'))[:40]}"])
+
                 else:
                     _send_cyd_lines([
                         f"[ERR] Comando desconhecido: '{verb[:22]}'",
-                        "Digite 'help' (help rf | net | sys | esp).",
+                        "Digite 'help' (rf | net | ai | sys | esp).",
                     ])
 
                 if log_fn:
@@ -5076,11 +5168,12 @@ def launch_flet_gui(
     term_eng: CyberDeckTerminalEngine = None,
     wifi_scan_col: wifi_scanner.WiFiScannerCollector = None,
     net_col: net_analyzer.NetworkAnalyzerCollector = None,
+    ai_eng: ai_analyst.NetworkAIAnalyst = None,
 ):
     import flet as ft
 
     if term_eng is None:
-        term_eng = CyberDeckTerminalEngine(collector=col, wifi_scan_col=wifi_scan_col, net_col=net_col)
+        term_eng = CyberDeckTerminalEngine(collector=col, wifi_scan_col=wifi_scan_col, net_col=net_col, ai_eng=ai_eng)
     else:
         if term_eng.collector is None:
             term_eng.collector = col
@@ -5088,6 +5181,8 @@ def launch_flet_gui(
             term_eng.wifi_scan_col = wifi_scan_col
         if term_eng.net_col is None:
             term_eng.net_col = net_col
+        if term_eng.ai_eng is None and ai_eng is not None:
+            term_eng.ai_eng = ai_eng
 
     # Helpers compativeis entre Flet 0.2x e Flet 1.0+
     _ICONS = getattr(ft, "Icons", getattr(ft, "icons", None))
@@ -8237,6 +8332,9 @@ def launch_flet_gui(
                     ),
                     ft.Row(
                         [
+                            make_cmd_chip("🤖 ai report", "ai report", "#C084FC"),
+                            make_cmd_chip("🧠 ai rf", "ai rf", "#E879F9"),
+                            make_cmd_chip("⚙️ ai status", "ai status", "#A855F7"),
                             make_cmd_chip("📡 rf scan", "rf scan", "#38BDF8"),
                             make_cmd_chip("📊 rf spectrum", "rf spectrum", "#22C55E"),
                             make_cmd_chip("🛡️ rf audit", "rf audit", "#FACC15"),
@@ -8708,6 +8806,108 @@ def launch_flet_gui(
             padding=14,
         )
 
+        # ---------------- 14. AGENTE IA DE REDES (GEMINI + IA LOCAL) ----------
+        lbl_ai_status = ft.Text(
+            "🤖 Agente IA: inicializando...",
+            size=11,
+            weight=ft.FontWeight.BOLD,
+            color="#C084FC",
+            font_family="Consolas",
+        )
+        txt_ai_question = ft.TextField(
+            hint_text="Pergunte ao Agente IA sobre sua rede/RF (ex: qual melhor canal 2.4GHz agora?)",
+            expand=True,
+            text_size=12,
+            color="#E2E8F0",
+            bgcolor="#05070B",
+            border_color="#2E1065",
+            focused_border_color="#C084FC",
+        )
+        txt_ai_output = ft.Text(
+            value="Clique em 'Relatório Completo' ou 'Analisar RF' para gerar diagnóstico inteligente via Gemini ou IA Local (Ollama).",
+            size=11,
+            color="#CBD5E1",
+            font_family="Consolas",
+            selectable=True,
+        )
+
+        def refresh_ai_ui():
+            if ai_eng is None:
+                return
+            st_a = ai_eng.get_status_snapshot(probe_local=False)
+            g_s = f"Gemini:{'ON' if st_a.get('gemini_key_set') else 'NO-KEY'} ({st_a.get('gemini_model','')})"
+            l_s = f"Local:{'ON' if st_a.get('local_online') else 'OFF'} ({st_a.get('active_local_model') or '--'})"
+            lbl_ai_status.value = f"🤖 Modo: {st_a.get('ai_provider','auto').upper()} • {g_s} • {l_s}"
+            if st_a.get("last_markdown_preview"):
+                txt_ai_output.value = st_a["last_markdown_preview"]
+
+        def _run_ai_gui(mode_req: str, question_s: str = ""):
+            if ai_eng is None:
+                return
+            lbl_ai_status.value = f"⏳ Agente IA processando análise ({mode_req})..."
+            safe_update(lbl_ai_status)
+
+            def _bg():
+                res = ai_eng.generate_report(mode=mode_req, question=question_s, save_file=(mode_req != "ask"))
+                if res.get("ok"):
+                    cyd_lns = res.get("cyd_lines", [])
+                    if cyd_lns:
+                        for ln in cyd_lns:
+                            term_eng.append_line(ln)
+                        for i in range(0, len(cyd_lns), 4):
+                            serial_mgr.send_event({"term": {"lines": cyd_lns[i : i + 4], "cmd": f"ai {mode_req}", "auto_scr": (i == 0)}})
+                    txt_ai_output.value = (res.get("markdown", "") or "")[:3500]
+                    append_log(f"🤖 Relatório IA ({mode_req}) via {res.get('provider_used')}/{res.get('model_used')} ({res.get('elapsed_s')}s)")
+                else:
+                    txt_ai_output.value = f"Erro IA: {res.get('error', 'desconhecido')}"
+                refresh_ai_ui()
+                safe_update(lbl_ai_status, txt_ai_output)
+
+            threading.Thread(target=_bg, daemon=True).start()
+
+        refresh_ai_ui()
+
+        sec_ai_analyst = ft.Container(
+            content=ft.Column(
+                [
+                    ft.Row(
+                        [
+                            ft.Text("🤖 AGENTE IA DE REDES (GOOGLE GEMINI + IA LOCAL OLLAMA)", size=13, weight=ft.FontWeight.BOLD, color="#C084FC"),
+                            ft.Row(
+                                [
+                                    ft.OutlinedButton("🧠 Relatório Completo", on_click=lambda e: _run_ai_gui("full")),
+                                    ft.OutlinedButton("📡 Analisar Espectro RF", on_click=lambda e: _run_ai_gui("rf")),
+                                ],
+                                spacing=8,
+                            ),
+                        ],
+                        alignment=ft.MainAxisAlignment.SPACE_BETWEEN,
+                    ),
+                    lbl_ai_status,
+                    ft.Row(
+                        [
+                            txt_ai_question,
+                            _Button("💬 Perguntar IA", on_click=lambda e: _run_ai_gui("ask", txt_ai_question.value or "")),
+                        ],
+                        spacing=8,
+                    ),
+                    ft.Container(
+                        content=ft.Column([txt_ai_output], scroll=ft.ScrollMode.AUTO, height=170),
+                        bgcolor="#05070B",
+                        border=border_all(1, "#2E1065"),
+                        border_radius=8,
+                        padding=10,
+                        width=float("inf"),
+                    ),
+                ],
+                spacing=8,
+            ),
+            bgcolor="#0B0F17",
+            border=border_all(1, "#A855F744"),
+            border_radius=14,
+            padding=14,
+        )
+
         # ---------------- CONSOLE SERIAL & LOG (COM COPIAR E LIMPAR) ---------
         txt_console = ft.Text(
             value="Inicializando CYD Cyber Deck v4.0 (Telemetria, Clima Regional, News Feed, Terminal CYD, Mercado, Portfólio, Pomodoro & Mídia)...",
@@ -8799,6 +8999,7 @@ def launch_flet_gui(
                     "terminal": term_eng.get_snapshot() if term_eng else {},
                     "wifi_radar": wifi_scan_col.get_ui_snapshot() if wifi_scan_col else {},
                     "net_analyzer": net_col.get_ui_snapshot() if net_col else {},
+                    "ai": ai_eng.get_status_snapshot(probe_local=False) if ai_eng else {},
                     "upload": upload_state,
                     "connected": True,
                 }
@@ -8956,11 +9157,14 @@ def launch_flet_gui(
                 elif p == "/api/terminal":
                     cmd_str = str(body.get("cmd", "")).strip()
                     wait_flag = bool(body.get("wait", False))
+                    req_to = body.get("timeout")
+                    is_ai_cmd = cmd_str.lower().startswith(("ai ", "ia ", "gemini ")) or cmd_str.lower() in ("ai", "ia", "gemini")
+                    eff_to = float(req_to) if req_to else (90.0 if is_ai_cmd else 10.0)
                     if cmd_str:
                         snap_pre = term_eng.get_snapshot()
                         lines_before = len(snap_pre.get("lines", []))
                         seq_before = snap_pre.get("seq", lines_before)
-                        out_lines = run_terminal_command(cmd_str, wait=wait_flag, timeout_s=10.0)
+                        out_lines = run_terminal_command(cmd_str, wait=wait_flag, timeout_s=eff_to)
                         res_t = {
                             "ok": True,
                             "state": get_ui_dict(),
@@ -8979,6 +9183,69 @@ def launch_flet_gui(
                     else:
                         ok = False
                         err_msg = "Comando vazio"
+
+                elif p == "/api/ai":
+                    if ai_eng is None:
+                        ok, err_msg = False, "Modulo ai_analyst indisponivel"
+                    else:
+                        act = str(body.get("action", "status")).lower().strip()
+                        if act == "status":
+                            res_a = {"ok": True, "ai": ai_eng.get_status_snapshot(probe_local=True)}
+                        elif act == "models":
+                            onl, mods, knd = ai_eng.list_local_models(timeout=2.5, force=True)
+                            res_a = {
+                                "ok": True,
+                                "local_online": onl,
+                                "local_kind": knd,
+                                "local_models": mods,
+                                "ai": ai_eng.get_status_snapshot(probe_local=False),
+                            }
+                        elif act == "config":
+                            pub = ai_eng.configure(
+                                ai_provider=body.get("ai_provider"),
+                                gemini_api_key=body.get("gemini_api_key"),
+                                gemini_model=body.get("gemini_model"),
+                                local_ai_url=body.get("local_ai_url"),
+                                local_ai_model=body.get("local_ai_model"),
+                                persist=True,
+                            )
+                            append_log(f"🤖 Config IA atualizada: provedor={pub['ai_provider']} | gemini_key={'SET' if pub['gemini_key_set'] else 'UNSET'}")
+                            res_a = {"ok": True, "config": pub, "ai": ai_eng.get_status_snapshot(probe_local=True)}
+                        elif act in ("report", "full", "rf", "ask"):
+                            mode_req = "rf" if act == "rf" else ("ask" if act == "ask" else "full")
+                            prov_req = body.get("provider")
+                            q_req = str(body.get("question", "")).strip()
+                            res_a = ai_eng.generate_report(
+                                mode=mode_req,
+                                provider=prov_req,
+                                question=q_req,
+                                save_file=(mode_req != "ask"),
+                            )
+                            if res_a.get("ok") and body.get("push_cyd", True):
+                                cyd_lns = res_a.get("cyd_lines", [])
+                                if cyd_lns:
+                                    for ln in cyd_lns:
+                                        term_eng.append_line(ln)
+                                    for i in range(0, len(cyd_lns), 4):
+                                        serial_mgr.send_event({
+                                            "term": {
+                                                "lines": cyd_lns[i : i + 4],
+                                                "cmd": f"ai {mode_req}",
+                                                "auto_scr": (i == 0 and bool(body.get("switch_screen", True))),
+                                            }
+                                        })
+                                    if body.get("switch_screen", True):
+                                        state["screen"] = 11
+                        else:
+                            res_a = {"ok": False, "error": f"Acao IA desconhecida: {act}"}
+                        content = json.dumps(res_a, ensure_ascii=False).encode("utf-8")
+                        self.send_response(200 if res_a.get("ok", True) else 400)
+                        self.send_header("Content-Type", "application/json; charset=utf-8")
+                        self.send_header("Content-Length", str(len(content)))
+                        self._send_cors()
+                        self.end_headers()
+                        self.wfile.write(content)
+                        return
 
                 elif p == "/api/color":
                     hex_c = body.get("hex", state["hex_color"])
@@ -9278,9 +9545,9 @@ def launch_flet_gui(
                 expand=True,
                 visible=False,
             ),
-            # Aba 7: Radar Wi-Fi RF (Tela 12) + Análise de Rede (Tela 13) + Wi-Fi UDP + Controle Remoto + Console
+            # Aba 7: Radar Wi-Fi RF (Tela 12) + Análise de Rede (Tela 13) + Agente IA + Wi-Fi UDP + Controle Remoto + Console
             ft.Column(
-                [sec_wifi_radar, sec_net_analyzer, sec_wifi_udp, sec_mobile_remote, sec_console],
+                [sec_ai_analyst, sec_wifi_radar, sec_net_analyzer, sec_wifi_udp, sec_mobile_remote, sec_console],
                 spacing=10,
                 scroll=ft.ScrollMode.AUTO,
                 expand=True,
@@ -9881,12 +10148,13 @@ def run_headless_daemon(
     term_eng: CyberDeckTerminalEngine = None,
     wifi_scan_col: wifi_scanner.WiFiScannerCollector = None,
     net_col: net_analyzer.NetworkAnalyzerCollector = None,
+    ai_eng: ai_analyst.NetworkAIAnalyst = None,
 ):
     """Executa o agente CYD em segundo plano puro (sem janela Flet), ideal para systemd --user."""
     import signal
 
     if term_eng is None:
-        term_eng = CyberDeckTerminalEngine(collector=col, wifi_scan_col=wifi_scan_col, net_col=net_col)
+        term_eng = CyberDeckTerminalEngine(collector=col, wifi_scan_col=wifi_scan_col, net_col=net_col, ai_eng=ai_eng)
     else:
         if term_eng.collector is None:
             term_eng.collector = col
@@ -9894,6 +10162,8 @@ def run_headless_daemon(
             term_eng.wifi_scan_col = wifi_scan_col
         if term_eng.net_col is None:
             term_eng.net_col = net_col
+        if term_eng.ai_eng is None and ai_eng is not None:
+            term_eng.ai_eng = ai_eng
 
     cfg = load_ui_config()
     state = {
@@ -9961,6 +10231,8 @@ def run_headless_daemon(
         wifi_scan_col.set_log_callback(log_h)
     if net_col is not None:
         net_col.set_log_callback(log_h)
+    if ai_eng is not None:
+        ai_eng.set_log_callback(log_h)
     ui_event_queue = serial_mgr.event_queue
     transfer_queue = serial_mgr.transfer_queue
     ack_event = serial_mgr.ack_event
@@ -10215,6 +10487,7 @@ def run_headless_daemon(
                 "terminal": term_eng.get_snapshot() if term_eng else {},
                 "wifi_radar": wifi_scan_col.get_ui_snapshot() if wifi_scan_col else {},
                 "net_analyzer": net_col.get_ui_snapshot() if net_col else {},
+                "ai": ai_eng.get_status_snapshot(probe_local=False) if ai_eng else {},
                 "upload": upload_state,
                 "connected": True,
             }
@@ -10372,6 +10645,9 @@ def run_headless_daemon(
             elif p == "/api/terminal":
                 cmd_str = str(body.get("cmd", "")).strip()
                 wait_flag = bool(body.get("wait", False))
+                req_to = body.get("timeout")
+                is_ai_cmd = cmd_str.lower().startswith(("ai ", "ia ", "gemini ")) or cmd_str.lower() in ("ai", "ia", "gemini")
+                eff_to = float(req_to) if req_to else (90.0 if is_ai_cmd else 10.0)
                 if cmd_str:
                     if state.get("term_auto_switch", True):
                         state["screen"] = 11
@@ -10384,7 +10660,7 @@ def run_headless_daemon(
                         log_fn=log_h,
                         auto_switch_screen=True,
                         wait=wait_flag,
-                        timeout_s=10.0,
+                        timeout_s=eff_to,
                     )
                     res_t = {
                         "ok": True,
@@ -10403,6 +10679,68 @@ def run_headless_daemon(
                     return
                 else:
                     ok, err_msg = False, "Comando vazio"
+            elif p == "/api/ai":
+                if ai_eng is None:
+                    ok, err_msg = False, "Modulo ai_analyst indisponivel"
+                else:
+                    act = str(body.get("action", "status")).lower().strip()
+                    if act == "status":
+                        res_a = {"ok": True, "ai": ai_eng.get_status_snapshot(probe_local=True)}
+                    elif act == "models":
+                        onl, mods, knd = ai_eng.list_local_models(timeout=2.5, force=True)
+                        res_a = {
+                            "ok": True,
+                            "local_online": onl,
+                            "local_kind": knd,
+                            "local_models": mods,
+                            "ai": ai_eng.get_status_snapshot(probe_local=False),
+                        }
+                    elif act == "config":
+                        pub = ai_eng.configure(
+                            ai_provider=body.get("ai_provider"),
+                            gemini_api_key=body.get("gemini_api_key"),
+                            gemini_model=body.get("gemini_model"),
+                            local_ai_url=body.get("local_ai_url"),
+                            local_ai_model=body.get("local_ai_model"),
+                            persist=True,
+                        )
+                        log_h(f"Config IA atualizada: provedor={pub['ai_provider']} | gemini_key={'SET' if pub['gemini_key_set'] else 'UNSET'}")
+                        res_a = {"ok": True, "config": pub, "ai": ai_eng.get_status_snapshot(probe_local=True)}
+                    elif act in ("report", "full", "rf", "ask"):
+                        mode_req = "rf" if act == "rf" else ("ask" if act == "ask" else "full")
+                        prov_req = body.get("provider")
+                        q_req = str(body.get("question", "")).strip()
+                        res_a = ai_eng.generate_report(
+                            mode=mode_req,
+                            provider=prov_req,
+                            question=q_req,
+                            save_file=(mode_req != "ask"),
+                        )
+                        if res_a.get("ok") and body.get("push_cyd", True):
+                            cyd_lns = res_a.get("cyd_lines", [])
+                            if cyd_lns:
+                                for ln in cyd_lns:
+                                    term_eng.append_line(ln)
+                                for i in range(0, len(cyd_lns), 4):
+                                    ui_event_queue.put({
+                                        "term": {
+                                            "lines": cyd_lns[i : i + 4],
+                                            "cmd": f"ai {mode_req}",
+                                            "auto_scr": (i == 0 and bool(body.get("switch_screen", True))),
+                                        }
+                                    })
+                                if body.get("switch_screen", True):
+                                    state["screen"] = 11
+                    else:
+                        res_a = {"ok": False, "error": f"Acao IA desconhecida: {act}"}
+                    content = json.dumps(res_a, ensure_ascii=False).encode("utf-8")
+                    self.send_response(200 if res_a.get("ok", True) else 400)
+                    self.send_header("Content-Type", "application/json; charset=utf-8")
+                    self.send_header("Content-Length", str(len(content)))
+                    self._send_cors()
+                    self.end_headers()
+                    self.wfile.write(content)
+                    return
             elif p == "/api/color":
                 h = str(body.get("hex", state["hex_color"])).strip().upper()
                 if not h.startswith("#"):
@@ -10655,10 +10993,30 @@ def main():
         scanner_ip_fn=lambda: wifi_scan_col.get_ui_snapshot().get("scanner_ip", ""),
         auto_start=not (args.stdout or args.once),
     )
+    def _persist_ai_cfg(delta: dict):
+        try:
+            cur_cfg = load_ui_config()
+            cur_cfg.update(delta)
+            save_ui_config(cur_cfg)
+        except Exception:
+            pass
+
+    ai_eng = ai_analyst.NetworkAIAnalyst(
+        collector=col,
+        wifi_scan_col=wifi_scan_col,
+        net_col=net_col,
+        ai_provider=str(cfg.get("ai_provider", "auto") or "auto"),
+        gemini_api_key=str(cfg.get("gemini_api_key", "") or ""),
+        gemini_model=str(cfg.get("gemini_model", "gemini-2.5-flash") or "gemini-2.5-flash"),
+        local_ai_url=str(cfg.get("local_ai_url", "http://127.0.0.1:11434") or "http://127.0.0.1:11434"),
+        local_ai_model=str(cfg.get("local_ai_model", "") or ""),
+        on_config_persist=_persist_ai_cfg,
+    )
     term_eng = CyberDeckTerminalEngine(
         collector=col,
         wifi_scan_col=wifi_scan_col,
         net_col=net_col,
+        ai_eng=ai_eng,
     )
     time.sleep(0.55)
 
@@ -10698,10 +11056,10 @@ def main():
             time.sleep(args.interval)
 
     if args.headless:
-        run_headless_daemon(col, mkt_col, media_col, pomo_eng, wth_col, news_col, args, term_eng=term_eng, wifi_scan_col=wifi_scan_col, net_col=net_col)
+        run_headless_daemon(col, mkt_col, media_col, pomo_eng, wth_col, news_col, args, term_eng=term_eng, wifi_scan_col=wifi_scan_col, net_col=net_col, ai_eng=ai_eng)
         return
 
-    launch_flet_gui(col, mkt_col, media_col, pomo_eng, wth_col, news_col, args, term_eng=term_eng, wifi_scan_col=wifi_scan_col, net_col=net_col)
+    launch_flet_gui(col, mkt_col, media_col, pomo_eng, wth_col, news_col, args, term_eng=term_eng, wifi_scan_col=wifi_scan_col, net_col=net_col, ai_eng=ai_eng)
 
 
 if __name__ == "__main__":

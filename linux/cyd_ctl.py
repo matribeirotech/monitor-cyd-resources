@@ -19,6 +19,11 @@ Exemplos:
   cyd jitter [alvo]       # Teste de estabilidade ICMP / jitter (padrao 1.1.1.1 ou gw)
   cyd mtu [alvo]          # Descoberta de Path MTU (PPPoE 1492 vs Ethernet 1500)
   cyd tls <host>          # Inspecao passiva de certificado TLS/SSL (:443)
+  cyd ai status|models    # Status do Agente IA (Google Gemini + Ollama/Local)
+  cyd ai report           # Relatorio completo da rede + RF com IA (salva em reports/*.md)
+  cyd ai rf               # Analise profunda do espectro 2.4GHz (ESP32-WROOM-32U)
+  cyd ai ask "<pergunta>" # Pergunta livre ao Agente IA usando telemetria atual
+  cyd ai config [...]     # Configura provedor (auto/gemini/local), chave Gemini ou modelo local
   cyd plan 700            # Define plano de internet contratado (ex: 700 Mbps Vivo Fibra)
   cyd brt 200             # Ajusta brilho PWM (0..255)
   cyd color "#00FFFF"     # Altera cor tema em tempo real
@@ -74,6 +79,8 @@ def api_post(path: str, payload: dict | None = None, timeout: float = 5.0) -> di
             return json.loads(resp.read().decode("utf-8", errors="ignore"))
     except urllib.error.URLError as ex:
         sys.exit(f"Erro ao enviar comando para o agente CYD ({API_BASE}): {ex.reason}")
+    except TimeoutError:
+        sys.exit(f"Tempo limite excedido ({int(timeout)}s) aguardando resposta do agente CYD ({path}).")
 
 
 def resolve_screen_arg(token: str) -> int:
@@ -229,11 +236,13 @@ def cmd_speed(args):
 
 def run_term_cmd(cmd_str: str, timeout: float = 15.0):
     """Envia comando ao Terminal CYD (Tela 11) com wait=True e imprime as linhas retornadas."""
+    is_ai = cmd_str.strip().lower().startswith(("ai ", "ia ", "gemini ")) or cmd_str.strip().lower() in ("ai", "ia", "gemini")
+    eff_to = max(timeout, 110.0) if is_ai else timeout
     st_before = None
     try:
-        res = api_post("/api/terminal", {"cmd": cmd_str, "wait": True}, timeout=timeout)
+        res = api_post("/api/terminal", {"cmd": cmd_str, "wait": True, "timeout": eff_to - 5.0}, timeout=eff_to)
     except Exception:
-        res = api_post("/api/terminal", {"cmd": cmd_str}, timeout=timeout)
+        res = api_post("/api/terminal", {"cmd": cmd_str}, timeout=eff_to)
 
     out_lines = res.get("output")
     if isinstance(out_lines, list) and out_lines:
@@ -268,6 +277,133 @@ def run_term_cmd(cmd_str: str, timeout: float = 15.0):
             print(ln)
     else:
         print(f"Comando enviado ao Terminal CYD: {cmd_str}")
+
+
+def cmd_ai(args):
+    """Comandos do Agente IA Hibrido (Google Gemini + IA Local Ollama/OpenAI-compat)."""
+    sub_a = (args.ai_action or "status").lower().strip()
+    extra = list(args.extra or [])
+
+    if sub_a in ("status", "st"):
+        res = api_post("/api/ai", {"action": "status"}, timeout=8.0)
+        ai = res.get("ai", {})
+        print(f"Agente IA CYD Cyber Deck ({API_BASE})")
+        print(f"  Provedor ativo : {str(ai.get('ai_provider', 'auto')).upper()}")
+        g_key = f"CONFIGURADA ({ai.get('gemini_key_masked', '***')})" if ai.get("gemini_key_set") else "NAO CONFIGURADA"
+        print(f"  Google Gemini  : {g_key} | Modelo: {ai.get('gemini_model', 'gemini-2.5-flash')}")
+        l_on = "ONLINE" if ai.get("local_online") else "OFFLINE"
+        print(
+            f"  IA Local       : {l_on} ({ai.get('local_kind', 'ollama')}) | "
+            f"URL: {ai.get('local_ai_url', 'http://127.0.0.1:11434')} | "
+            f"Modelo ativo: {ai.get('active_local_model') or '--'}"
+        )
+        mods = ai.get("local_models", [])
+        if mods:
+            print(f"  Modelos locais : {', '.join(mods)}")
+        if ai.get("last_report_path"):
+            print(
+                f"  Ultimo relat.  : {ai['last_report_path']} "
+                f"({ai.get('last_provider_used', '--')}/{ai.get('last_model_used', '--')} @ {ai.get('last_report_time', '--')})"
+            )
+        return
+
+    if sub_a in ("models", "modelos", "list"):
+        res = api_post("/api/ai", {"action": "models"}, timeout=8.0)
+        ai = res.get("ai", {})
+        print(f"Google Gemini : {ai.get('gemini_model', 'gemini-2.5-flash')} ({'CHAVE OK' if ai.get('gemini_key_set') else 'SEM CHAVE'})")
+        print(f"IA Local      : {'ONLINE' if res.get('local_online') else 'OFFLINE'} ({res.get('local_kind', 'ollama')}) em {ai.get('local_ai_url', '')}")
+        mods = res.get("local_models", [])
+        if mods:
+            active_m = ai.get("active_local_model", "")
+            for m in mods:
+                mark = " ◀ ATIVO" if m == active_m else ""
+                print(f"  - {m}{mark}")
+        else:
+            print("  Nenhum modelo local encontrado.")
+        return
+
+    if sub_a in ("config", "cfg", "set"):
+        payload = {"action": "config"}
+        if args.provider:
+            payload["ai_provider"] = args.provider
+        if args.gemini_key is not None:
+            payload["gemini_api_key"] = args.gemini_key
+        if args.gemini_model:
+            payload["gemini_model"] = args.gemini_model
+        if args.local_url:
+            payload["local_ai_url"] = args.local_url
+        if args.local_model is not None:
+            payload["local_ai_model"] = args.local_model
+        if len(payload) == 1:
+            print("Nenhuma opcao informada. Exemplo:")
+            print("  cyd ai config --provider auto --gemini-key SUA_CHAVE --gemini-model gemini-2.5-flash")
+            print("  cyd ai config --provider local --local-url http://127.0.0.1:11434 --local-model qwen2.5:7b")
+            return
+        res = api_post("/api/ai", payload, timeout=10.0)
+        cfg_p = res.get("config", {})
+        print("Configuracao do Agente IA salva com sucesso!")
+        print(f"  Provedor     : {str(cfg_p.get('ai_provider', 'auto')).upper()}")
+        print(f"  Gemini       : {'CHAVE OK (' + cfg_p.get('gemini_key_masked', '') + ')' if cfg_p.get('gemini_key_set') else 'SEM CHAVE'} | {cfg_p.get('gemini_model', '')}")
+        print(f"  IA Local     : {cfg_p.get('local_ai_url', '')} | modelo: {cfg_p.get('local_ai_model') or 'auto'}")
+        return
+
+    if sub_a in ("report", "relatorio", "full", "rf", "spectrum", "ask", "perguntar"):
+        if sub_a in ("rf", "spectrum"):
+            act_api = "rf"
+            q_str = ""
+        elif sub_a in ("ask", "perguntar"):
+            act_api = "ask"
+            q_str = " ".join(extra).strip()
+            if not q_str:
+                sys.exit("Informe a pergunta. Ex: cyd ai ask \"Qual canal 2.4GHz devo usar no roteador?\"")
+        else:
+            act_api = "report"
+            q_str = ""
+
+        prov = args.provider
+        if not prov and extra and act_api != "ask" and extra[0].lower() in ("auto", "gemini", "local"):
+            prov = extra[0].lower()
+
+        print(f"Consultando Agente IA ({act_api}, provedor={prov or 'padrao'})... aguarde...")
+        res = api_post(
+            "/api/ai",
+            {
+                "action": act_api,
+                "provider": prov,
+                "question": q_str,
+                "push_cyd": not bool(args.no_cyd),
+                "switch_screen": not bool(args.no_cyd),
+            },
+            timeout=210.0,
+        )
+        if not res.get("ok"):
+            sys.exit(f"Erro no Agente IA: {res.get('error', 'desconhecido')}")
+
+        prov_u = res.get("provider_used", "?")
+        mod_u = res.get("model_used", "?")
+        elap = res.get("elapsed_s", 0.0)
+        print(f"\n=== AGENTE IA CYD ({prov_u.upper()} / {mod_u} — {elap:.1f}s) ===")
+        if res.get("report_path"):
+            print(f"Relatorio salvo em: {res['report_path']}")
+        print("=" * 68)
+        print(res.get("markdown") or "\n".join(res.get("cyd_lines", [])))
+        print("=" * 68)
+        if not args.no_cyd:
+            print("Resumo tambem enviado para a Tela 11 (SCR_TERMINAL) da placa CYD.")
+        return
+
+    # Atalho: `cyd ai <pergunta livre>`
+    q_free = " ".join([args.ai_action] + extra).strip()
+    print(f"Consultando Agente IA (pergunta livre)... aguarde...")
+    res = api_post(
+        "/api/ai",
+        {"action": "ask", "provider": args.provider, "question": q_free, "push_cyd": not bool(args.no_cyd)},
+        timeout=125.0,
+    )
+    if not res.get("ok"):
+        sys.exit(f"Erro no Agente IA: {res.get('error', 'desconhecido')}")
+    print(f"\n=== AGENTE IA CYD ({res.get('provider_used','?').upper()} / {res.get('model_used','?')} — {res.get('elapsed_s',0):.1f}s) ===")
+    print(res.get("markdown") or "\n".join(res.get("cyd_lines", [])))
 
 
 def main():
@@ -315,6 +451,16 @@ def main():
     p_tls = sub.add_parser("tls", aliases=["ssl"], help="Inspeciona certificado TLS/SSL de um dominio (:443)")
     p_tls.add_argument("host", help="Dominio ou host:porta (ex: github.com)")
 
+    p_ai = sub.add_parser("ai", aliases=["ia"], help="Agente IA hibrido (Gemini + Ollama local) para analise de redes e RF")
+    p_ai.add_argument("ai_action", nargs="?", default="status", help="status | models | report | rf | ask | config")
+    p_ai.add_argument("extra", nargs="*", help="Pergunta para 'ask' ou provedor opcional")
+    p_ai.add_argument("--provider", choices=["auto", "gemini", "local"], default=None, help="Forca provedor de IA")
+    p_ai.add_argument("--gemini-key", default=None, help="Define chave GEMINI_API_KEY (use 'clear' para remover)")
+    p_ai.add_argument("--gemini-model", default=None, help="Define modelo Gemini (ex: gemini-2.5-flash)")
+    p_ai.add_argument("--local-url", default=None, help="URL da IA Local (padrao: http://127.0.0.1:11434)")
+    p_ai.add_argument("--local-model", default=None, help="Modelo local (ex: qwen2.5:7b ou 'auto')")
+    p_ai.add_argument("--no-cyd", action="store_true", help="Nao envia o resumo para a Tela 11 da CYD")
+
     p_rt = sub.add_parser("router", aliases=["gw"], help="Diagnostico do roteador/gateway")
     p_rt.add_argument("--open", action="store_true", help="Abre a pagina de admin do roteador no navegador")
 
@@ -361,6 +507,8 @@ def main():
         run_term_cmd(f"mtu {args.target}".strip())
     elif c in ("tls", "ssl"):
         run_term_cmd(f"tls {args.host}".strip())
+    elif c in ("ai", "ia"):
+        cmd_ai(args)
     elif c in ("router", "gw"):
         cmd_router(args)
     elif c in ("lan", "arp"):

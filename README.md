@@ -1,6 +1,6 @@
-# ⚡ CYD Cyber Deck: Hardware, Clima Regional, News Feed, Terminal Administrativo, Radar Wi-Fi RF, Análise de Rede & Financial Market Monitor (v4.5 — Windows & Linux)
+# ⚡ CYD Cyber Deck: Hardware, Clima Regional, News Feed, Terminal Administrativo + Agente IA (Gemini + Local), Radar Wi-Fi RF, Análise de Rede & Financial Market Monitor (v4.7 — Windows & Linux)
 
-![Versão](https://img.shields.io/badge/vers%C3%A3o-4.5.0-00FF00?style=for-the-badge)
+![Versão](https://img.shields.io/badge/vers%C3%A3o-4.7.0-00FF00?style=for-the-badge)
 ![OS](https://img.shields.io/badge/OS-Ubuntu%20%7C%20Linux%20%7C%20Windows-E95420?style=for-the-badge&logo=ubuntu)
 ![Plataforma](https://img.shields.io/badge/ESP32-2432S028R%20(CYD)-blue?style=for-the-badge&logo=espressif)
 ![Interface PC](https://img.shields.io/badge/GUI%20PC-Flet%20%2F%20Flutter-02569B?style=for-the-badge&logo=flutter)
@@ -174,7 +174,9 @@ Todas as fotos abaixo foram capturadas diretamente da placa física em funcionam
 | **v4.1** | **Clima Regional (Votuporanga) no Topo + Tela 10 (Clima & Gemini Gems) + Alerta de Tempestade + CI/CD GitHub Actions** | ✅ Concluído |
 | **v4.2** | **CYD Cyber Deck (12 Telas) + Feed de Notícias (Tela 10) + Terminal CYD (Tela 11) + Serial Assíncrona (115200 bps) + Clean UI (NavigationRail) + Nova Identidade Visual** | ✅ Concluído |
 | **v4.3** | **Telemetria Wi-Fi (UDP Porta 8888) + Modo Híbrido (USB & Sem Fio) + Fragmentação MTU + Terminal Linux Expandido** | ✅ Concluído |
-| **v4.5 (Atual)** | **Modo Headless (`systemd --user`) + Tela 12 (`SCR_WIFI_RADAR` via ESP32-WROOM-32U sem fio mDNS/UDP) + Tela 13 (`SCR_NET_ANALYZER` Roteador/LAN/Speedtest 700 Mbps) + CLI Linux (`cyd`)** | ✅ **Concluído (v4.5)** |
+| **v4.5** | **Modo Headless (`systemd --user`) + Tela 12 (`SCR_WIFI_RADAR` via ESP32-WROOM-32U sem fio mDNS/UDP) + Tela 13 (`SCR_NET_ANALYZER` Roteador/LAN/Speedtest 700 Mbps) + CLI Linux (`cyd`)** | ✅ Concluído |
+| **v4.6** | **Terminal CYD RF & Rede Defensiva (`rf spectrum`, `rf track`, `rf audit`, `rf diff`, `rf export`, `oui`, `netcheck`, `jitter`, `mtu`, `tls`, `route`)** | ✅ Concluído |
+| **v4.7 (Atual)** | **Agente IA Híbrido para Análise de Redes & Relatórios (Google Gemini + IA Local Ollama/OpenAI-compat) no Terminal CYD, Web PWA, Flet e CLI (`cyd ai`)** | ✅ **Concluído (v4.7)** |
 
 ---
 
@@ -231,6 +233,7 @@ minimal-monitor/
 │
 ├── agent/                           # Agente Desktop (PC) em Flet (Flutter), Daemon Headless e Servidor Web Mobile
 │   ├── agent.py                     # Coletor Hardware + Mercado + Pomodoro + Media + GUI Flet + modo --headless
+│   ├── ai_analyst.py                # Agente IA híbrido (Google Gemini + Ollama/OpenAI local) para relatórios de rede e RF
 │   ├── wifi_scanner.py              # Módulo Radar Wi-Fi RF (listener UDP :8889 / comando :8890 para ESP32-WROOM-32U)
 │   ├── net_analyzer.py              # Módulo Análise de Rede, Roteador/Gateway, LAN ARP e Speedtest Fibra 700 Mbps
 │   ├── mobile_web.py                # Interface Web Mobile (PWA) em tempo real (SSE)
@@ -314,12 +317,22 @@ ln -sf "$(pwd)/linux/cyd_ctl.py" ~/.local/bin/cyd
 | `cyd plan <mbps>` | Configura a velocidade contratada do plano de internet (ex.: `cyd plan 700` para Vivo Fibra 700 Mb) |
 | `cyd brt <0..255>` | Ajusta o brilho PWM do display da CYD |
 | `cyd color "#00FFFF"` | Altera a cor tema RGB565 da CYD em tempo real |
-| `cyd cmd "<comando>"` | Executa comando no Terminal CYD (Tela 11) com retorno síncrono no terminal Linux (ex.: `cyd cmd "rf spectrum"`, `cyd cmd "oui 30:DE:4B"`, `cyd cmd "route"`) |
+| `cyd ai status` / `cyd ai models` | Verifica status do Agente IA (Google Gemini + Ollama/OpenAI local) e lista modelos locais disponíveis |
+| `cyd ai report [--provider auto\|gemini\|local]` | Gera relatório completo de rede + espectro RF 2.4 GHz (salva `.md` em `reports/`, imprime no Linux e envia resumo à CYD Tela 11) |
+| `cyd ai rf [--provider auto\|gemini\|local]` | Análise profunda com IA focada no espectro 2.4 GHz da ESP32-WROOM-32U (co-canal, OUI, auditoria passiva) |
+| `cyd ai ask "<pergunta>"` | Faz uma pergunta livre sobre a rede atual usando telemetria ao vivo (`--provider gemini\|local` opcional) |
+| `cyd ai config [...]` | Configura provedor (`--provider`), chave/modelo Gemini (`--gemini-key`, `--gemini-model`) ou IA local (`--local-url`, `--local-model`) |
+| `cyd cmd "<comando>"` | Executa comando no Terminal CYD (Tela 11) com retorno síncrono no terminal Linux (ex.: `cyd cmd "ai report"`, `cyd cmd "rf spectrum"`, `cyd cmd "route"`) |
 
 #### Exemplos práticos
 ```bash
 cyd 12                  # Abre o Radar Wi-Fi RF (ESP32-WROOM-32U)
 cyd screen net          # Abre a Tela 13 (Análise de Rede & Roteador)
+cyd ai status           # Checa Google Gemini + modelos locais do Ollama
+cyd ai report           # Relatório completo da rede + RF com IA (salva em reports/*.md e mostra resumo na CYD)
+cyd ai rf --provider local  # Análise profunda do espectro 2.4 GHz rodando 100% offline via Ollama
+cyd ai ask "Qual canal 2.4GHz configurar no roteador?"  # Pergunta técnica usando telemetria real
+cyd ai config --gemini-key "SUA_CHAVE" --provider auto  # Ativa Google Gemini com fallback automático para IA Local
 cyd rf spectrum         # Analisa ocupação dos canais 1..13 e recomenda melhor canal (1, 6 ou 11)
 cyd rf audit            # Auditoria passiva: redes OPEN, ocultas, WEP, Mesh multi-BSSID e canais cheios
 cyd rf track Vivo       # Rastreia estabilidade de sinal (dBm/dB), OUI e distância indoor aproximada
