@@ -769,7 +769,7 @@ HTML_MOBILE_APP = r"""<!DOCTYPE html>
     </div>
 
     <div class="sec-header" style="margin-top:14px;">
-      <div class="sec-title">CYD CYBER DECK v4.0 — FINANÇAS, FOCO, MÍDIA, NEWS & TERMINAL (TELAS 6 A 11)</div>
+      <div class="sec-title">CYD CYBER DECK v4.5 — FINANÇAS, FOCO, MÍDIA, NEWS, TERMINAL, RADAR & REDE (TELAS 6 A 13)</div>
     </div>
     <div class="screen-grid">
       <div class="screen-card" data-screen="6" onclick="selectScreen(6)">
@@ -836,6 +836,61 @@ HTML_MOBILE_APP = r"""<!DOCTYPE html>
           <div class="sc-title">Tela 11: Terminal CYD</div>
           <div class="sc-desc">Console Verde • ping, fetch, docker, wifi</div>
         </div>
+      </div>
+
+      <div class="screen-card" data-screen="12" onclick="selectScreen(12)">
+        <div class="sc-top">
+          <div class="sc-icon">📡</div>
+          <div class="sc-badge" id="badge-12">T12</div>
+        </div>
+        <div>
+          <div class="sc-title">Tela 12: Radar Wi-Fi</div>
+          <div class="sc-desc" id="sc12Desc">ESP32-WROOM-32U • Canais 2.4GHz & RSSI</div>
+        </div>
+      </div>
+
+      <div class="screen-card" data-screen="13" onclick="selectScreen(13)">
+        <div class="sc-top">
+          <div class="sc-icon">🌐</div>
+          <div class="sc-badge" id="badge-13">T13</div>
+        </div>
+        <div>
+          <div class="sc-title">Tela 13: Rede & Roteador</div>
+          <div class="sc-desc" id="sc13Desc">Gateway, LAN ARP & Fibra 700 Mbps</div>
+        </div>
+      </div>
+    </div>
+
+    <div class="sec-header" style="margin-top:14px;">
+      <div class="sec-title">🌐 ANÁLISE DE REDE, ROTEADOR & FIBRA 700 Mbps (TELA 13)</div>
+    </div>
+    <div class="action-card">
+      <div style="display:flex; justify-content:space-between; align-items:center; margin-bottom:6px;">
+        <span style="font-size:11px; font-weight:800; font-family:monospace; color:#38BDF8;" id="mNetaGw">🌐 Gateway: detectando...</span>
+        <span style="font-size:10px; font-family:monospace; color:var(--text-dim);" id="mNetaIsp">ISP</span>
+      </div>
+      <div style="font-size:10.5px; font-family:monospace; color:#22C55E; margin-bottom:6px;" id="mNetaTraffic">Tempo real: ↓0.0 ↑0.0 Mbps • Plano 700M</div>
+      <div style="font-size:10.5px; font-family:monospace; color:#FACC15; margin-bottom:8px;" id="mNetaSpeed">Speedtest: clique em ⚡ Speedtest</div>
+      <div class="btn-row">
+        <button class="btn btn-secondary" onclick="netAnalyzerAction('speedtest')" style="font-size:11px;">⚡ Speedtest</button>
+        <button class="btn btn-secondary" onclick="openRouterAdmin()" style="font-size:11px;">🌐 Roteador</button>
+        <button class="btn btn-secondary" onclick="selectScreen(13)" style="font-size:11px;">📺 Tela 13</button>
+      </div>
+    </div>
+
+    <div class="sec-header" style="margin-top:14px;">
+      <div class="sec-title">📡 RADAR WI-FI RF (ESP32-WROOM-32U ANTENA EXTERNA • TELA 12)</div>
+    </div>
+    <div class="action-card">
+      <div style="display:flex; justify-content:space-between; align-items:center; margin-bottom:6px;">
+        <span style="font-size:11px; font-weight:800; font-family:monospace; color:#F59E0B;" id="mWradStatus">🟡 Aguardando ESP32-WROOM-32U...</span>
+        <span style="font-size:10px; font-family:monospace; color:var(--text-dim);" id="mWradMeta">-- redes</span>
+      </div>
+      <div style="font-size:10.5px; font-family:monospace; color:#38BDF8; margin-bottom:8px;" id="mWradChInfo">Canal livre: CH1 • Mais cheio: --</div>
+      <div style="background:#030508; border:1px solid #1E293B; border-radius:8px; padding:8px; font-family:monospace; font-size:10.5px; color:#E2E8F0; max-height:155px; overflow-y:auto; margin-bottom:8px;" id="mWradList">Aguardando primeira varredura...</div>
+      <div class="btn-row">
+        <button class="btn btn-secondary" onclick="wifiRadarScan()" style="font-size:11px;">🔄 Escanear Agora</button>
+        <button class="btn btn-secondary" onclick="selectScreen(12)" style="font-size:11px;">📺 Abrir Tela 12</button>
       </div>
     </div>
 
@@ -1329,6 +1384,42 @@ HTML_MOBILE_APP = r"""<!DOCTYPE html>
       }
     }
 
+    let lastRouterAdminUrl = "";
+    async function netAnalyzerAction(action) {
+      vibrate(18);
+      if (action === "speedtest") showToast("Iniciando Speedtest Fibra (~4s)...", "⚡");
+      try {
+        await fetch("/api/net_analyzer", {
+          method: "POST",
+          headers: {"Content-Type": "application/json"},
+          body: JSON.stringify({action: action})
+        });
+      } catch (err) {
+        console.error(err);
+      }
+    }
+    function openRouterAdmin() {
+      if (lastRouterAdminUrl) {
+        window.open(lastRouterAdminUrl, "_blank");
+      } else {
+        showToast("Gateway ainda não detectado", "⚠️");
+      }
+    }
+
+    async function wifiRadarScan() {
+      vibrate(18);
+      showToast("Escaneando redes na ESP32-WROOM-32U...", "📡");
+      try {
+        await fetch("/api/wifi_radar", {
+          method: "POST",
+          headers: {"Content-Type": "application/json"},
+          body: JSON.stringify({action: "scan"})
+        });
+      } catch (err) {
+        console.error(err);
+      }
+    }
+
     async function sendTermCmd(presetCmd) {
       vibrate(20);
       const inp = document.getElementById("mTermInput");
@@ -1674,6 +1765,73 @@ HTML_MOBILE_APP = r"""<!DOCTYPE html>
         if (tb && tb.innerText !== data.terminal.text) {
           tb.innerText = data.terminal.text;
           tb.scrollTop = tb.scrollHeight;
+        }
+      }
+
+      // Radar Wi-Fi RF (ESP32-WROOM-32U - Tela 12)
+      if (data.wifi_radar) {
+        const wr = data.wifi_radar;
+        const stEl = document.getElementById("mWradStatus");
+        const mtEl = document.getElementById("mWradMeta");
+        const chEl = document.getElementById("mWradChInfo");
+        const lsEl = document.getElementById("mWradList");
+        const sc12 = document.getElementById("sc12Desc");
+        if (stEl) {
+          stEl.innerText = (wr.online ? "🟢 " : "🟡 ") + (wr.status_msg || "Aguardando ESP32-WROOM-32U...");
+          stEl.style.color = wr.online ? "#22C55E" : "#F59E0B";
+        }
+        if (mtEl) {
+          mtEl.innerText = `${wr.total || 0} APs • #${wr.scan_count || 0}`;
+        }
+        if (chEl) {
+          const bStr = wr.total > 0 ? `${wr.best_rssi} dBm` : "-- dBm";
+          const bcStr = wr.busiest_ch > 0 ? `CH${wr.busiest_ch}` : "--";
+          chEl.innerText = `Melhor: ${bStr} • Livre: CH${wr.free_ch || 1} • Cheio: ${bcStr} • ${wr.last_scan_str || "--:--"}`;
+        }
+        if (sc12) {
+          sc12.innerText = wr.online ? `${wr.total || 0} redes • Livre CH${wr.free_ch || 1}` : "ESP32-WROOM-32U • Offline";
+        }
+        if (lsEl) {
+          const nets = Array.isArray(wr.networks) ? wr.networks : [];
+          if (!nets.length) {
+            lsEl.innerText = wr.online ? "Escaneando redes 2.4 GHz..." : "Conecte a ESP32-WROOM-32U na USB.";
+          } else {
+            lsEl.innerHTML = nets.slice(0, 12).map(n => {
+              const r = n.rssi || -100;
+              const c = r >= -62 ? "#22C55E" : (r >= -75 ? "#FACC15" : (r >= -84 ? "#F97316" : "#EF4444"));
+              const ssid = String(n.ssid || "<OCULTA>").replace(/</g, "&lt;").replace(/>/g, "&gt;");
+              return `<div style="display:flex;justify-content:space-between;padding:2px 0;border-bottom:1px solid #111827;">` +
+                     `<span style="color:#F1F5F9;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;max-width:52%;">${ssid}</span>` +
+                     `<span style="color:#38BDF8;">CH${String(n.ch||0).padStart(2,"0")}</span>` +
+                     `<span style="color:${c};font-weight:700;">${r} dBm</span>` +
+                     `</div>`;
+            }).join("");
+          }
+        }
+      }
+
+      // Analise de Rede, Roteador & Fibra 700M (Tela 13)
+      if (data.net_analyzer) {
+        const na = data.net_analyzer;
+        if (na.admin_url) lastRouterAdminUrl = na.admin_url;
+        const elGw = document.getElementById("mNetaGw");
+        const elIsp = document.getElementById("mNetaIsp");
+        const elTr = document.getElementById("mNetaTraffic");
+        const elSp = document.getElementById("mNetaSpeed");
+        const sc13 = document.getElementById("sc13Desc");
+        if (elGw) {
+          elGw.innerText = `${na.gw_up ? "🟢" : "🔴"} GW ${na.gateway_ip || "--"} (${Number(na.gw_ms||0).toFixed(1)}ms) • WAN ${Number(na.wan_ms||0).toFixed(0)}ms • LAN ${na.lan_count || 0}`;
+        }
+        if (elIsp) elIsp.innerText = na.isp || "ISP";
+        if (elTr) elTr.innerText = `Tempo real: ↓${Number(na.rx_mbps||0).toFixed(1)} ↑${Number(na.tx_mbps||0).toFixed(1)} Mbps • Plano ${na.plan_mbps || 700}M`;
+        const sp = na.speedtest || {};
+        if (elSp) {
+          if (sp.running) elSp.innerText = "⏳ Medindo velocidade da fibra...";
+          else if (sp.dl_mbps > 0) elSp.innerText = `Speedtest (${sp.time_str}): DL ${sp.dl_mbps.toFixed(1)}M (${sp.plan_pct}%) | UL ${sp.ul_mbps.toFixed(1)}M`;
+          else elSp.innerText = "Speedtest: clique em ⚡ Speedtest ou rode 'cyd speed'";
+        }
+        if (sc13) {
+          sc13.innerText = `GW ${Number(na.gw_ms||0).toFixed(1)}ms • WAN ${Number(na.wan_ms||0).toFixed(0)}ms • ${na.lan_count || 0} hosts`;
         }
       }
 

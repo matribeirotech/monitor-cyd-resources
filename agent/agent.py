@@ -59,6 +59,22 @@ except ImportError:
     except Exception:
         import agent.mobile_web as mobile_web
 
+try:
+    import wifi_scanner
+except ImportError:
+    try:
+        from . import wifi_scanner
+    except Exception:
+        import agent.wifi_scanner as wifi_scanner
+
+try:
+    import net_analyzer
+except ImportError:
+    try:
+        from . import net_analyzer
+    except Exception:
+        import agent.net_analyzer as net_analyzer
+
 IS_WINDOWS = platform.system() == "Windows"
 IS_LINUX = platform.system() == "Linux"
 if sys.stdout is None:
@@ -911,18 +927,24 @@ class Collector:
 
 
 # ---------------------------------------------------------------- serial ----
-def find_port():
+def find_port(excluded_ports=None):
+    excluded_canon = {wifi_scanner._canonical_port(p) for p in (excluded_ports or set()) if p}
     if IS_LINUX and os.path.exists("/dev/mike"):
-        return "/dev/mike"
+        if wifi_scanner._canonical_port("/dev/mike") not in excluded_canon:
+            return "/dev/mike"
     try:
         from serial.tools import list_ports
     except ImportError:
         sys.exit("Faltando pyserial. Rode: pip install pyserial")
     cands = list(list_ports.comports())
     for p in cands:
+        if wifi_scanner._canonical_port(p.device) in excluded_canon:
+            continue
         if p.vid is not None and (p.vid, p.pid) in KNOWN_USB_IDS:
             return p.device
     for p in cands:
+        if wifi_scanner._canonical_port(p.device) in excluded_canon:
+            continue
         if re.search(r"ttyUSB|ttyACM|^COM\d+$", p.device):
             return p.device
     return None
@@ -1015,12 +1037,17 @@ class SerialManager:
         udp_enabled: bool = False,
         udp_ip: str = "",
         udp_port: int = UDP_DEFAULT_PORT,
+        excluded_ports_fn=None,
     ):
         self.preferred_port = preferred_port
         self.baud = int(baud)
         self.on_rx_line = on_rx_line
         self.on_status_change = on_status_change
         self.on_log = on_log
+        self.excluded_ports_fn = excluded_ports_fn
+        self._scanner_ignored_ports: dict[str, float] = {}
+        self._wrong_board_port: str = ""
+        self._active_serial_port: str = ""
 
         self.event_queue: queue.Queue = queue.Queue()
         self.transfer_queue: queue.Queue = queue.Queue()
@@ -1083,6 +1110,34 @@ class SerialManager:
     def get_status_snapshot(self) -> dict:
         """Alias para get_status(). Retorna uma cópia thread-safe do estado da conexão."""
         return self.get_status()
+
+    def get_active_ports(self) -> set[str]:
+        """Retorna a porta serial atualmente aberta pela CYD (para evitar conflito com o Scanner ESP32)."""
+        p = self._active_serial_port
+        return {p} if p else set()
+
+    def set_excluded_ports_fn(self, fn):
+        self.excluded_ports_fn = fn
+
+    def _get_excluded_ports(self) -> set[str]:
+        excluded: set[str] = set()
+        if self.excluded_ports_fn:
+            try:
+                res = self.excluded_ports_fn()
+                if isinstance(res, str) and res:
+                    excluded.add(res)
+                elif res:
+                    for item in res:
+                        if item:
+                            excluded.add(str(item))
+            except Exception:
+                pass
+        now_m = time.monotonic()
+        expired = [k for k, exp in self._scanner_ignored_ports.items() if now_m >= exp]
+        for k in expired:
+            self._scanner_ignored_ports.pop(k, None)
+        excluded.update(self._scanner_ignored_ports.keys())
+        return excluded
 
     def start(self):
         if self._running:
@@ -1284,6 +1339,13 @@ class SerialManager:
         """Processa uma linha recebida da CYD (mesmo tratamento para USB e UDP)."""
         if not raw:
             return
+        # Protecao dual-ESP32: se esta porta serial responder como ESP32 Scanner, libera imediatamente
+        if via == "serial" and not self.preferred_port and wifi_scanner.is_scanner_banner_line(raw):
+            cur_p = self._active_serial_port
+            if cur_p:
+                self._scanner_ignored_ports[wifi_scanner._canonical_port(cur_p)] = time.monotonic() + 30.0
+                self._wrong_board_port = cur_p
+            return
         with self._status_lock:
             self._status["rx_packets"] += 1
 
@@ -1385,12 +1447,22 @@ class SerialManager:
                     pass
             ser = None
             ser_ready = False
+            self._active_serial_port = ""
 
         while self._running:
             now_m = time.monotonic()
 
             # ---------- 1) Ciclo de vida da porta USB (100% não-bloqueante) ----------
             try:
+                if self._wrong_board_port:
+                    wrong_p = self._wrong_board_port
+                    self._wrong_board_port = ""
+                    _close_serial()
+                    next_port_scan = now_m + 0.5
+                    self._update_status(connected=False, state="SEARCHING", port="")
+                    if self.on_log:
+                        self.on_log(f"📡 Porta {wrong_p} identificada como ESP32 Scanner Wi-Fi (liberada para o Radar RF).")
+
                 if self._reconnect_flag.is_set():
                     self._reconnect_flag.clear()
                     _close_serial()
@@ -1398,21 +1470,27 @@ class SerialManager:
                     self._update_status(connected=False, state="RECONNECTING", port="", tx_bytes_sec=0)
 
                 if ser is None and now_m >= next_port_scan:
-                    port = self.preferred_port or find_port()
+                    port = self.preferred_port or find_port(excluded_ports=self._get_excluded_ports())
                     if not port:
                         self._update_status(connected=False, state="SEARCHING", port="")
                         next_port_scan = now_m + 1.5
                     else:
                         self._update_status(connected=False, state="CONNECTING", port=port)
                         ser = serial.Serial(port=port, baudrate=self.baud, timeout=0.04, write_timeout=0.35)
+                        self._active_serial_port = port
                         ser_settle_until = now_m + 1.5
                         ser_ready = False
 
                 if ser is not None and not ser_ready and now_m >= ser_settle_until:
+                    # Antes de limpar o buffer, verifica se o banner de boot e da ESP32 Scanner
+                    self._read_available_lines(ser)
+                    if self._wrong_board_port:
+                        continue
                     ser.reset_input_buffer()
                     ser.reset_output_buffer()
                     ser_ready = True
                     port_name = getattr(ser, "port", "") or ""
+                    self._active_serial_port = port_name
                     self._update_status(connected=True, state="CONNECTED", port=port_name, last_error="")
                     if self.on_log:
                         self.on_log(f"⚡ USB Serial conectada em {port_name} ({self.baud} bps • Non-Blocking I/O)")
@@ -1972,6 +2050,10 @@ def load_ui_config():
         "udp_port": UDP_DEFAULT_PORT,
         "esp_wifi_ssid": "",
         "esp_wifi_pass": "",
+        "scanner_enabled": True,
+        "scanner_port": "",
+        "scanner_interval_s": 8.0,
+        "net_plan_mbps": 700,
         "news_topics": list(DEFAULT_NEWS_TOPICS),
         "news_api_key": os.environ.get("NEWS_API_KEY", ""),
         "news_rotate_sec": 15,
@@ -4485,6 +4567,63 @@ class CyberDeckTerminalEngine:
                         lines_p.append(f"  {idx_p}) {pname[:24]:<24} RAM: {mem_p:.1f}%")
                     _send_cyd_lines(lines_p)
 
+                # ================================== ROUTER / GATEWAY ======================
+                elif verb in ("router", "gateway", "gw"):
+                    _send_cyd_lines(["[ROUTER] Diagnosticando roteador / gateway..."])
+                    gw_ip, iface, local_ip = net_analyzer.detect_default_route()
+                    gw_p = net_analyzer.ping_stats(gw_ip, count=3)
+                    h_code, h_hint = net_analyzer.check_router_http(gw_ip)
+                    hosts = net_analyzer.read_lan_neighbors(gw_ip=gw_ip)
+                    gw_mac = next((h["mac"] for h in hosts if h["ip"] == gw_ip), "--")
+                    _send_cyd_lines([
+                        f"GW: {gw_ip} ({gw_mac}) via {iface}",
+                        f"PC: {local_ip} | Ping: {gw_p['avg_ms']:.1f}ms | Jit: {gw_p['jitter_ms']:.1f}ms | Loss: {gw_p['loss_pct']}%",
+                        f"Admin Web: http://{gw_ip} (HTTP {h_code} {h_hint})",
+                        f"Vizinhos ARP ativos na LAN: {len(hosts)} host(s)",
+                    ])
+
+                # ================================== LAN / ARP =============================
+                elif verb in ("lan", "arp", "hosts"):
+                    gw_ip, _if, _ip = net_analyzer.detect_default_route()
+                    hosts = net_analyzer.read_lan_neighbors(gw_ip=gw_ip)
+                    lines_h = [f"[LAN] Tabela ARP/Vizinhos ({len(hosts)} hosts):"]
+                    for h in hosts[:8]:
+                        lines_h.append(f"  {h['ip']:<15} {h['mac']:<17} {h['tag']}")
+                    _send_cyd_lines(lines_h)
+
+                # ================================== DNS ===================================
+                elif verb in ("dns", "dig", "nslookup"):
+                    dom = re.sub(r"[^a-zA-Z0-9.\-]", "", arg_rest or "cloudflare.com") or "cloudflare.com"
+                    t0 = time.perf_counter()
+                    try:
+                        infos = socket.getaddrinfo(dom, 443, socket.AF_INET)
+                        ms = (time.perf_counter() - t0) * 1000.0
+                        ips = sorted({x[4][0] for x in infos})[:4]
+                        _send_cyd_lines([f"[DNS] {dom} ({ms:.1f} ms): " + ", ".join(ips)])
+                    except Exception as ex:
+                        _send_cyd_lines([f"[DNS ERR] {dom}: {str(ex)[:38]}"])
+
+                # ================================== TRACE / TRACEROUTE ====================
+                elif verb in ("trace", "traceroute", "tracepath"):
+                    tgt = re.sub(r"[^a-zA-Z0-9.\-:]", "", arg_rest or "1.1.1.1") or "1.1.1.1"
+                    _send_cyd_lines([f"[TRACE] Rastreando rota ate {tgt} (max 8 saltos)..."])
+                    t_cmd = ["tracert", "-d", "-h", "8", "-w", "1000", tgt] if IS_WINDOWS else ["traceroute", "-n", "-m", "8", "-w", "1", "-q", "1", tgt]
+                    out_t = net_analyzer._run_cmd(t_cmd, timeout=9.0)
+                    t_lines = [ln.strip() for ln in out_t.splitlines() if ln.strip()][:9]
+                    _send_cyd_lines(t_lines if t_lines else ["[TRACE] Sem resposta / traceroute indisponivel."])
+
+                # ================================== SPEEDTEST =============================
+                elif verb in ("speed", "speedtest"):
+                    _send_cyd_lines(["[SPEED] Testando Download/Upload Fibra (~4s)..."])
+                    res = net_analyzer.run_cloudflare_speedtest()
+                    if res.get("ok"):
+                        _send_cyd_lines([
+                            f"[OK] Download: {res['dl_mbps']:.1f} Mbps | Upload: {res['ul_mbps']:.1f} Mbps",
+                            f"Ping 1.1.1.1: {res['ping_ms']:.1f} ms | Jitter: {res['jitter_ms']:.1f} ms",
+                        ])
+                    else:
+                        _send_cyd_lines(["[ERR] Falha no teste de velocidade."])
+
                 else:
                     _send_cyd_lines([
                         f"[ERR] Comando desconhecido: '{verb}'",
@@ -4510,6 +4649,8 @@ def launch_flet_gui(
     gems_eng: NewsFeedCollector,
     cli_args,
     term_eng: CyberDeckTerminalEngine = None,
+    wifi_scan_col: wifi_scanner.WiFiScannerCollector = None,
+    net_col: net_analyzer.NetworkAnalyzerCollector = None,
 ):
     import flet as ft
 
@@ -4597,6 +4738,9 @@ def launch_flet_gui(
             "udp_port": int(cfg.get("udp_port", UDP_DEFAULT_PORT) or UDP_DEFAULT_PORT),
             "esp_wifi_ssid": str(cfg.get("esp_wifi_ssid", "") or ""),
             "esp_wifi_pass": str(cfg.get("esp_wifi_pass", "") or ""),
+            "scanner_enabled": bool(cfg.get("scanner_enabled", True)),
+            "scanner_port": str(cfg.get("scanner_port", "") or ""),
+            "scanner_interval_s": float(cfg.get("scanner_interval_s", 8.0) or 8.0),
             "term_auto_switch": True,
             "synced_cover_id": "",
             "sd_missing_warned": False,
@@ -4672,6 +4816,16 @@ def launch_flet_gui(
             state["running"] = False
             try:
                 serial_mgr.stop()
+            except Exception:
+                pass
+            try:
+                if wifi_scan_col is not None:
+                    wifi_scan_col.stop()
+            except Exception:
+                pass
+            try:
+                if net_col is not None:
+                    net_col.stop()
             except Exception:
                 pass
             try:
@@ -4765,7 +4919,10 @@ def launch_flet_gui(
             udp_enabled=bool(cfg.get("udp_enabled", False)),
             udp_ip=str(cfg.get("udp_ip", "") or ""),
             udp_port=int(cfg.get("udp_port", UDP_DEFAULT_PORT) or UDP_DEFAULT_PORT),
+            excluded_ports_fn=(wifi_scan_col.get_active_ports if wifi_scan_col is not None else None),
         )
+        if wifi_scan_col is not None:
+            wifi_scan_col.set_excluded_ports_fn(serial_mgr.get_active_ports)
         ui_event_queue = serial_mgr.event_queue
         transfer_queue = serial_mgr.transfer_queue
         ack_event = serial_mgr.ack_event
@@ -4822,6 +4979,9 @@ def launch_flet_gui(
                 "udp_port": state.get("udp_port", UDP_DEFAULT_PORT),
                 "esp_wifi_ssid": state.get("esp_wifi_ssid", ""),
                 "esp_wifi_pass": state.get("esp_wifi_pass", ""),
+                "scanner_enabled": state.get("scanner_enabled", True),
+                "scanner_port": state.get("scanner_port", ""),
+                "scanner_interval_s": state.get("scanner_interval_s", 8.0),
             })
             save_ui_config(cfg)
             serial_mgr.configure_udp(
@@ -4832,18 +4992,20 @@ def launch_flet_gui(
             mkt_col.set_custom_tickers([p.get("ticker", "") for p in state["portfolio"]])
             portf_pkt, _ = mkt_col.compute_portfolio(state["portfolio"], state["portfolio_pnl_mode"])
             state["ui_dirty"] = True
-            serial_mgr.send_event(
-                {
-                    "ui": get_ui_dict(),
-                    "mkt": mkt_col.get_market_dict(),
-                    "portf": portf_pkt,
-                    "pomo": pomo_eng.get_payload(),
-                    "media": media_col.get_cyd_payload(state["synced_cover_id"]),
-                    "wth": wth_col.get_cyd_payload(),
-                    "news": gems_eng.get_cyd_news_payload(include_queue=True, force=True),
-                },
-                coalesce=True,
-            )
+            ev_pkt = {
+                "ui": get_ui_dict(),
+                "mkt": mkt_col.get_market_dict(),
+                "portf": portf_pkt,
+                "pomo": pomo_eng.get_payload(),
+                "media": media_col.get_cyd_payload(state["synced_cover_id"]),
+                "wth": wth_col.get_cyd_payload(),
+                "news": gems_eng.get_cyd_news_payload(include_queue=True, force=True),
+            }
+            if wifi_scan_col is not None:
+                ev_pkt["wrad"] = wifi_scan_col.get_cyd_payload()
+            if net_col is not None:
+                ev_pkt["neta"] = net_col.get_cyd_payload()
+            serial_mgr.send_event(ev_pkt, coalesce=True)
 
         def append_log(msg: str):
             ts = datetime.now().strftime("%H:%M:%S")
@@ -4867,6 +5029,8 @@ def launch_flet_gui(
             9: "Mídia",
             10: "Clima & News",
             11: "Terminal CYD",
+            12: "Radar Wi-Fi",
+            13: "Rede & Roteador",
         }
 
         def switch_tab(tab_idx: int):
@@ -5290,6 +5454,8 @@ def launch_flet_gui(
             (9, "🎵 Tela 9: Spotify & YT Music", "Capa 320x240 no SD + Overlay Translúcido Título/Artista", "ALBUM"),
             (10, "📰 Tela 10: Clima & News Feed", "Clima Regional (Votuporanga) + Manchetes Deslizantes (TFT_eSprite 15s)", "NEWSPAPER"),
             (11, "💻 Tela 11: Terminal Cyber Deck", "Console Verde Clássico c/ Scroll + ping, fetch, docker & Wi-Fi Scan", "TERMINAL"),
+            (12, "📡 Tela 12: Radar Wi-Fi RF", "ESP32-WROOM-32U Antena Externa • Canais 2.4 GHz & Top Redes Próximas", "RADAR"),
+            (13, "🌐 Tela 13: Rede & Roteador", "Gateway, Ping/Jitter, LAN ARP & Speedtest Fibra 700 Mbps", "ROUTER"),
         ]
         screen_cards = []
 
@@ -5344,9 +5510,10 @@ def launch_flet_gui(
                 ft.Row([screen_cards[0][1], screen_cards[1][1], screen_cards[2][1]], spacing=8),
                 ft.Row([screen_cards[3][1], screen_cards[4][1], screen_cards[5][1]], spacing=8),
                 ft.Divider(height=4, color="#151C28"),
-                ft.Text("CYD CYBER DECK v4.0 — FINANÇAS, FOCO, MÍDIA, CLIMA, NEWS FEED & TERMINAL (TELAS 6 A 11)", size=10, weight=ft.FontWeight.BOLD, color="#64748B"),
+                ft.Text("CYD CYBER DECK v4.5 — FINANÇAS, FOCO, MÍDIA, NEWS, TERMINAL, RADAR RF & REDE (TELAS 6 A 13)", size=10, weight=ft.FontWeight.BOLD, color="#64748B"),
                 ft.Row([screen_cards[6][1], screen_cards[7][1], screen_cards[8][1]], spacing=8),
                 ft.Row([screen_cards[9][1], screen_cards[10][1], screen_cards[11][1]], spacing=8),
+                ft.Row([screen_cards[12][1], screen_cards[13][1]], spacing=8),
             ],
             spacing=7,
         )
@@ -7925,6 +8092,181 @@ def launch_flet_gui(
             padding=14,
         )
 
+        # ---------------- 13. RADAR WI-FI RF (ESP32-WROOM-32U ANTENA EXTERNA • TELA 12) --
+        lbl_wrad_status = ft.Text(
+            "📡 Aguardando ESP32-WROOM-32U (Antena Externa)...",
+            size=11,
+            weight=ft.FontWeight.BOLD,
+            color="#F59E0B",
+            font_family="Consolas",
+        )
+        lbl_wrad_summary = ft.Text(
+            "Redes: 0 • Melhor: -- dBm • Canal Livre: CH1 • Mais Cheio: --",
+            size=11,
+            color="#94A3B8",
+            font_family="Consolas",
+        )
+        wrad_list_col = ft.Column(spacing=4, scroll=ft.ScrollMode.AUTO, height=165)
+
+        def on_wrad_force_scan(_e=None):
+            if wifi_scan_col is not None:
+                wifi_scan_col.force_scan()
+                append_log("📡 Varredura passiva disparada na ESP32-WROOM-32U (Antena Externa)...")
+
+        def refresh_wifi_radar_ui():
+            if wifi_scan_col is None:
+                return
+            ws = wifi_scan_col.get_ui_snapshot()
+            lbl_wrad_status.value = f"{'🟢' if ws['online'] else '🟡'} {ws['status_msg']}"
+            lbl_wrad_status.color = "#22C55E" if ws["online"] else "#F59E0B"
+            best_s = f"{ws['best_rssi']} dBm" if ws["total"] > 0 else "-- dBm"
+            bch_s = f"CH{ws['busiest_ch']}" if ws["busiest_ch"] > 0 else "--"
+            lbl_wrad_summary.value = (
+                f"Redes: {ws['total']} (Scan #{ws['scan_count']} • {ws['last_scan_str']}) • "
+                f"Melhor: {best_s} • Livre: CH{ws['free_ch']} • Cheio: {bch_s}"
+            )
+            wrad_list_col.controls.clear()
+            nets = ws.get("networks", [])
+            if not nets:
+                wrad_list_col.controls.append(
+                    ft.Text("Nenhuma rede escaneada ainda. Conecte a ESP32-WROOM-32U na USB.", size=11, color="#64748B")
+                )
+            else:
+                for net in nets[:15]:
+                    rssi_v = int(net.get("rssi", -100))
+                    r_col = "#22C55E" if rssi_v >= -62 else ("#FACC15" if rssi_v >= -75 else ("#F97316" if rssi_v >= -84 else "#EF4444"))
+                    wrad_list_col.controls.append(
+                        ft.Container(
+                            content=ft.Row(
+                                [
+                                    ft.Text(f"{net.get('ssid', '<OCULTA>')[:24]:<24}", size=11, weight=ft.FontWeight.BOLD, color="#E2E8F0", font_family="Consolas"),
+                                    ft.Text(f"CH{int(net.get('ch', 0)):02d}", size=11, color="#38BDF8", font_family="Consolas"),
+                                    ft.Text(f"{rssi_v:>4d} dBm ({net.get('quality', 0):>3d}%)", size=11, weight=ft.FontWeight.BOLD, color=r_col, font_family="Consolas"),
+                                    ft.Text(net.get("bssid", ""), size=10, color="#64748B", font_family="Consolas"),
+                                ],
+                                alignment=ft.MainAxisAlignment.SPACE_BETWEEN,
+                            ),
+                            bgcolor="#07090E",
+                            border=border_all(1, "#151C28"),
+                            border_radius=7,
+                            padding=pad_sym(horizontal=8, vertical=4),
+                        )
+                    )
+
+        sec_wifi_radar = ft.Container(
+            content=ft.Column(
+                [
+                    ft.Row(
+                        [
+                            ft.Text("📡 RADAR WI-FI RF — ESP32-WROOM-32U ANTENA EXTERNA (TELA 12)", size=13, weight=ft.FontWeight.BOLD, color="#22C55E"),
+                            ft.Row(
+                                [
+                                    ft.OutlinedButton("🔄 Escanear Agora", on_click=on_wrad_force_scan),
+                                    ft.OutlinedButton("📺 Exibir Tela 12 na CYD", on_click=lambda e: on_select_screen(12)),
+                                ],
+                                spacing=8,
+                            ),
+                        ],
+                        alignment=ft.MainAxisAlignment.SPACE_BETWEEN,
+                    ),
+                    lbl_wrad_status,
+                    lbl_wrad_summary,
+                    wrad_list_col,
+                ],
+                spacing=8,
+            ),
+            bgcolor="#0B0F17",
+            border=border_all(1, "#22C55E44"),
+            border_radius=14,
+            padding=14,
+        )
+
+        # ---------------- 14. ANALISE DE REDE, ROTEADOR & FIBRA 700M (TELA 13) --
+        lbl_neta_gw = ft.Text(
+            "🌐 Roteador / Gateway: detectando...",
+            size=11,
+            weight=ft.FontWeight.BOLD,
+            color="#38BDF8",
+            font_family="Consolas",
+        )
+        lbl_neta_spd = ft.Text(
+            "Link: ↓0.0 ↑0.0 Mbps • Speedtest: aguarde 'cyd speed' ou clique abaixo",
+            size=11,
+            color="#94A3B8",
+            font_family="Consolas",
+        )
+        neta_lan_col = ft.Column(spacing=3, scroll=ft.ScrollMode.AUTO, height=110)
+
+        def on_neta_speedtest(_e=None):
+            if net_col is not None:
+                net_col.trigger_speedtest()
+                append_log("⚡ Speedtest Fibra iniciado (acompanhe na Tela 13 da CYD)...")
+
+        def on_neta_open_router(_e=None):
+            if net_col is not None:
+                url = net_col.get_ui_snapshot().get("admin_url", "")
+                if url:
+                    webbrowser.open(url)
+                    append_log(f"🌐 Abrindo painel de administração do roteador: {url}")
+
+        def refresh_net_analyzer_ui():
+            if net_col is None:
+                return
+            ns = net_col.get_ui_snapshot()
+            spd = ns.get("speedtest", {})
+            lbl_neta_gw.value = (
+                f"{'🟢' if ns.get('gw_up') else '🔴'} GW {ns.get('gateway_ip','--')} ({ns.get('gw_ms',0):.1f}ms • jit {ns.get('gw_jit',0):.1f}ms • loss {ns.get('gw_loss',0)}%) • "
+                f"WAN {ns.get('wan_ms',0):.1f}ms • DNS {ns.get('dns_ms',0)}ms • ISP: {ns.get('isp','--')}"
+            )
+            if spd.get("running"):
+                spd_s = "⏳ Medindo velocidade..."
+            elif spd.get("dl_mbps", 0) > 0:
+                spd_s = f"DL {spd['dl_mbps']:.1f} Mbps ({spd.get('plan_pct',0)}%) | UL {spd['ul_mbps']:.1f} Mbps ({spd.get('time_str')})"
+            else:
+                spd_s = "Sem teste recente"
+            lbl_neta_spd.value = (
+                f"Tempo real: ↓{ns.get('rx_mbps',0):.1f} ↑{ns.get('tx_mbps',0):.1f} Mbps (Plano {ns.get('plan_mbps',700)}M) • Speedtest: {spd_s}"
+            )
+            neta_lan_col.controls.clear()
+            for h in ns.get("lan_hosts", [])[:10]:
+                neta_lan_col.controls.append(
+                    ft.Text(
+                        f"  • {h.get('ip',''):<15}  {h.get('mac',''):<17}  [{h.get('tag','')}] ({h.get('state','')})",
+                        size=10,
+                        color="#CBD5E1",
+                        font_family="Consolas",
+                    )
+                )
+
+        sec_net_analyzer = ft.Container(
+            content=ft.Column(
+                [
+                    ft.Row(
+                        [
+                            ft.Text("🌐 ANÁLISE DE REDE, ROTEADOR & LINK FIBRA 700 Mbps (TELA 13)", size=13, weight=ft.FontWeight.BOLD, color="#38BDF8"),
+                            ft.Row(
+                                [
+                                    ft.OutlinedButton("⚡ Speedtest Fibra", on_click=on_neta_speedtest),
+                                    ft.OutlinedButton("🌐 Abrir Roteador", on_click=on_neta_open_router),
+                                    ft.OutlinedButton("📺 Exibir Tela 13 na CYD", on_click=lambda e: on_select_screen(13)),
+                                ],
+                                spacing=8,
+                            ),
+                        ],
+                        alignment=ft.MainAxisAlignment.SPACE_BETWEEN,
+                    ),
+                    lbl_neta_gw,
+                    lbl_neta_spd,
+                    neta_lan_col,
+                ],
+                spacing=8,
+            ),
+            bgcolor="#0B0F17",
+            border=border_all(1, "#38BDF844"),
+            border_radius=14,
+            padding=14,
+        )
+
         # ---------------- CONSOLE SERIAL & LOG (COM COPIAR E LIMPAR) ---------
         txt_console = ft.Text(
             value="Inicializando CYD Cyber Deck v4.0 (Telemetria, Clima Regional, News Feed, Terminal CYD, Mercado, Portfólio, Pomodoro & Mídia)...",
@@ -8014,6 +8356,8 @@ def launch_flet_gui(
                     "news": gems_eng.get_ui_snapshot() if gems_eng else {},
                     "gems": gems_eng.get_ui_snapshot() if gems_eng else {},
                     "terminal": term_eng.get_snapshot() if term_eng else {},
+                    "wifi_radar": wifi_scan_col.get_ui_snapshot() if wifi_scan_col else {},
+                    "net_analyzer": net_col.get_ui_snapshot() if net_col else {},
                     "upload": upload_state,
                     "connected": True,
                 }
@@ -8065,7 +8409,7 @@ def launch_flet_gui(
                     if val is not None:
                         try:
                             scr_idx = int(val)
-                            if 0 <= scr_idx <= 11:
+                            if 0 <= scr_idx <= 13:
                                 on_select_screen(scr_idx)
                                 append_log(f"📱 Smartphone selecionou Tela {scr_idx}")
                         except Exception:
@@ -8100,12 +8444,49 @@ def launch_flet_gui(
 
                 if p == "/api/screen":
                     scr = int(body.get("screen", state["screen"]))
-                    if 0 <= scr <= 11:
+                    if 0 <= scr <= 13:
                         on_select_screen(scr)
                         append_log(f"📱 Smartphone selecionou Tela {scr}")
                     else:
                         ok = False
-                        err_msg = "Tela inválida (0-11)"
+                        err_msg = "Tela inválida (0-13)"
+
+                elif p == "/api/net_analyzer":
+                    act = str(body.get("action", "refresh")).lower()
+                    if net_col is not None:
+                        if act == "speedtest":
+                            net_col.trigger_speedtest()
+                            append_log("⚡ Speedtest Fibra disparado via Web/CLI")
+                        elif act == "set_plan" and body.get("plan_mbps"):
+                            pm = int(body["plan_mbps"])
+                            net_col.set_plan_mbps(pm)
+                            cfg["net_plan_mbps"] = pm
+                            save_ui_config(cfg)
+                        elif act == "router_diag":
+                            diag = net_col.get_router_diagnostics()
+                            content = json.dumps({"ok": True, "diag": diag}, ensure_ascii=False).encode("utf-8")
+                            self.send_response(200)
+                            self.send_header("Content-Type", "application/json; charset=utf-8")
+                            self.send_header("Content-Length", str(len(content)))
+                            self._send_cors()
+                            self.end_headers()
+                            self.wfile.write(content)
+                            return
+                        else:
+                            net_col.force_refresh()
+
+                elif p == "/api/wifi_radar":
+                    act = str(body.get("action", "scan")).lower()
+                    if wifi_scan_col is not None:
+                        if act == "config":
+                            wifi_scan_col.configure(
+                                enabled=body.get("enabled"),
+                                port=body.get("port"),
+                                interval_s=body.get("interval_s"),
+                            )
+                        else:
+                            wifi_scan_col.force_scan()
+                            append_log("📡 Smartphone/Web solicitou varredura no Radar Wi-Fi RF")
 
                 elif p == "/api/weather":
                     act = str(body.get("action", "refresh")).lower()
@@ -8437,9 +8818,9 @@ def launch_flet_gui(
                 expand=True,
                 visible=False,
             ),
-            # Aba 7: Telemetria Wi-Fi UDP (Porta 8888) + Controle Remoto Smartphone + Console Serial
+            # Aba 7: Radar Wi-Fi RF (Tela 12) + Análise de Rede (Tela 13) + Wi-Fi UDP + Controle Remoto + Console
             ft.Column(
-                [sec_wifi_udp, sec_mobile_remote, sec_console],
+                [sec_wifi_radar, sec_net_analyzer, sec_wifi_udp, sec_mobile_remote, sec_console],
                 spacing=10,
                 scroll=ft.ScrollMode.AUTO,
                 expand=True,
@@ -8628,6 +9009,8 @@ def launch_flet_gui(
             elif act == 4:
                 refresh_terminal_ui()
             elif act == 7:
+                refresh_wifi_radar_ui()
+                refresh_net_analyzer_ui()
                 txt_console.value = "\n".join(log_lines)
 
             safe_update(nav_rail, tabs_viewport)
@@ -8835,6 +9218,9 @@ def launch_flet_gui(
                     refresh_portfolio_ui()
                 elif active_tab == 4:
                     refresh_terminal_ui()
+                elif active_tab == 7:
+                    refresh_wifi_radar_ui()
+                    refresh_net_analyzer_ui()
             except Exception:
                 pass
 
@@ -8889,6 +9275,8 @@ def launch_flet_gui(
                 dirty_controls.append(sec_cyber_terminal)
             elif active_tab == 5:
                 dirty_controls.append(lbl_power_status)
+            elif active_tab == 7:
+                dirty_controls.extend([sec_wifi_radar, sec_net_analyzer])
             safe_update(*dirty_controls)
 
         def orchestrator_worker():
@@ -8998,6 +9386,10 @@ def launch_flet_gui(
                                 include_queue=("ui" in payload),
                                 force=("ui" in payload),
                             )
+                            if wifi_scan_col is not None:
+                                payload["wrad"] = wifi_scan_col.get_cyd_payload()
+                            if net_col is not None:
+                                payload["neta"] = net_col.get_cyd_payload()
 
                         # Envia de forma 100% não-bloqueante para o SerialManager (substitui amostra obsoleta se ocupada)
                         serial_mgr.send_telemetry(payload)
@@ -9018,12 +9410,730 @@ def launch_flet_gui(
         ft.app(target=build_app)
 
 
+def run_headless_daemon(
+    col: Collector,
+    mkt_col: MarketCollector,
+    media_col: MediaCollector,
+    pomo_eng: PomodoroEngine,
+    wth_col: WeatherCollector,
+    gems_eng: NewsFeedCollector,
+    cli_args,
+    term_eng: CyberDeckTerminalEngine = None,
+    wifi_scan_col: wifi_scanner.WiFiScannerCollector = None,
+    net_col: net_analyzer.NetworkAnalyzerCollector = None,
+):
+    """Executa o agente CYD em segundo plano puro (sem janela Flet), ideal para systemd --user."""
+    import signal
+
+    if term_eng is None:
+        term_eng = CyberDeckTerminalEngine(collector=col)
+    elif term_eng.collector is None:
+        term_eng.collector = col
+
+    cfg = load_ui_config()
+    state = {
+        "screen": int(cfg.get("screen", 1)),
+        "hex_color": cfg.get("hex_color", "#00FF00").upper(),
+        "color": cfg.get("color", "0x07E0"),
+        "bg": cfg.get("bg", "none"),
+        "brt": int(cfg.get("brt", 200)),
+        "ticker": bool(cfg.get("ticker", True)),
+        "sd_files": list(cfg.get("sd_files", [])),
+        "sleep_enabled": bool(cfg.get("sleep_enabled", True)),
+        "sleep_timeout_min": int(cfg.get("sleep_timeout_min", 15)),
+        "night_mode_enabled": bool(cfg.get("night_mode_enabled", True)),
+        "night_start_hour": int(cfg.get("night_start_hour", 22)),
+        "night_end_hour": int(cfg.get("night_end_hour", 6)),
+        "night_brightness": int(cfg.get("night_brightness", 40)),
+        "alert_rules": [dict(r) for r in cfg.get("alert_rules", DEFAULT_ALERT_RULES)],
+        "portfolio": [dict(p) for p in cfg.get("portfolio", DEFAULT_PORTFOLIO)],
+        "portfolio_pnl_mode": str(cfg.get("portfolio_pnl_mode", "hist")),
+        "pomo_work_min": int(cfg.get("pomo_work_min", 25)),
+        "pomo_break_min": int(cfg.get("pomo_break_min", 5)),
+        "pomo_long_min": int(cfg.get("pomo_long_min", 15)),
+        "pomo_buzzer": bool(cfg.get("pomo_buzzer", True)),
+        "media_source_pref": str(cfg.get("media_source_pref", "auto")),
+        "media_auto_cover": bool(cfg.get("media_auto_cover", True)),
+        "weather_city": str(cfg.get("weather_city", "Votuporanga")),
+        "news_topics": list(cfg.get("news_topics", DEFAULT_NEWS_TOPICS)),
+        "news_api_key": str(cfg.get("news_api_key", os.environ.get("NEWS_API_KEY", ""))),
+        "udp_enabled": bool(cfg.get("udp_enabled", False)),
+        "udp_ip": str(cfg.get("udp_ip", "") or ""),
+        "udp_port": int(cfg.get("udp_port", UDP_DEFAULT_PORT) or UDP_DEFAULT_PORT),
+        "esp_wifi_ssid": str(cfg.get("esp_wifi_ssid", "") or ""),
+        "esp_wifi_pass": str(cfg.get("esp_wifi_pass", "") or ""),
+        "term_auto_switch": True,
+        "synced_cover_id": "",
+        "sd_missing_warned": False,
+        "current_effective_brt": int(cfg.get("brt", 200)),
+        "running": True,
+        "ui_dirty": True,
+        "last_ui_sync": 0.0,
+        "last_mkt_sync": 0.0,
+    }
+
+    mkt_col.set_custom_tickers([p.get("ticker", "") for p in state["portfolio"]])
+    media_col.set_source_pref(state["media_source_pref"])
+    pomo_eng.set_durations(state["pomo_work_min"], state["pomo_break_min"], state["pomo_long_min"])
+    pomo_eng.buzzer_enabled = state["pomo_buzzer"]
+    gems_eng.set_topics(state["news_topics"], state["news_api_key"])
+
+    def log_h(msg: str):
+        ts = datetime.now().strftime("%H:%M:%S")
+        print(f"[{ts}] {msg}", flush=True)
+
+    serial_mgr = SerialManager(
+        preferred_port=cli_args.port,
+        baud=BAUD,
+        udp_enabled=bool(cfg.get("udp_enabled", False)),
+        udp_ip=str(cfg.get("udp_ip", "") or ""),
+        udp_port=int(cfg.get("udp_port", UDP_DEFAULT_PORT) or UDP_DEFAULT_PORT),
+        excluded_ports_fn=(wifi_scan_col.get_active_ports if wifi_scan_col is not None else None),
+        on_log=log_h,
+    )
+    if wifi_scan_col is not None:
+        wifi_scan_col.set_excluded_ports_fn(serial_mgr.get_active_ports)
+        wifi_scan_col.set_log_callback(log_h)
+    if net_col is not None:
+        net_col.set_log_callback(log_h)
+    ui_event_queue = serial_mgr.event_queue
+    transfer_queue = serial_mgr.transfer_queue
+    ack_event = serial_mgr.ack_event
+    last_ack = serial_mgr.last_ack
+    upload_state = {"active": False, "pct": 0.0, "status": "", "target": ""}
+
+    def get_ui_dict():
+        bg = (state["bg"] or "none").strip()
+        if bg.startswith("/"):
+            bg = bg[1:]
+        return {
+            "screen": int(state["screen"]),
+            "color": state["color"],
+            "bg": bg,
+            "brt": int(state.get("current_effective_brt", state["brt"])),
+            "ticker": bool(state["ticker"]),
+        }
+
+    def persist_and_queue_ui():
+        cfg.update({
+            "screen": state["screen"],
+            "hex_color": state["hex_color"],
+            "color": state["color"],
+            "bg": state["bg"],
+            "brt": state["brt"],
+            "ticker": state["ticker"],
+            "sd_files": state["sd_files"],
+            "sleep_enabled": state["sleep_enabled"],
+            "sleep_timeout_min": state["sleep_timeout_min"],
+            "night_mode_enabled": state["night_mode_enabled"],
+            "night_start_hour": state["night_start_hour"],
+            "night_end_hour": state["night_end_hour"],
+            "night_brightness": state["night_brightness"],
+            "alert_rules": state["alert_rules"],
+            "portfolio": state["portfolio"],
+            "portfolio_pnl_mode": state["portfolio_pnl_mode"],
+            "pomo_work_min": state["pomo_work_min"],
+            "pomo_break_min": state["pomo_break_min"],
+            "pomo_long_min": state["pomo_long_min"],
+            "pomo_buzzer": state["pomo_buzzer"],
+            "media_source_pref": state["media_source_pref"],
+            "media_auto_cover": state["media_auto_cover"],
+            "weather_city": state["weather_city"],
+            "news_topics": state["news_topics"],
+            "news_api_key": state["news_api_key"],
+            "udp_enabled": state.get("udp_enabled", False),
+            "udp_ip": state.get("udp_ip", ""),
+            "udp_port": state.get("udp_port", UDP_DEFAULT_PORT),
+            "esp_wifi_ssid": state.get("esp_wifi_ssid", ""),
+            "esp_wifi_pass": state.get("esp_wifi_pass", ""),
+        })
+        save_ui_config(cfg)
+        serial_mgr.configure_udp(
+            enabled=state.get("udp_enabled", False),
+            ip=state.get("udp_ip", ""),
+            port=state.get("udp_port", UDP_DEFAULT_PORT),
+        )
+        mkt_col.set_custom_tickers([p.get("ticker", "") for p in state["portfolio"]])
+        portf_pkt, _ = mkt_col.compute_portfolio(state["portfolio"], state["portfolio_pnl_mode"])
+        state["ui_dirty"] = True
+        ev_pkt = {
+            "ui": get_ui_dict(),
+            "mkt": mkt_col.get_market_dict(),
+            "portf": portf_pkt,
+            "pomo": pomo_eng.get_payload(),
+            "media": media_col.get_cyd_payload(state["synced_cover_id"]),
+            "wth": wth_col.get_cyd_payload(),
+            "news": gems_eng.get_cyd_news_payload(include_queue=True, force=True),
+        }
+        if wifi_scan_col is not None:
+            ev_pkt["wrad"] = wifi_scan_col.get_cyd_payload()
+        if net_col is not None:
+            ev_pkt["neta"] = net_col.get_cyd_payload()
+        serial_mgr.send_event(ev_pkt, coalesce=True)
+
+    def request_sd_files():
+        ui_event_queue.put({"cmd": "list_sd"})
+
+    def _wait_ack(expected_prefix: str, timeout: float = 4.0):
+        t0 = time.time()
+        while time.time() - t0 < timeout:
+            if ack_event.wait(timeout=0.06):
+                ack_event.clear()
+                val = last_ack.get("val") or ""
+                if val.startswith("ERR_NO_SD"):
+                    return False, "ERR_NO_SD"
+                if val.startswith("ERR_OPEN"):
+                    return False, "ERR_OPEN"
+                if val.startswith(expected_prefix):
+                    return True, val
+        return False, "TIMEOUT"
+
+    def start_file_transfer(filename: str, raw_bytes: bytes):
+        if not raw_bytes or upload_state["active"]:
+            return
+        try:
+            target_name, data = prepare_image_bytes_for_cyd(filename, raw_bytes)
+        except Exception as ex:
+            log_h(f"Erro ao preparar imagem: {ex}")
+            return
+
+        def _worker():
+            upload_state.update({"active": True, "pct": 0.0, "status": f"Gravando '{target_name}'...", "target": target_name})
+            ack_event.clear()
+            transfer_queue.put({"file_name": f"/{target_name}", "file_mode": "w"})
+            ok, resp = _wait_ack("ACK_START", timeout=4.5)
+            if not ok:
+                upload_state.update({"active": False, "status": f"Falha ({resp})"})
+                return
+            total = len(data)
+            seq = 0
+            for i in range(0, total, 512):
+                chunk = data[i:i + 512]
+                b64 = base64.b64encode(chunk).decode("ascii")
+                ack_event.clear()
+                transfer_queue.put({"file_name": f"/{target_name}", "file_mode": "a", "seq": seq, "file_data": b64})
+                ok, resp = _wait_ack("ACK_CHUNK", timeout=3.5)
+                if not ok:
+                    upload_state.update({"active": False, "status": f"Erro bloco {seq} ({resp})"})
+                    return
+                seq += 1
+                upload_state["pct"] = min((i + len(chunk)) / float(total), 1.0)
+            ack_event.clear()
+            transfer_queue.put({"file_name": f"/{target_name}", "file_mode": "eof"})
+            ok, resp = _wait_ack("ACK_EOF", timeout=5.0)
+            upload_state["active"] = False
+            if ok:
+                upload_state.update({"pct": 1.0, "status": f"'{target_name}' gravado!"})
+                if target_name not in state["sd_files"]:
+                    state["sd_files"].append(target_name)
+                state["bg"] = target_name
+                persist_and_queue_ui()
+                log_h(f"Upload SD concluído: {target_name}")
+            else:
+                upload_state["status"] = f"Falha EOF ({resp})"
+
+        threading.Thread(target=_worker, daemon=True).start()
+
+    def start_media_cover_transfer(cid: str, cyd_bytes: bytes):
+        if not cyd_bytes or upload_state["active"]:
+            return
+        upload_state["active"] = True
+
+        def _cov_worker():
+            target_name = "_media_cov.jpg"
+            upload_state.update({"pct": 0.0, "status": "Sincronizando capa no SD...", "target": target_name})
+            ack_event.clear()
+            transfer_queue.put({"file_name": f"/{target_name}", "file_mode": "w"})
+            ok, resp = _wait_ack("ACK_START", timeout=4.0)
+            if not ok:
+                upload_state["active"] = False
+                if resp == "ERR_NO_SD":
+                    if not state["sd_missing_warned"]:
+                        state["sd_missing_warned"] = True
+                        log_h("Cartão SD não detectado na CYD (capa ignorada).")
+                    state["synced_cover_id"] = cid
+                return
+            total = len(cyd_bytes)
+            seq = 0
+            for i in range(0, total, 512):
+                chunk = cyd_bytes[i:i + 512]
+                b64 = base64.b64encode(chunk).decode("ascii")
+                ack_event.clear()
+                transfer_queue.put({"file_name": f"/{target_name}", "file_mode": "a", "seq": seq, "file_data": b64})
+                ok, _resp = _wait_ack("ACK_CHUNK", timeout=3.2)
+                if not ok:
+                    upload_state["active"] = False
+                    return
+                seq += 1
+                upload_state["pct"] = min((i + len(chunk)) / float(total), 1.0)
+            ack_event.clear()
+            transfer_queue.put({"file_name": f"/{target_name}", "file_mode": "eof", "is_cover": True, "cid": cid})
+            ok, _resp = _wait_ack("ACK_EOF", timeout=4.5)
+            upload_state["active"] = False
+            if ok:
+                state["synced_cover_id"] = cid
+                state["sd_missing_warned"] = False
+                ui_event_queue.put({"media": media_col.get_cyd_payload(cid)})
+                log_h(f"Capa sincronizada no SD ({len(cyd_bytes)/1024:.1f} KB)")
+
+        threading.Thread(target=_cov_worker, daemon=True).start()
+
+    def on_serial_status_change(snap: dict):
+        st_code = str(snap.get("state", "")).lower()
+        port_str = snap.get("port", "")
+        if st_code == "connected":
+            state["ui_dirty"] = True
+            log_h(f"SerialManager conectado em {port_str} ({snap.get('baud', BAUD)} bps)")
+            request_sd_files()
+        elif st_code in ("error", "disconnected"):
+            log_h(f"Serial desconectada ({snap.get('last_error', 'erro I/O')}). Tentando reconectar...")
+
+    def on_serial_rx_line(raw: str):
+        if raw.startswith("TERM_LOG:"):
+            t_line = raw.split("TERM_LOG:", 1)[1].strip()
+            if t_line:
+                term_eng.append_line(t_line)
+        elif raw == "MONITOR_READY":
+            state["ui_dirty"] = True
+            state["synced_cover_id"] = ""
+            request_sd_files()
+        elif raw.startswith("SD_FILES:"):
+            try:
+                files = json.loads(raw.split("SD_FILES:", 1)[1])
+                if isinstance(files, list):
+                    base_opts = ["none", "terminal", "z1p0"]
+                    merged = base_opts + [f for f in files if f not in base_opts and not str(f).startswith("_media")]
+                    state["sd_files"] = merged
+                    cfg["sd_files"] = merged
+                    save_ui_config(cfg)
+            except Exception:
+                pass
+        elif raw.startswith("SD_INIT:OK"):
+            state["sd_missing_warned"] = False
+            log_h(f"Cartão MicroSD montado ({raw}).")
+
+    serial_mgr.set_callbacks(on_rx_line=on_serial_rx_line, on_status_change=on_serial_status_change)
+
+    class HeadlessMobileHandler(http.server.BaseHTTPRequestHandler):
+        def log_message(self, format, *args):
+            pass
+
+        def _send_cors(self):
+            self.send_header("Access-Control-Allow-Origin", "*")
+            self.send_header("Access-Control-Allow-Methods", "GET, POST, OPTIONS")
+            self.send_header("Access-Control-Allow-Headers", "Content-Type, Authorization")
+
+        def do_OPTIONS(self):
+            self.send_response(204)
+            self._send_cors()
+            self.end_headers()
+
+        def _build_mobile_status(self) -> dict:
+            return {
+                "screen": state["screen"],
+                "hex_color": state["hex_color"],
+                "color": state["color"],
+                "bg": state["bg"],
+                "brt": state["brt"],
+                "ticker": state["ticker"],
+                "sleep_enabled": state["sleep_enabled"],
+                "night_mode_enabled": state["night_mode_enabled"],
+                "sd_files": state["sd_files"],
+                "sys": col.sample_sys() if col else {},
+                "mkt": mkt_col.get_market_dict() if mkt_col else {},
+                "portf": mkt_col.compute_portfolio(state["portfolio"], state["portfolio_pnl_mode"])[0] if mkt_col else {},
+                "pomodoro": pomo_eng.get_ui_snapshot() if pomo_eng else {},
+                "media": media_col.get_ui_snapshot() if media_col else {},
+                "weather": wth_col.get_ui_snapshot() if wth_col else {},
+                "news": gems_eng.get_ui_snapshot() if gems_eng else {},
+                "gems": gems_eng.get_ui_snapshot() if gems_eng else {},
+                "terminal": term_eng.get_snapshot() if term_eng else {},
+                "wifi_radar": wifi_scan_col.get_ui_snapshot() if wifi_scan_col else {},
+                "net_analyzer": net_col.get_ui_snapshot() if net_col else {},
+                "upload": upload_state,
+                "connected": True,
+            }
+
+        def do_GET(self):
+            parsed = urllib.parse.urlparse(self.path)
+            p = parsed.path
+            if p in ("/", "/index.html"):
+                content = mobile_web.HTML_MOBILE_APP.encode("utf-8")
+                self.send_response(200)
+                self.send_header("Content-Type", "text/html; charset=utf-8")
+                self.send_header("Content-Length", str(len(content)))
+                self.send_header("Cache-Control", "no-cache")
+                self._send_cors()
+                self.end_headers()
+                self.wfile.write(content)
+            elif p == "/api/status":
+                content = json.dumps(self._build_mobile_status(), ensure_ascii=False).encode("utf-8")
+                self.send_response(200)
+                self.send_header("Content-Type", "application/json; charset=utf-8")
+                self.send_header("Content-Length", str(len(content)))
+                self._send_cors()
+                self.end_headers()
+                self.wfile.write(content)
+            elif p == "/api/stream":
+                self.send_response(200)
+                self.send_header("Content-Type", "text/event-stream; charset=utf-8")
+                self.send_header("Cache-Control", "no-cache")
+                self.send_header("Connection", "keep-alive")
+                self._send_cors()
+                self.end_headers()
+                while state["running"]:
+                    chunk = f"data: {json.dumps(self._build_mobile_status(), ensure_ascii=False)}\n\n".encode("utf-8")
+                    try:
+                        self.wfile.write(chunk)
+                        self.wfile.flush()
+                    except (ConnectionResetError, BrokenPipeError, ConnectionAbortedError, OSError):
+                        break
+                    time.sleep(1.0)
+            elif p == "/api/screen":
+                qs = urllib.parse.parse_qs(parsed.query)
+                val = qs.get("s", qs.get("screen", [None]))[0]
+                if val is not None:
+                    try:
+                        scr_idx = int(val)
+                        if 0 <= scr_idx <= 13:
+                            state["screen"] = scr_idx
+                            persist_and_queue_ui()
+                    except Exception:
+                        pass
+                content = json.dumps({"ok": True, "screen": state["screen"]}).encode("utf-8")
+                self.send_response(200)
+                self.send_header("Content-Type", "application/json; charset=utf-8")
+                self.send_header("Content-Length", str(len(content)))
+                self._send_cors()
+                self.end_headers()
+                self.wfile.write(content)
+            else:
+                self.send_response(404)
+                self._send_cors()
+                self.end_headers()
+
+        def do_POST(self):
+            parsed = urllib.parse.urlparse(self.path)
+            p = parsed.path
+            length = int(self.headers.get("Content-Length", 0))
+            body = {}
+            if length > 0:
+                try:
+                    body = json.loads(self.rfile.read(length).decode("utf-8", errors="ignore"))
+                except Exception:
+                    pass
+
+            ok = True
+            err_msg = ""
+            if p == "/api/screen":
+                scr = int(body.get("screen", state["screen"]))
+                if 0 <= scr <= 13:
+                    state["screen"] = scr
+                    persist_and_queue_ui()
+                else:
+                    ok, err_msg = False, "Tela inválida (0-13)"
+            elif p == "/api/net_analyzer":
+                act = str(body.get("action", "refresh")).lower()
+                if net_col is not None:
+                    if act == "speedtest":
+                        net_col.trigger_speedtest()
+                        log_h("Speedtest Fibra disparado via Web/CLI")
+                    elif act == "set_plan" and body.get("plan_mbps"):
+                        pm = int(body["plan_mbps"])
+                        net_col.set_plan_mbps(pm)
+                        cfg["net_plan_mbps"] = pm
+                        save_ui_config(cfg)
+                        log_h(f"Plano de internet ajustado para {pm} Mbps")
+                    elif act == "router_diag":
+                        diag = net_col.get_router_diagnostics()
+                        content = json.dumps({"ok": True, "diag": diag}, ensure_ascii=False).encode("utf-8")
+                        self.send_response(200)
+                        self.send_header("Content-Type", "application/json; charset=utf-8")
+                        self.send_header("Content-Length", str(len(content)))
+                        self._send_cors()
+                        self.end_headers()
+                        self.wfile.write(content)
+                        return
+                    else:
+                        net_col.force_refresh()
+            elif p == "/api/wifi_radar":
+                act = str(body.get("action", "scan")).lower()
+                if wifi_scan_col is not None:
+                    if act == "config":
+                        wifi_scan_col.configure(
+                            enabled=body.get("enabled"),
+                            port=body.get("port"),
+                            interval_s=body.get("interval_s"),
+                        )
+                    else:
+                        wifi_scan_col.force_scan()
+                        log_h("Varredura manual solicitada via API para ESP32-WROOM-32U")
+            elif p == "/api/weather":
+                act = str(body.get("action", "refresh")).lower()
+                if act == "city" and body.get("city"):
+                    state["weather_city"] = str(body["city"]).strip() or "Votuporanga"
+                    wth_col.set_city(state["weather_city"])
+                    persist_and_queue_ui()
+                elif act == "storm":
+                    is_sim = not wth_col.get_ui_snapshot().get("sim_storm", False)
+                    wth_col.trigger_storm_simulation(active=is_sim)
+                    ui_event_queue.put({"wth": wth_col.get_cyd_payload()})
+                else:
+                    wth_col.force_refresh()
+            elif p in ("/api/news", "/api/gem"):
+                act = str(body.get("action", "next")).lower()
+                if act == "toggle_topic" and body.get("topic"):
+                    t_name = str(body["topic"]).strip()
+                    curr = list(state["news_topics"])
+                    if t_name in curr and len(curr) > 1:
+                        curr.remove(t_name)
+                    elif t_name not in curr:
+                        curr.append(t_name)
+                    state["news_topics"] = curr
+                    gems_eng.set_topics(curr, state["news_api_key"])
+                    persist_and_queue_ui()
+                elif act == "topics" and isinstance(body.get("topics"), list):
+                    state["news_topics"] = [str(x).strip() for x in body["topics"] if str(x).strip()]
+                    gems_eng.set_topics(state["news_topics"], state["news_api_key"])
+                    persist_and_queue_ui()
+                elif act == "refresh":
+                    threading.Thread(
+                        target=lambda: (gems_eng.fetch_now(), ui_event_queue.put({"news": gems_eng.get_cyd_news_payload(include_queue=True, force=True)})),
+                        daemon=True,
+                    ).start()
+                else:
+                    gems_eng.next_headline()
+                    ui_event_queue.put({"news": gems_eng.get_cyd_news_payload(include_queue=False, force=True)})
+            elif p == "/api/terminal":
+                cmd_str = str(body.get("cmd", "")).strip()
+                if cmd_str:
+                    if state.get("term_auto_switch", True):
+                        state["screen"] = 11
+                    term_eng.execute_command(cmd_str, dispatch_fn=lambda pkt: ui_event_queue.put(pkt), log_fn=log_h, auto_switch_screen=True)
+                else:
+                    ok, err_msg = False, "Comando vazio"
+            elif p == "/api/color":
+                h = str(body.get("hex", state["hex_color"])).strip().upper()
+                if not h.startswith("#"):
+                    h = "#" + h
+                if len(h) == 7:
+                    state["hex_color"] = h
+                    state["color"] = rgb_hex_to_rgb565_str(h)
+                    persist_and_queue_ui()
+            elif p == "/api/brightness":
+                state["brt"] = max(0, min(255, int(body.get("brt", state["brt"]))))
+                persist_and_queue_ui()
+            elif p == "/api/bg":
+                state["bg"] = body.get("bg", state["bg"])
+                persist_and_queue_ui()
+            elif p == "/api/ticker":
+                state["ticker"] = bool(body["ticker"]) if "ticker" in body else (not state["ticker"])
+                persist_and_queue_ui()
+            elif p == "/api/pomodoro":
+                act = str(body.get("action", "toggle")).lower()
+                if act == "toggle":
+                    pomo_eng.toggle()
+                elif act == "reset":
+                    pomo_eng.reset()
+                elif act == "skip":
+                    pomo_eng.skip()
+                elif act == "phase":
+                    pomo_eng.set_phase(str(body.get("phase", "WORK")))
+                ui_event_queue.put({"pomo": pomo_eng.get_payload()})
+            elif p == "/api/media":
+                act = str(body.get("action", "play_pause")).lower()
+                if act in ("play_pause", "next", "prev"):
+                    media_col.control(act)
+                elif act == "sync_cover":
+                    _tk, cid, c_bytes = media_col.get_cover_for_sd()
+                    if c_bytes:
+                        state["synced_cover_id"] = ""
+                        start_media_cover_transfer(cid or "manual", c_bytes)
+            elif p == "/api/power":
+                if "sleep_enabled" in body:
+                    state["sleep_enabled"] = bool(body["sleep_enabled"])
+                if "night_mode_enabled" in body:
+                    state["night_mode_enabled"] = bool(body["night_mode_enabled"])
+                persist_and_queue_ui()
+            elif p == "/api/test_alert":
+                ui_event_queue.put({"alrt": {"bz": True, "led": state["color"], "p": 2}})
+            elif p == "/api/refresh_sd":
+                request_sd_files()
+            elif p == "/api/upload":
+                fname = body.get("filename", "mobile_wall.jpg")
+                b64_data = body.get("data", "")
+                if b64_data:
+                    try:
+                        start_file_transfer(fname, base64.b64decode(b64_data))
+                    except Exception as ex:
+                        ok, err_msg = False, str(ex)
+                else:
+                    ok, err_msg = False, "Nenhum dado de imagem recebido"
+            else:
+                self.send_response(404)
+                self._send_cors()
+                self.end_headers()
+                return
+
+            res_payload = {"ok": ok, "state": get_ui_dict()}
+            if err_msg:
+                res_payload["error"] = err_msg
+            content = json.dumps(res_payload, ensure_ascii=False).encode("utf-8")
+            self.send_response(200 if ok else 400)
+            self.send_header("Content-Type", "application/json; charset=utf-8")
+            self.send_header("Content-Length", str(len(content)))
+            self._send_cors()
+            self.end_headers()
+            self.wfile.write(content)
+
+    class _HeadlessHTTPServer(http.server.ThreadingHTTPServer):
+        allow_reuse_address = True
+
+    mobile_server = None
+    mobile_port = 8088
+    for test_port in (8088, 8089, 8550, 8551, 8552):
+        try:
+            mobile_server = _HeadlessHTTPServer(("0.0.0.0", test_port), HeadlessMobileHandler)
+            mobile_port = test_port
+            break
+        except OSError:
+            continue
+
+    if mobile_server:
+        threading.Thread(target=mobile_server.serve_forever, daemon=True, name="HeadlessMobileHTTP").start()
+        log_h(f"Painel Web/Mobile ativo em http://{get_local_lan_ip()}:{mobile_port} (http://127.0.0.1:{mobile_port})")
+
+    def _handle_stop(signum, _frame):
+        log_h(f"Sinal {signum} recebido. Encerrando agente CYD headless...")
+        state["running"] = False
+
+    signal.signal(signal.SIGTERM, _handle_stop)
+    signal.signal(signal.SIGINT, _handle_stop)
+
+    log_h("CYD Cyber Deck iniciado em modo HEADLESS (segundo plano).")
+    last_telemetry_t = 0.0
+    last_fired_alerts = {}
+    last_dispatched_brt = -1
+    last_storm_alert_state = False
+    pending_cov_id = ""
+    pending_cov_t0 = 0.0
+
+    try:
+        while state["running"]:
+            try:
+                now = time.time()
+                mkt_metrics = mkt_col.get_market_dict()
+
+                pomo_done_ev = pomo_eng.tick()
+                if pomo_done_ev and pomo_done_ev.get("buzzer", True):
+                    led_c = "0x07FF" if pomo_done_ev["finished_phase"] == "WORK" else "0x07E0"
+                    serial_mgr.send_event({
+                        "pomo": pomo_eng.get_payload(done_flag=True),
+                        "alrt": {"bz": True, "led": led_c, "p": 3},
+                    })
+
+                eff_brt, _brt_reason = calculate_dynamic_brightness(state["brt"], state)
+                state["current_effective_brt"] = eff_brt
+                if eff_brt != last_dispatched_brt:
+                    last_dispatched_brt = eff_brt
+                    serial_mgr.send_event({"ui": {"brt": eff_brt}})
+
+                if state["media_auto_cover"] and not upload_state["active"] and transfer_queue.empty():
+                    _tk, cov_id, cov_bytes = media_col.get_cover_for_sd()
+                    if cov_id and cov_bytes and cov_id != state["synced_cover_id"]:
+                        if cov_id != pending_cov_id:
+                            pending_cov_id = cov_id
+                            pending_cov_t0 = now
+                        elif now - pending_cov_t0 >= 1.3:
+                            pending_cov_t0 = now + 8.0
+                            start_media_cover_transfer(cov_id, cov_bytes)
+
+                if now - last_telemetry_t >= cli_args.interval:
+                    last_telemetry_t = now
+                    sys_metrics = col.sample_sys()
+
+                    rotated_news = gems_eng.tick_scheduler()
+                    if rotated_news is not None:
+                        serial_mgr.send_event({
+                            "news": gems_eng.get_cyd_news_payload(include_queue=False, force=True),
+                        })
+
+                    wth_payload = wth_col.get_cyd_payload()
+                    payload = {
+                        "sys": sys_metrics,
+                        "pomo": pomo_eng.get_payload(),
+                        "media": media_col.get_cyd_payload(state["synced_cover_id"]),
+                        "wth": wth_payload,
+                    }
+
+                    curr_storm = bool(wth_payload.get("alrt", False))
+                    if curr_storm and not last_storm_alert_state:
+                        payload["alrt"] = {"bz": True, "led": "0xF800", "p": 3}
+                    last_storm_alert_state = curr_storm
+
+                    trig = evaluate_alert_rules(state.get("alert_rules", []), sys_metrics, mkt_metrics, last_fired_alerts, now)
+                    if trig:
+                        payload["alrt"] = trig["alrt"]
+                        log_h(f"ALERTA: {trig['rule_name']} ({trig['curr_val']:.1f} {trig['op']} {trig['target_val']:.1f})")
+
+                    if state["ui_dirty"] or (now - state["last_ui_sync"] >= 10.0):
+                        payload["ui"] = get_ui_dict()
+                        state["ui_dirty"] = False
+                        state["last_ui_sync"] = now
+
+                    if (now - state["last_mkt_sync"] >= 2.0) or ("ui" in payload):
+                        if mkt_metrics.get("usd", 0) > 0 or mkt_metrics.get("btc", 0) > 0:
+                            payload["mkt"] = mkt_metrics
+                            state["last_mkt_sync"] = now
+                        payload["portf"] = mkt_col.compute_portfolio(
+                            state["portfolio"],
+                            state["portfolio_pnl_mode"],
+                        )[0]
+                        payload["news"] = gems_eng.get_cyd_news_payload(
+                            include_queue=("ui" in payload),
+                            force=("ui" in payload),
+                        )
+                        if wifi_scan_col is not None:
+                            payload["wrad"] = wifi_scan_col.get_cyd_payload()
+                        if net_col is not None:
+                            payload["neta"] = net_col.get_cyd_payload()
+
+                    serial_mgr.send_telemetry(payload)
+            except Exception as ex:
+                log_h(f"Erro no loop headless: {ex}")
+            time.sleep(0.10)
+    finally:
+        serial_mgr.stop()
+        if wifi_scan_col is not None:
+            try:
+                wifi_scan_col.stop()
+            except Exception:
+                pass
+        if net_col is not None:
+            try:
+                net_col.stop()
+            except Exception:
+                pass
+        try:
+            col.stop()
+        except Exception:
+            pass
+        if mobile_server:
+            try:
+                mobile_server.shutdown()
+            except Exception:
+                pass
+        log_h("Agente CYD headless encerrado.")
+
+
 def main():
     ap = argparse.ArgumentParser(description="Agente CYD Cyber Deck v4.0 — Terminal, News Feed, Clima & Telemetria (Flet / Flutter Edition)")
-    ap.add_argument("-p", "--port", help="Porta serial, ex: COM5 ou /dev/ttyUSB0")
+    ap.add_argument("-p", "--port", help="Porta serial da CYD, ex: COM5 ou /dev/ttyUSB0")
+    ap.add_argument("--scanner-port", default="", help="Porta serial da ESP32 Scanner Wi-Fi, ex: /dev/ttyUSB1")
     ap.add_argument("-i", "--interval", type=float, default=INTERVAL)
     ap.add_argument("--stdout", action="store_true", help="Imprime o JSON no terminal e nao abre GUI")
     ap.add_argument("--once", action="store_true", help="Coleta uma amostra JSON e sai")
+    ap.add_argument("--headless", action="store_true", help="Executa em segundo plano sem interface grafica (ideal para systemd)")
     ap.add_argument("--game-proc", action="append", default=[], help="Processo extra de jogo")
     args = ap.parse_args()
 
@@ -9044,6 +10154,17 @@ def main():
         rotate_sec=15.0,
     )
     term_eng = CyberDeckTerminalEngine(collector=col)
+    wifi_scan_col = wifi_scanner.WiFiScannerCollector(
+        preferred_port=(args.scanner_port or str(cfg.get("scanner_port", "") or "")),
+        scan_interval_s=float(cfg.get("scanner_interval_s", 8.0) or 8.0),
+        enabled=bool(cfg.get("scanner_enabled", True)) and not (args.stdout or args.once),
+        auto_start=not (args.stdout or args.once),
+    )
+    net_col = net_analyzer.NetworkAnalyzerCollector(
+        plan_mbps=int(cfg.get("net_plan_mbps", 700) or 700),
+        scanner_ip_fn=lambda: wifi_scan_col.get_ui_snapshot().get("scanner_ip", ""),
+        auto_start=not (args.stdout or args.once),
+    )
     time.sleep(0.55)
 
     if args.stdout or args.once:
@@ -9081,7 +10202,11 @@ def main():
                 return
             time.sleep(args.interval)
 
-    launch_flet_gui(col, mkt_col, media_col, pomo_eng, wth_col, news_col, args, term_eng=term_eng)
+    if args.headless:
+        run_headless_daemon(col, mkt_col, media_col, pomo_eng, wth_col, news_col, args, term_eng=term_eng, wifi_scan_col=wifi_scan_col, net_col=net_col)
+        return
+
+    launch_flet_gui(col, mkt_col, media_col, pomo_eng, wth_col, news_col, args, term_eng=term_eng, wifi_scan_col=wifi_scan_col, net_col=net_col)
 
 
 if __name__ == "__main__":

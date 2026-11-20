@@ -685,6 +685,61 @@ struct TerminalState {
 
 static bool isMatrixRain = false;
 
+// ======================================= Modulo 3: Radar Wi-Fi RF (SCR_WIFI_RADAR / Tela 12)
+#define WRAD_MAX_APS 6
+
+struct WifiRadarAp {
+  char    ssid[18];
+  int16_t rssi;
+  uint8_t ch;
+  char    bssid[18];
+};
+
+struct WifiRadarState {
+  bool        valid      = false;
+  bool        online     = false;
+  bool        scanning   = false;
+  char        port[16]   = "";
+  uint8_t     total      = 0;
+  uint8_t     newCount   = 0;
+  int16_t     bestRssi   = 0;
+  int16_t     avgRssi    = 0;
+  uint8_t     busiestCh  = 0;
+  uint8_t     freeCh     = 1;
+  uint16_t    ageSec     = 999;
+  uint16_t    scanCount  = 0;
+  uint8_t     chCounts[13] = {0};
+  WifiRadarAp aps[WRAD_MAX_APS];
+  uint8_t     apCount    = 0;
+  bool        dirty      = true;
+} wrad;
+
+// ======================================= Modulo 4: Analise de Rede & Roteador (Tela 13)
+struct NetAnalyzerState {
+  bool     valid     = false;
+  char     gw[20]    = "---";
+  char     iface[12] = "eth0";
+  char     localIp[20] = "---";
+  bool     gwUp      = false;
+  float    gwMs      = 0.0f;
+  float    gwJit     = 0.0f;
+  uint8_t  loss      = 0;
+  uint16_t gwHttp    = 0;
+  bool     wanUp     = false;
+  float    wanMs     = 0.0f;
+  int16_t  dnsMs     = 0;
+  float    rxMbps    = 0.0f;
+  float    txMbps    = 0.0f;
+  uint16_t planMbps  = 700;
+  uint8_t  lanCount  = 0;
+  char     isp[20]   = "ISP";
+  bool     spdRun    = false;
+  float    spdDl     = 0.0f;
+  float    spdUl     = 0.0f;
+  char     spdTm[10] = "--:--";
+  bool     dirty     = true;
+} neta;
+
 // Sanitiza strings UTF-8 caso algum caractere acentuado escape para o TFT_eSPI
 static void sanitizeAscii(char* dst, const char* src, size_t maxLen) {
   if (!dst || maxLen == 0) return;
@@ -770,6 +825,8 @@ void resetDrawCache() {
   gLastNewsRemainS = -1;
   gLastStormFlash = 255;
   termSt.dirty = true;
+  wrad.dirty = true;
+  neta.dirty = true;
 }
 
 static void setLed(uint8_t r, uint8_t g, uint8_t b) {
@@ -1041,6 +1098,8 @@ void drawHeader() {
   else if (currentScreen == SCR_MEDIA)        scrTitle = "PLAYER";
   else if (currentScreen == SCR_NEWS)         scrTitle = "NEWS FEED";
   else if (currentScreen == SCR_TERMINAL)     scrTitle = "CYBER TERM";
+  else if (currentScreen == SCR_WIFI_RADAR)   scrTitle = "WIFI RADAR";
+  else if (currentScreen == SCR_NET_ANALYZER) scrTitle = "NET ANALYZER";
 
   tft.setTextDatum(ML_DATUM);
   tft.setTextColor(C_ACCENT, C_ACCENT_DK);
@@ -3093,6 +3152,340 @@ void runWifiScanOnTerminal() {
   screenTerminalDynamic();
 }
 
+// ======================================= Modulo 3: SCR_WIFI_RADAR (Tela 12) =
+static uint16_t rssiBarColor(int16_t rssi) {
+  if (rssi >= -62) return 0x07E0; // Verde forte
+  if (rssi >= -75) return 0xFFE0; // Amarelo medio
+  if (rssi >= -84) return 0xFD20; // Laranja fraco
+  return 0xF800;                  // Vermelho muito fraco
+}
+
+void screenWifiRadarStatic() {
+  isMatrixRain = false;
+  if (isGifPlaying) {
+    gif.close();
+    isGifPlaying = false;
+  }
+  tft.fillScreen(C_BG);
+  drawHeader();
+  drawClock();
+
+  // Card Superior Esquerdo: Resumo RF & Status da Antena Externa (x=4, y=26, w=154, h=50)
+  drawModernCard(4, 26, 154, 50, "ESP32-32U • RF");
+
+  // Card Superior Direito: Espectro de Ocupacao Canais 1..13 (x=162, y=26, w=154, h=50)
+  drawModernCard(162, 26, 154, 50, "CANAIS 2.4GHz");
+
+  // Card Principal Inferior: Top 6 Redes Proximas (x=4, y=80, w=312, h=139)
+  drawModernCard(4, 80, 312, 139, "REDES PROXIMAS (TOP 6 SINAL)");
+
+  // Cabecalho das colunas da tabela de redes
+  tft.setTextDatum(TL_DATUM);
+  tft.setTextColor(C_DIM, C_CARD);
+  tft.drawString("SSID", 10, 95, 1);
+  tft.drawString("CH", 142, 95, 1);
+  tft.drawString("SINAL", 184, 95, 1);
+  tft.setTextDatum(TR_DATUM);
+  tft.drawString("RSSI", 310, 95, 1);
+  tft.drawFastHLine(8, 105, 304, C_CARD_HI);
+
+  wrad.dirty = true;
+}
+
+void screenWifiRadarDynamic() {
+  if (!wrad.dirty) return;
+  wrad.dirty = false;
+
+  // --- 1) Card Superior Esquerdo: KPIs & Status ---
+  tft.fillRect(7, 40, 148, 33, C_CARD);
+
+  uint16_t stCol = wrad.online ? (wrad.scanning ? 0x07FF : 0x07E0) : 0xF800;
+  tft.fillCircle(14, 48, 4, stCol);
+
+  char totBuf[24];
+  if (wrad.online) {
+    snprintf(totBuf, sizeof(totBuf), "%u APs", (unsigned)wrad.total);
+  } else {
+    snprintf(totBuf, sizeof(totBuf), "OFFLINE");
+  }
+  tft.setTextDatum(ML_DATUM);
+  tft.setTextColor(wrad.online ? 0xFFFF : 0xF800, C_CARD);
+  tft.drawString(totBuf, 23, 49, 2);
+
+  // Pill de status no canto direito do card esquerdo
+  char tagBuf[14];
+  if (!wrad.online) {
+    snprintf(tagBuf, sizeof(tagBuf), "SEM USB");
+  } else if (wrad.scanning) {
+    snprintf(tagBuf, sizeof(tagBuf), "SCAN...");
+  } else {
+    snprintf(tagBuf, sizeof(tagBuf), "#%u", (unsigned)wrad.scanCount);
+  }
+  tft.setTextDatum(MR_DATUM);
+  tft.setTextColor(stCol, C_CARD);
+  tft.drawString(tagBuf, 152, 49, 1);
+
+  char rfSub[32];
+  if (wrad.online && wrad.total > 0) {
+    snprintf(rfSub, sizeof(rfSub), "TOP %ddBm | MED %ddBm", (int)wrad.bestRssi, (int)wrad.avgRssi);
+  } else if (wrad.online) {
+    snprintf(rfSub, sizeof(rfSub), "Escaneando 2.4 GHz...");
+  } else {
+    snprintf(rfSub, sizeof(rfSub), "Conecte ESP32-WROOM-32U");
+  }
+  tft.setTextDatum(ML_DATUM);
+  tft.setTextColor(C_DIM, C_CARD);
+  tft.drawString(rfSub, 10, 65, 1);
+
+  // --- 2) Card Superior Direito: Mini Espectro dos Canais 1..13 ---
+  tft.fillRect(165, 40, 148, 33, C_CARD);
+
+  uint8_t maxChVal = 1;
+  for (int i = 0; i < 13; i++) {
+    if (wrad.chCounts[i] > maxChVal) maxChVal = wrad.chCounts[i];
+  }
+
+  const int barBaseY = 61;
+  const int barMaxH  = 19;
+  for (int i = 0; i < 13; i++) {
+    int bx = 170 + i * 11;
+    uint8_t cnt = wrad.chCounts[i];
+    int bh = (cnt > 0) ? max(3, (int)((cnt * barMaxH) / maxChVal)) : 2;
+    uint16_t bCol = 0x2124; // Canal vazio
+    if (cnt >= 4)      bCol = 0xF800; // Congestionado
+    else if (cnt >= 2) bCol = 0xFFE0; // Moderado
+    else if (cnt == 1) bCol = 0x07E0; // Livre/leve
+    tft.fillRect(bx, barBaseY - bh, 8, bh, bCol);
+  }
+
+  // Rodape do espectro: canal livre recomendado vs canal mais cheio
+  char chInfo[30];
+  if (wrad.online && wrad.total > 0) {
+    snprintf(chInfo, sizeof(chInfo), "LIVRE:CH%u  CHEIO:CH%u",
+             (unsigned)wrad.freeCh, (unsigned)wrad.busiestCh);
+  } else {
+    snprintf(chInfo, sizeof(chInfo), "CH 1    6    11   13");
+  }
+  tft.setTextDatum(MC_DATUM);
+  tft.setTextColor(0x07FF, C_CARD);
+  tft.drawString(chInfo, 239, 68, 1);
+
+  // --- 3) Card Inferior: Lista das Top 6 Redes Proximas ---
+  tft.fillRect(6, 107, 308, 109, C_CARD);
+
+  if (!wrad.online) {
+    tft.setTextDatum(MC_DATUM);
+    tft.setTextColor(C_WARN, C_CARD);
+    tft.drawString("Aguardando ESP32-WROOM-32U...", SCR_W / 2, 148, 2);
+    tft.setTextColor(C_DIM, C_CARD);
+    tft.drawString("Conecte a placa com antena externa na USB", SCR_W / 2, 170, 1);
+    return;
+  }
+
+  if (wrad.apCount == 0) {
+    tft.setTextDatum(MC_DATUM);
+    tft.setTextColor(0x07FF, C_CARD);
+    tft.drawString("Escaneando redes proximas...", SCR_W / 2, 155, 2);
+    return;
+  }
+
+  const int rowH = 18;
+  for (uint8_t i = 0; i < wrad.apCount && i < WRAD_MAX_APS; i++) {
+    int ry = 109 + i * rowH;
+    const WifiRadarAp& ap = wrad.aps[i];
+    uint16_t sCol = rssiBarColor(ap.rssi);
+
+    // Destaque suave alternado
+    if (i % 2 == 1) {
+      tft.fillRect(7, ry - 1, 306, rowH - 1, 0x0421);
+    }
+    uint16_t rowBg = (i % 2 == 1) ? 0x0421 : C_CARD;
+
+    // 1) SSID (ate 16 chars)
+    tft.setTextDatum(ML_DATUM);
+    tft.setTextColor(i == 0 ? 0xFFFF : C_TEXT, rowBg);
+    tft.drawString(ap.ssid, 10, ry + 7, 1);
+
+    // 2) Pill de Canal (CHxx)
+    char chBuf[8];
+    snprintf(chBuf, sizeof(chBuf), "C%02u", (unsigned)ap.ch);
+    tft.fillRoundRect(138, ry + 1, 26, 13, 3, 0x1082);
+    tft.setTextDatum(MC_DATUM);
+    tft.setTextColor(0x07FF, 0x1082);
+    tft.drawString(chBuf, 151, ry + 7, 1);
+
+    // 3) Barra visual de sinal RSSI (-95..-45 dBm)
+    const int barX = 172;
+    const int barW = 86;
+    int pct = constrain((int)((ap.rssi + 95) * 100 / 50), 4, 100);
+    int fillW = max(3, (barW * pct) / 100);
+    tft.fillRoundRect(barX, ry + 3, barW, 9, 2, C_TRACK);
+    tft.fillRoundRect(barX, ry + 3, fillW, 9, 2, sCol);
+
+    // 4) Valor numerico dBm
+    char rBuf[12];
+    snprintf(rBuf, sizeof(rBuf), "%ddBm", (int)ap.rssi);
+    tft.setTextDatum(MR_DATUM);
+    tft.setTextColor(sCol, rowBg);
+    tft.drawString(rBuf, 310, ry + 7, 1);
+  }
+}
+
+// ======================================= Modulo 4: SCR_NET_ANALYZER (Tela 13) =
+void screenNetAnalyzerStatic() {
+  isMatrixRain = false;
+  if (isGifPlaying) {
+    gif.close();
+    isGifPlaying = false;
+  }
+  tft.fillScreen(C_BG);
+  drawHeader();
+  drawClock();
+
+  // 1) Card Superior Esquerdo: Roteador / Gateway (x=4, y=26, w=154, h=66)
+  drawModernCard(4, 26, 154, 66, "ROTEADOR / GW");
+
+  // 2) Card Superior Direito: WAN / DNS / ISP (x=162, y=26, w=154, h=66)
+  drawModernCard(162, 26, 154, 66, "WAN / DNS / ISP");
+
+  // 3) Card Central: Throughput Tempo Real vs Plano 700 Mbps (x=4, y=96, w=312, h=60)
+  drawModernCard(4, 96, 312, 60, "LINK TEMPO REAL (Mbps)");
+
+  // 4) Card Inferior: Speedtest Fibra sob demanda (x=4, y=160, w=312, h=59)
+  drawModernCard(4, 160, 312, 59, "SPEEDTEST FIBRA (cyd speed)");
+
+  neta.dirty = true;
+}
+
+void screenNetAnalyzerDynamic() {
+  if (!neta.dirty) return;
+  neta.dirty = false;
+
+  // --- 1) Card Roteador / Gateway ---
+  tft.fillRect(7, 40, 148, 49, C_CARD);
+  uint16_t gwCol = neta.gwUp ? 0x07E0 : 0xF800;
+  tft.fillCircle(14, 48, 4, gwCol);
+
+  tft.setTextDatum(ML_DATUM);
+  tft.setTextColor(0xFFFF, C_CARD);
+  tft.drawString(neta.gw, 23, 48, 2);
+
+  // Badge HTTP admin do roteador
+  if (neta.gwHttp > 0) {
+    tft.fillRoundRect(116, 41, 36, 13, 3, 0x0320);
+    tft.setTextDatum(MC_DATUM);
+    tft.setTextColor(0x07E0, 0x0320);
+    tft.drawString("WEB", 134, 47, 1);
+  }
+
+  char gwLine1[30];
+  snprintf(gwLine1, sizeof(gwLine1), "GW %.1fms | JIT %.1f", neta.gwMs, neta.gwJit);
+  tft.setTextDatum(ML_DATUM);
+  tft.setTextColor(neta.gwMs < 5.0f ? 0x07E0 : (neta.gwMs < 20.0f ? 0xFFE0 : 0xF800), C_CARD);
+  tft.drawString(gwLine1, 10, 66, 1);
+
+  char gwLine2[30];
+  snprintf(gwLine2, sizeof(gwLine2), "LOSS %u%% | LAN %u HOSTS", (unsigned)neta.loss, (unsigned)neta.lanCount);
+  tft.setTextColor(neta.loss == 0 ? C_DIM : 0xF800, C_CARD);
+  tft.drawString(gwLine2, 10, 80, 1);
+
+  // --- 2) Card WAN / DNS / ISP ---
+  tft.fillRect(165, 40, 148, 49, C_CARD);
+  uint16_t wanCol = neta.wanUp ? 0x07FF : 0xF800;
+  tft.fillCircle(172, 48, 4, wanCol);
+
+  char wanBig[24];
+  if (neta.wanUp) snprintf(wanBig, sizeof(wanBig), "WAN %.0fms", neta.wanMs);
+  else            snprintf(wanBig, sizeof(wanBig), "OFFLINE");
+  tft.setTextDatum(ML_DATUM);
+  tft.setTextColor(wanCol, C_CARD);
+  tft.drawString(wanBig, 181, 48, 2);
+
+  char dnsBuf[28];
+  snprintf(dnsBuf, sizeof(dnsBuf), "DNS %dms | %s", (int)neta.dnsMs, neta.iface);
+  tft.setTextColor(0xDEFB, C_CARD);
+  tft.drawString(dnsBuf, 168, 66, 1);
+
+  char ispBuf[26];
+  snprintf(ispBuf, sizeof(ispBuf), "%.18s", neta.isp);
+  for (int i = 0; ispBuf[i]; i++) ispBuf[i] = toupper((unsigned char)ispBuf[i]);
+  tft.setTextColor(C_ACCENT, C_CARD);
+  tft.drawString(ispBuf, 168, 80, 1);
+
+  // --- 3) Card Link Tempo Real vs Plano (ex: 700 Mbps) ---
+  tft.fillRect(7, 110, 306, 43, C_CARD);
+  uint16_t plan = max((uint16_t)10, neta.planMbps);
+
+  char planTag[20];
+  snprintf(planTag, sizeof(planTag), "PLANO %uM", (unsigned)plan);
+  tft.setTextDatum(MR_DATUM);
+  tft.setTextColor(0x07FF, C_CARD);
+  tft.drawString(planTag, 310, 116, 1);
+
+  // Linha RX (Download)
+  char rxBuf[24];
+  snprintf(rxBuf, sizeof(rxBuf), "DL %5.1f Mbps", neta.rxMbps);
+  tft.setTextDatum(ML_DATUM);
+  tft.setTextColor(0x07E0, C_CARD);
+  tft.drawString(rxBuf, 10, 118, 2);
+
+  int rxPct = constrain((int)((neta.rxMbps * 100.0f) / (float)plan), 0, 100);
+  const int bX = 128, bW = 122;
+  tft.fillRoundRect(bX, 114, bW, 9, 2, C_TRACK);
+  if (rxPct > 0) tft.fillRoundRect(bX, 114, max(3, (bW * rxPct) / 100), 9, 2, 0x07E0);
+
+  // Linha TX (Upload)
+  char txBuf[24];
+  snprintf(txBuf, sizeof(txBuf), "UL %5.1f Mbps", neta.txMbps);
+  tft.setTextDatum(ML_DATUM);
+  tft.setTextColor(0xFD20, C_CARD);
+  tft.drawString(txBuf, 10, 139, 2);
+
+  int txPct = constrain((int)((neta.txMbps * 100.0f) / (float)plan), 0, 100);
+  tft.fillRoundRect(bX, 135, bW, 9, 2, C_TRACK);
+  if (txPct > 0) tft.fillRoundRect(bX, 135, max(3, (bW * txPct) / 100), 9, 2, 0xFD20);
+
+  char pctLbl[16];
+  snprintf(pctLbl, sizeof(pctLbl), "USO %d%%", rxPct);
+  tft.setTextDatum(MR_DATUM);
+  tft.setTextColor(C_DIM, C_CARD);
+  tft.drawString(pctLbl, 310, 139, 1);
+
+  // --- 4) Card Inferior: Speedtest Fibra ---
+  tft.fillRect(7, 174, 306, 42, C_CARD);
+  if (neta.spdRun) {
+    tft.setTextDatum(MC_DATUM);
+    tft.setTextColor(0x07FF, C_CARD);
+    tft.drawString("MEDINDO VELOCIDADE DA FIBRA...", SCR_W / 2, 189, 2);
+    tft.setTextColor(C_DIM, C_CARD);
+    tft.drawString("Aguarde ~4s (Cloudflare multi-stream)", SCR_W / 2, 206, 1);
+  } else if (neta.spdDl > 0.0f) {
+    int spdPct = constrain((int)((neta.spdDl * 100.0f) / (float)plan), 0, 150);
+    char dlBig[24];
+    snprintf(dlBig, sizeof(dlBig), "DL %.1fM", neta.spdDl);
+    tft.setTextDatum(ML_DATUM);
+    tft.setTextColor(0x07E0, C_CARD);
+    tft.drawString(dlBig, 12, 189, 4);
+
+    char ulBig[24];
+    snprintf(ulBig, sizeof(ulBig), "UL %.1fM", neta.spdUl);
+    tft.setTextDatum(ML_DATUM);
+    tft.setTextColor(0x07FF, C_CARD);
+    tft.drawString(ulBig, 152, 186, 2);
+
+    char metaSpd[28];
+    snprintf(metaSpd, sizeof(metaSpd), "%d%% plano | %s", spdPct, neta.spdTm);
+    tft.setTextColor(spdPct >= 80 ? 0x07E0 : (spdPct >= 50 ? 0xFFE0 : 0xFD20), C_CARD);
+    tft.drawString(metaSpd, 152, 204, 1);
+  } else {
+    tft.setTextDatum(MC_DATUM);
+    tft.setTextColor(C_TEXT, C_CARD);
+    tft.drawString("Pronto para testar link de fibra", SCR_W / 2, 187, 2);
+    tft.setTextColor(C_DIM, C_CARD);
+    tft.drawString("Execute 'cyd speed' no Linux ou Web :8088", SCR_W / 2, 205, 1);
+  }
+}
+
 // ================================================= Serial & UDP / Protocolo JSON =
 void applyJson(const char *json) {
   JsonDocument doc;
@@ -3351,7 +3744,9 @@ void applyJson(const char *json) {
     } else if (vScr.is<const char*>()) {
       String s = String(vScr.as<const char*>());
       s.toLowerCase();
-      if (s.indexOf("term") >= 0 || s.indexOf("deck") >= 0 || s.indexOf("cmd") >= 0 || s.indexOf("sh") >= 0) newScr = SCR_TERMINAL;
+      if (s.indexOf("net") >= 0 || s.indexOf("rout") >= 0 || s.indexOf("vivo") >= 0 || s.indexOf("spd") >= 0) newScr = SCR_NET_ANALYZER;
+      else if (s.indexOf("radar") >= 0 || s.indexOf("wifi") >= 0 || s.indexOf("rf") >= 0) newScr = SCR_WIFI_RADAR;
+      else if (s.indexOf("term") >= 0 || s.indexOf("deck") >= 0 || s.indexOf("cmd") >= 0 || s.indexOf("sh") >= 0) newScr = SCR_TERMINAL;
       else if (s.indexOf("news") >= 0 || s.indexOf("notic") >= 0 || s.indexOf("wth") >= 0 || s.indexOf("clim") >= 0 || s.indexOf("gem") >= 0 || s.indexOf("vot") >= 0) newScr = SCR_NEWS;
       else if (s.indexOf("pomo") >= 0 || s.indexOf("foco") >= 0) newScr = SCR_POMODORO;
       else if (s.indexOf("med") >= 0 || s.indexOf("spot") >= 0 || s.indexOf("yt") >= 0 || s.indexOf("mus") >= 0) newScr = SCR_MEDIA;
@@ -3699,6 +4094,81 @@ void applyJson(const char *json) {
     }
   }
 
+  // 7.8) Processa Modulo 3: Radar Wi-Fi Externo ("wrad") - ESP32-WROOM-32U
+  JsonVariant jwr = root["wrad"];
+  if (!jwr.isNull()) {
+    wrad.online    = jwr["on"]   | false;
+    wrad.scanning  = jwr["scan"] | false;
+    if (!jwr["port"].isNull()) sanitizeAscii(wrad.port, jwr["port"] | "", sizeof(wrad.port));
+    wrad.total     = (uint8_t)constrain((int)(jwr["tot"]  | 0), 0, 255);
+    wrad.newCount  = (uint8_t)constrain((int)(jwr["new"]  | 0), 0, 255);
+    wrad.bestRssi  = (int16_t)(jwr["best"] | 0);
+    wrad.avgRssi   = (int16_t)(jwr["avg"]  | 0);
+    wrad.busiestCh = (uint8_t)constrain((int)(jwr["bch"]  | 0), 0, 13);
+    wrad.freeCh    = (uint8_t)constrain((int)(jwr["fch"]  | 1), 1, 13);
+    wrad.ageSec    = (uint16_t)constrain((int)(jwr["age"] | 0), 0, 999);
+    wrad.scanCount = (uint16_t)(jwr["sc"]  | wrad.scanCount);
+
+    if (jwr["ch"].is<JsonArray>()) {
+      JsonArray chArr = jwr["ch"].as<JsonArray>();
+      uint8_t idx = 0;
+      for (JsonVariant v : chArr) {
+        if (idx >= 13) break;
+        wrad.chCounts[idx++] = (uint8_t)constrain(v.as<int>(), 0, 99);
+      }
+    }
+
+    if (jwr["aps"].is<JsonArray>()) {
+      JsonArray apsArr = jwr["aps"].as<JsonArray>();
+      uint8_t idx = 0;
+      for (JsonVariant v : apsArr) {
+        if (idx >= WRAD_MAX_APS) break;
+        if (v.is<JsonArray>()) {
+          JsonArray row = v.as<JsonArray>();
+          const char* ss = row[0] | "<OCULTA>";
+          sanitizeAscii(wrad.aps[idx].ssid, ss, sizeof(wrad.aps[idx].ssid));
+          if (!wrad.aps[idx].ssid[0]) strlcpy(wrad.aps[idx].ssid, "<OCULTA>", sizeof(wrad.aps[idx].ssid));
+          wrad.aps[idx].rssi = (int16_t)(row[1] | -100);
+          wrad.aps[idx].ch   = (uint8_t)constrain((int)(row[2] | 0), 0, 14);
+          const char* bs = row[3] | "";
+          strlcpy(wrad.aps[idx].bssid, bs, sizeof(wrad.aps[idx].bssid));
+          idx++;
+        }
+      }
+      wrad.apCount = idx;
+    }
+
+    wrad.valid = true;
+    wrad.dirty = true;
+  }
+
+  // 7.9) Processa Modulo 4: Analise de Rede, Roteador & Fibra ("neta")
+  JsonVariant jna = root["neta"];
+  if (!jna.isNull()) {
+    if (!jna["gw"].isNull())  sanitizeAscii(neta.gw,      jna["gw"]  | "---", sizeof(neta.gw));
+    if (!jna["if"].isNull())  sanitizeAscii(neta.iface,   jna["if"]  | "eth0", sizeof(neta.iface));
+    if (!jna["ip"].isNull())  sanitizeAscii(neta.localIp, jna["ip"]  | "---", sizeof(neta.localIp));
+    if (!jna["isp"].isNull()) sanitizeAscii(neta.isp,     jna["isp"] | "ISP", sizeof(neta.isp));
+    if (!jna["stm"].isNull()) sanitizeAscii(neta.spdTm,   jna["stm"] | "--:--", sizeof(neta.spdTm));
+    neta.gwUp     = jna["gwup"]  | neta.gwUp;
+    neta.gwMs     = jna["gwms"]  | neta.gwMs;
+    neta.gwJit    = jna["gwjit"] | neta.gwJit;
+    neta.loss     = (uint8_t)constrain((int)(jna["loss"] | neta.loss), 0, 100);
+    neta.gwHttp   = (uint16_t)(jna["gwh"] | neta.gwHttp);
+    neta.wanUp    = jna["wanup"] | neta.wanUp;
+    neta.wanMs    = jna["wanms"] | neta.wanMs;
+    neta.dnsMs    = (int16_t)(jna["dnsms"] | neta.dnsMs);
+    neta.rxMbps   = jna["rx"]    | neta.rxMbps;
+    neta.txMbps   = jna["tx"]    | neta.txMbps;
+    neta.planMbps = (uint16_t)constrain((int)(jna["plan"] | neta.planMbps), 10, 10000);
+    neta.lanCount = (uint8_t)constrain((int)(jna["lan"] | neta.lanCount), 0, 255);
+    neta.spdRun   = jna["srun"]  | false;
+    neta.spdDl    = jna["sdl"]   | neta.spdDl;
+    neta.spdUl    = jna["sul"]   | neta.spdUl;
+    neta.valid    = true;
+    neta.dirty    = true;
+  }
+
   // 8) Processa Bloco de Alertas Fisicos ("alrt") - Buzzer e LED RGB
   JsonVariant alrt = root["alrt"];
   if (!alrt.isNull()) {
@@ -3785,8 +4255,8 @@ void pumpUDP() {
     // Drena todos os pacotes UDP pendentes na porta 8888 sem bloquear o loop de 28 FPS
     int packetSize = udp.parsePacket();
     while (packetSize > 0) {
-      lastUdpRemoteIP   = udp.remoteIP();
-      lastUdpRemotePort = udp.remotePort();
+      IPAddress srcIP   = udp.remoteIP();
+      uint16_t  srcPort = udp.remotePort();
       int len = udp.read(udpBuf, sizeof(udpBuf) - 1);
       if (len > 2) {
         udpBuf[len] = '\0';
@@ -3794,7 +4264,17 @@ void pumpUDP() {
         while (len > 0 && (udpBuf[len - 1] == '\n' || udpBuf[len - 1] == '\r')) {
           udpBuf[--len] = '\0';
         }
-        replyViaUdp = true;
+        // Broadcast puro da ESP32-WROOM-32U ("wrad") nao deve sobrescrever o IP do Agente PC
+        bool isExternalRadarOnly = (strstr(udpBuf, "\"wrad\"") != nullptr) &&
+                                   (strstr(udpBuf, "\"sys\"")  == nullptr) &&
+                                   (strstr(udpBuf, "\"cmd\"")  == nullptr);
+        if (!isExternalRadarOnly) {
+          lastUdpRemoteIP   = srcIP;
+          lastUdpRemotePort = srcPort;
+          replyViaUdp       = true;
+        } else {
+          replyViaUdp       = false;
+        }
         applyJson(udpBuf);
         replyViaUdp = false;
       }
@@ -3955,6 +4435,8 @@ void loop() {
     else if (currentScreen == SCR_MEDIA)        screenMediaStatic();
     else if (currentScreen == SCR_NEWS)         screenNewsStatic();
     else if (currentScreen == SCR_TERMINAL)     screenTerminalStatic();
+    else if (currentScreen == SCR_WIFI_RADAR)   screenWifiRadarStatic();
+    else if (currentScreen == SCR_NET_ANALYZER) screenNetAnalyzerStatic();
     needFullDraw = false;
   }
 
@@ -3991,6 +4473,8 @@ void loop() {
     else if (currentScreen == SCR_MEDIA)        screenMediaDynamic();
     else if (currentScreen == SCR_NEWS)         screenNewsDynamic();
     else if (currentScreen == SCR_TERMINAL)     screenTerminalDynamic();
+    else if (currentScreen == SCR_WIFI_RADAR)   screenWifiRadarDynamic();
+    else if (currentScreen == SCR_NET_ANALYZER) screenNetAnalyzerDynamic();
 
     drawClock();
     drawStormAlertBanner();

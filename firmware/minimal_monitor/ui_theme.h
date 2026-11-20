@@ -43,7 +43,7 @@ void applyColor565(uint16_t color565);
 #define LOG_MSG_MAX  37
 
 // ---- Layouts / Telas (Controladas 100% pelo Agente Python no PC) ----
-#define SCREENS          12
+#define SCREENS          14
 #define SCR_RESUMO       0   // Tela 0: Resumo Geral (Gauges de CPU & RAM + Barras Disco/Rede/Temp)
 #define SCR_CPU_RAM      1   // Tela 1: Painel CPU + RAM (Barras + Graficos de CPU e RAM lado a lado, estilo sys.monitor_)
 #define SCR_CPU_RAM_DUAL 2   // Tela 2: Grafico Combinado CPU + RAM (2 curvas sobrepostas no mesmo grafico grande)
@@ -57,6 +57,8 @@ void applyColor565(uint16_t color565);
 #define SCR_NEWS         10  // Tela 10: Clima Regional (Votuporanga) & Feed de Noticias Customizavel (News API / RSS)
 #define SCR_WEATHER_GEMS 10  // Alias de retrocompatibilidade
 #define SCR_TERMINAL     11  // Tela 11: Cyber Deck Terminal (Logs, Ping, Fetch, Docker & Wi-Fi Scan Nativo)
+#define SCR_WIFI_RADAR   12  // Tela 12: Radar Wi-Fi RF & Espectro de Canais (ESP32-WROOM-32U Antena Externa)
+#define SCR_NET_ANALYZER 13  // Tela 13: Analise de Rede Local, Roteador & Link Fibra (700 Mbps)
 
 // Estrutura geometrica auxiliar
 struct Rect { int16_t x, y, w, h; };

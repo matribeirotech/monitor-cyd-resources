@@ -1,6 +1,6 @@
-# ⚡ CYD Cyber Deck: Hardware, Clima Regional, News Feed, Terminal Administrativo & Financial Market Monitor (v4.3 — Windows & Ubuntu / Linux)
+# ⚡ CYD Cyber Deck: Hardware, Clima Regional, News Feed, Terminal Administrativo, Radar Wi-Fi RF, Análise de Rede & Financial Market Monitor (v4.5 — Windows & Linux)
 
-![Versão](https://img.shields.io/badge/vers%C3%A3o-4.3.0-00FF00?style=for-the-badge)
+![Versão](https://img.shields.io/badge/vers%C3%A3o-4.5.0-00FF00?style=for-the-badge)
 ![OS](https://img.shields.io/badge/OS-Ubuntu%20%7C%20Linux%20%7C%20Windows-E95420?style=for-the-badge&logo=ubuntu)
 ![Plataforma](https://img.shields.io/badge/ESP32-2432S028R%20(CYD)-blue?style=for-the-badge&logo=espressif)
 ![Interface PC](https://img.shields.io/badge/GUI%20PC-Flet%20%2F%20Flutter-02569B?style=for-the-badge&logo=flutter)
@@ -173,13 +173,14 @@ Todas as fotos abaixo foram capturadas diretamente da placa física em funcionam
 | **v4.0** | **Pomodoro (Tela 8) + Spotify & YouTube Music (Tela 9) + Portfólio Pessoal (Tela 7) + Alertas Físicos Buzzer/LED + Modo Sleep/Noturno + UI 6 Abas** | ✅ Concluído |
 | **v4.1** | **Clima Regional (Votuporanga) no Topo + Tela 10 (Clima & Gemini Gems) + Alerta de Tempestade + CI/CD GitHub Actions** | ✅ Concluído |
 | **v4.2** | **CYD Cyber Deck (12 Telas) + Feed de Notícias (Tela 10) + Terminal CYD (Tela 11) + Serial Assíncrona (115200 bps) + Clean UI (NavigationRail) + Nova Identidade Visual** | ✅ Concluído |
-| **v4.3 (Atual)** | **Telemetria Wi-Fi (UDP Porta 8888) + Modo Híbrido (USB & Sem Fio) + Fragmentação MTU + Terminal Linux Expandido** | ✅ **Concluído (v4.3)** |
+| **v4.3** | **Telemetria Wi-Fi (UDP Porta 8888) + Modo Híbrido (USB & Sem Fio) + Fragmentação MTU + Terminal Linux Expandido** | ✅ Concluído |
+| **v4.5 (Atual)** | **Modo Headless (`systemd --user`) + Tela 12 (`SCR_WIFI_RADAR` via ESP32-WROOM-32U sem fio mDNS/UDP) + Tela 13 (`SCR_NET_ANALYZER` Roteador/LAN/Speedtest 700 Mbps) + CLI Linux (`cyd`)** | ✅ **Concluído (v4.5)** |
 
 ---
 
-## 🖥️ As 12 Telas da CYD (320×240)
+## 🖥️ As 14 Telas da CYD (320×240)
 
-Todas as telas podem ser alternadas instantaneamente pelo painel Desktop, pelo aplicativo do celular (Wi-Fi) ou pelo botão físico `BOOT` traseiro:
+Todas as telas podem ser alternadas instantaneamente pelo painel Desktop, pelo aplicativo do celular (Wi-Fi), pelo **CLI Linux (`cyd`)** ou pelo botão físico `BOOT` traseiro:
 
 1. **Tela 0 — `Resumo Gauges` (`SCR_RESUMO`):** Gauges circulares suaves de CPU % e RAM %, clock, temperatura, GPU, VRAM, Disco, Rede e Letreiro da Bolsa no rodapé.
 2. **Tela 1 — `CPU + RAM Principal` (`SCR_CPU_RAM`):** Visual clássico *cyberpunk terminal* com barras duplas segmentadas, 2 gráficos dedicados de histórico lado a lado e Letreiro da Bolsa.
@@ -192,7 +193,9 @@ Todas as telas podem ser alternadas instantaneamente pelo painel Desktop, pelo a
 9. **🍅 Tela 8 — `Pomodoro Focus Hub` (`SCR_POMODORO`):** Cronômetro circular anti-flicker (25m Trabalho / 5m Pausa / 15m Longa), contador de ciclos, mini-status da música atual e bipe no Buzzer ao finalizar.
 10. **🎵 Tela 9 — `Player Spotify & YouTube Music` (`SCR_MEDIA`):** Capa do álbum em tela cheia do MicroSD com card de vidro fumê translúcido, Título, Artista, badge de fonte (`SPOTIFY` verde / `YT MUSIC` vermelho) e barra de progresso.
 11. **📰 Tela 10 — `Feed de Notícias Customizável` (`SCR_NEWS`):** Manchetes rotativas dos tópicos escolhidos (Política, Tecnologia, Mercado, IA) com deslize horizontal suave (*ticker smooth scroll* via `TFT_eSprite`).
-12. **💻 Tela 11 — `Terminal CYD & Rede` (`SCR_TERMINAL`):** Prompt estilo hacker CRT verde com buffer de rolagem vertical, logs em tempo real, comandos locais do PC (`ping`, `fetch`, `docker`) e escaneamento de redes Wi-Fi em hardware (`wifi scan` no ESP32).
+12. **💻 Tela 11 — `Terminal CYD & Rede` (`SCR_TERMINAL`):** Prompt estilo hacker CRT verde com buffer de rolagem vertical, logs em tempo real, comandos locais (`ping`, `fetch`, `docker`, `router`, `lan`, `dns`, `trace`, `speed`) e escaneamento nativo no ESP32 (`wifi scan`).
+13. **📡 Tela 12 — `Radar Wi-Fi RF` (`SCR_WIFI_RADAR`):** Integrada via **Wi-Fi UDP + mDNS (`cyd-radar.local`)** com uma placa **ESP32-WROOM-32U** com antena externa (alimentada apenas por energia): exibe status RF, contagem de redes 2.4 GHz, gráfico de ocupação dos canais `1–13` (canal mais livre vs mais congestionado) e Top 6 redes mais fortes com barras de RSSI e dBm.
+14. **🌐 Tela 13 — `Análise de Rede, Roteador & Fibra` (`SCR_NET_ANALYZER`):** Monitoramento do roteador/gateway padrão (latência, jitter, perda de pacotes e status HTTP do painel admin), latência WAN (`1.1.1.1`) + DNS + ISP, tráfego em tempo real (Mbps RX/TX vs plano configurável ex.: `700 Mbps`), contagem de vizinhos ativos na LAN (tabela ARP) e Speedtest Fibra sob demanda.
 
 ---
 
@@ -217,33 +220,33 @@ Controle 100% da sua placa CYD à distância sem instalar nada no smartphone:
 
 ```text
 minimal-monitor/
-├── firmware/                        # Firmware C++ para ESP32-2432S028R (CYD)
+├── firmware/                        # Firmwares C++ para ESP32 (CYD e Nó Radar Wi-Fi)
 │   ├── minimal_monitor/
-│   │   ├── minimal_monitor.ino      # Loop principal, decodificador JPEG com alpha-blending, 10 telas e parser JSON
-│   │   └── ui_theme.h               # Definições das 10 telas (SCR_0..SCR_9), pinos Buzzer/LED e paletas RGB565
+│   │   ├── minimal_monitor.ino      # Loop principal, decodificador JPEG com alpha-blending, 14 telas e parser JSON
+│   │   └── ui_theme.h               # Definições das 14 telas (SCR_0..SCR_13), pinos Buzzer/LED e paletas RGB565
+│   ├── wifi_scanner/                # Firmware sem fio para ESP32-WROOM-32U (Antena Externa)
+│   │   ├── wifi_scanner.ino         # Scan 2.4 GHz + mDNS (cyd-radar.local) + UDP Unicast/Broadcast (:8888/:8889)
+│   │   └── platformio.ini           # Projeto PlatformIO isolado para gravação da ESP32-WROOM-32U
 │   └── User_Setup.h                 # Configurações de barramento SPI e pinagem TFT_eSPI
 │
-├── agent/                           # Agente Desktop (PC) em Flet (Flutter) e Servidor Web Mobile
-│   ├── agent.py                     # Coletor Hardware + Mercado + PomodoroEngine + MediaCollector + GUI Flet 6 Abas
-│   ├── mobile_web.py                # Interface Web Mobile (PWA) de alta performance em 5 abas
-│   ├── file_version_info.txt        # Metadados de versão Windows (v4.0.0.0) para o executável
+├── agent/                           # Agente Desktop (PC) em Flet (Flutter), Daemon Headless e Servidor Web Mobile
+│   ├── agent.py                     # Coletor Hardware + Mercado + Pomodoro + Media + GUI Flet + modo --headless
+│   ├── wifi_scanner.py              # Módulo Radar Wi-Fi RF (listener UDP :8889 / comando :8890 para ESP32-WROOM-32U)
+│   ├── net_analyzer.py              # Módulo Análise de Rede, Roteador/Gateway, LAN ARP e Speedtest Fibra 700 Mbps
+│   ├── mobile_web.py                # Interface Web Mobile (PWA) em tempo real (SSE)
+│   ├── file_version_info.txt        # Metadados de versão Windows para o executável
 │   ├── requirements.txt             # Dependências Python (Flet, WinRT, Pillow, psutil, pyserial, etc.)
-│   ├── ui_config.json               # Configuração persistida de telas, cores, alertas e carteira
+│   ├── ui_config.json               # Configuração persistida de telas, cores, alertas e carteira (ignorado no Git)
 │   ├── CYD-Hardware-Monitor.spec    # Especificação PyInstaller para build do executável
 │   └── dist/
-│       └── CYD-Hardware-Monitor.exe # Executável standalone Windows pronto para uso (v4.0)
+│       └── CYD-Hardware-Monitor.exe # Executável standalone Windows pronto para uso
 │
 │
-├── linux/                           # 🐧 Suíte Nativa para Ubuntu / Debian / Linux
-│   ├── install_ubuntu.sh            # Instalador 1-comando (apt, udev, fix brltty, .venv e ícone no Menu do Ubuntu)
+├── linux/                           # 🐧 Suíte Nativa para Linux (Fedora / Ubuntu / Debian)
+│   ├── cyd_ctl.py                   # CLI nativo Linux (`cyd`) para trocar telas, diagnóstico de rede e controle
 │   ├── run_linux.sh                 # Launcher nativo Linux (GUI ou --headless)
-│   ├── build_linux.sh               # Empacotador PyInstaller para gerar binário Linux standalone
-│   ├── flash_firmware_linux.sh      # Script de compilação e gravação do firmware ESP32 no Linux
-│   ├── CYD-Hardware-Monitor-Linux.spec # Especificação PyInstaller para Linux x86_64
-│   ├── 99-cyd-cyber-deck.rules      # Regras udev (/dev/mike) para CH340/CP2102/CH9102/FT232 sem sudo
-│   ├── cyd-cyber-deck.desktop       # Atalho de aplicativo nativo Ubuntu / GNOME
-│   ├── cyd-cyber-deck.service       # Serviço systemd de usuário para inicialização automática
-│   └── README_LINUX.md              # Guia completo de instalação e arquitetura no Ubuntu / Linux
+│   ├── cyd-cyber-deck.service       # Serviço systemd de usuário para inicialização automática em segundo plano
+│   └── ...                          # Scripts auxiliares, regras udev e atalho desktop
 │
 ├── mobile/                          # Projeto Flutter nativo para Android e iOS
 │   ├── README.md                    # Instruções de compilação do APK nativo
@@ -267,17 +270,56 @@ O projeto possui suporte **100% nativo ao Ubuntu (22.04 LTS / 24.04 LTS+) e Debi
 chmod +x linux/*.sh
 ./linux/install_ubuntu.sh
 
-# 2. Inicie o Painel Desktop Flet no Ubuntu (ou abra pelo Menu de Aplicativos "CYD Cyber Deck"):
+# 2. Inicie o Painel Desktop Flet no Linux (ou rode em segundo plano com --headless):
 ./linux/run_linux.sh
+./linux/run_linux.sh --headless
 
-# 3. (Opcional) Gere o binário executável único para Linux (dist/CYD-Hardware-Monitor-Linux):
-./linux/build_linux.sh
-
-# 4. (Opcional) Compile e grave o firmware na placa CYD direto pelo Ubuntu:
-./linux/flash_firmware_linux.sh
+# 3. (Opcional) Instale como serviço automático em segundo plano (systemd --user):
+mkdir -p ~/.config/systemd/user
+cp linux/cyd-cyber-deck.service ~/.config/systemd/user/
+systemctl --user daemon-reload
+systemctl --user enable --now cyd-cyber-deck.service
 ```
 
-> 📖 Consulte o guia detalhado em [`linux/README_LINUX.md`](linux/README_LINUX.md).
+### ⌨️ Controle pelo CLI no Linux (`cyd`)
+
+Instale o atalho executável `cyd` no seu `PATH` (sem dependências externas — comunica-se via API local `http://127.0.0.1:8088`, configurável pela variável `CYD_API_URL`):
+
+```bash
+chmod +x linux/cyd_ctl.py
+mkdir -p ~/.local/bin
+ln -sf "$(pwd)/linux/cyd_ctl.py" ~/.local/bin/cyd
+```
+
+#### Comandos disponíveis
+
+| Comando | Descrição |
+| :--- | :--- |
+| `cyd <0..13>` | Troca diretamente para a tela pelo número (ex.: `cyd 12`, `cyd 13`) |
+| `cyd screen <alvo>` / `cyd s <alvo>` | Troca de tela por número ou apelido (`resumo`, `cpu`, `dual`, `gpu`, `graph`, `wall`, `market`, `portfolio`, `pomo`, `media`, `news`, `term`, `radar`, `net`) |
+| `cyd next` / `cyd prev` | Avança ou volta para a tela seguinte/anterior (`0..13`) |
+| `cyd list` | Lista todas as 14 telas disponíveis indicando qual está ativa |
+| `cyd status` | Exibe resumo de Hardware, Radar Wi-Fi (ESP32-WROOM-32U) e Análise de Rede/Roteador |
+| `cyd router` | Executa diagnóstico completo do roteador/gateway (IP, MAC, ping, jitter, perda, HTTP admin e DNS) |
+| `cyd router --open` | Além do diagnóstico, abre a página de administração do roteador no navegador |
+| `cyd lan` | Lista os dispositivos ativos na LAN via tabela ARP/vizinhos local |
+| `cyd speed` | Abre a Tela 13 e dispara o Speedtest Fibra multi-stream (Download/Upload Mbps + Ping) |
+| `cyd radar [--scan]` | Exibe as redes 2.4 GHz detectadas pela ESP32-WROOM-32U (`--scan` força nova varredura sem fio) |
+| `cyd plan <mbps>` | Configura a velocidade contratada do plano de internet (ex.: `cyd plan 700` para Vivo Fibra 700 Mb) |
+| `cyd brt <0..255>` | Ajusta o brilho PWM do display da CYD |
+| `cyd color "#00FFFF"` | Altera a cor tema RGB565 da CYD em tempo real |
+| `cyd cmd "<comando>"` | Envia comando para o Terminal CYD na Tela 11 (ex.: `cyd cmd "router"`, `cyd cmd "dns google.com"`, `cyd cmd "trace 1.1.1.1"`) |
+
+#### Exemplos práticos
+```bash
+cyd 12                  # Abre o Radar Wi-Fi RF (ESP32-WROOM-32U)
+cyd screen net          # Abre a Tela 13 (Análise de Rede & Roteador)
+cyd speed               # Mede velocidade da fibra ao vivo na Tela 13
+cyd router --open       # Diagnostica o gateway e abre o painel do roteador
+cyd radar --scan        # Dispara varredura remota sem fio na ESP32-WROOM-32U
+```
+
+> 📖 Consulte também o guia detalhado em [`linux/README_LINUX.md`](linux/README_LINUX.md).
 
 ---
 

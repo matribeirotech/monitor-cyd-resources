@@ -1,0 +1,15 @@
+[Unit]
+Description=CYD Cyber Deck Resource Monitor Agent (Headless)
+After=network-online.target graphical-session.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+WorkingDirectory=/home/zipo/Projetos/CYD-PROJECTS/monitor-cyd-resources/agent
+Environment=PYTHONUNBUFFERED=1
+ExecStart=/home/zipo/Projetos/CYD-PROJECTS/monitor-cyd-resources/.venv/bin/python -u /home/zipo/Projetos/CYD-PROJECTS/monitor-cyd-resources/agent/agent.py --headless
+Restart=always
+RestartSec=3
+
+[Install]
+WantedBy=default.target
