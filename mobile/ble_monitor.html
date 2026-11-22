@@ -1,0 +1,204 @@
+<!DOCTYPE html>
+<html lang="pt-BR">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
+  <meta name="theme-color" content="#06090F">
+  <title>CYD BLE Monitor — ESP32-WROOM-32U (+9 dBm)</title>
+  <style>
+    :root {
+      --bg: #06090F; --card: #0E1523; --bd: #1E293B; --txt: #F1F5F9;
+      --dim: #94A3B8; --ok: #22C55E; --warn: #F59E0B; --crit: #EF4444; --ble: #38BDF8;
+    }
+    * { box-sizing: border-box; margin: 0; padding: 0; font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, monospace; }
+    body { background: var(--bg); color: var(--txt); padding: 14px; min-height: 100vh; }
+    .hdr { display: flex; justify-content: space-between; align-items: center; padding-bottom: 12px; border-bottom: 1px solid var(--bd); margin-bottom: 12px; }
+    .hdr h1 { font-size: 16px; color: var(--ble); }
+    .pill { font-size: 11px; font-weight: 800; padding: 4px 10px; border-radius: 99px; background: #0F172A; border: 1px solid var(--bd); }
+    .card { background: var(--card); border: 1px solid var(--bd); border-radius: 14px; padding: 12px; margin-bottom: 12px; }
+    .card h2 { font-size: 11px; letter-spacing: 0.8px; color: var(--dim); margin-bottom: 8px; text-transform: uppercase; }
+    .btn { width: 100%; padding: 12px; border-radius: 10px; border: none; font-weight: 800; font-size: 13px; cursor: pointer; background: #0284C7; color: #fff; }
+    .btn-row { display: grid; grid-template-columns: repeat(3, 1fr); gap: 8px; margin-top: 8px; }
+    .btn-sm { padding: 9px 6px; border-radius: 8px; border: 1px solid var(--bd); background: #131C2E; color: var(--txt); font-size: 11px; font-weight: 700; cursor: pointer; }
+    .kpi-grid { display: grid; grid-template-columns: repeat(2, 1fr); gap: 8px; }
+    .kpi { background: #080D17; border: 1px solid var(--bd); border-radius: 10px; padding: 10px; }
+    .kpi-lbl { font-size: 10px; color: var(--dim); }
+    .kpi-val { font-size: 18px; font-weight: 800; margin-top: 2px; color: var(--ok); }
+    .kpi-sub { font-size: 10px; color: var(--dim); margin-top: 2px; }
+    .logs { background: #04070C; border: 1px solid var(--bd); border-radius: 10px; padding: 8px; max-height: 190px; overflow-y: auto; font-size: 11px; line-height: 1.45; }
+    .alert-crit { border-color: var(--crit) !important; box-shadow: 0 0 18px rgba(239, 68, 68, 0.35); }
+    .scr-grid { display: grid; grid-template-columns: repeat(5, 1fr); gap: 6px; }
+  </style>
+</head>
+<body>
+  <div class="hdr">
+    <div>
+      <h1>🔵 CYD BLE LIVE (ESP32-32U)</h1>
+      <div style="font-size:11px;color:var(--dim);" id="subInfo">Antena Externa +9 dBm • Monitoria Tempo Real</div>
+    </div>
+    <span class="pill" id="blePill" style="color:var(--warn);">DESCONECTADO</span>
+  </div>
+
+  <div class="card">
+    <button class="btn" id="btnConnect" onclick="toggleConnect()">🔵 CONECTAR AO CYD-RADAR-32U (BLUETOOTH)</button>
+    <div style="font-size:10.5px;color:var(--dim);margin-top:8px;" id="connMsg">
+      Requer Chrome/Edge Android (ou Bluefy no iOS) em HTTPS (:8443) ou localhost. Sem necessidade de Wi-Fi após parear!
+    </div>
+  </div>
+
+  <div class="card" id="secCard">
+    <h2>🛡️ Segurança, IDS & Detecção de Invasão (Tela 14)</h2>
+    <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:6px;">
+      <strong id="secStatus" style="font-size:15px;color:var(--ok);">🛡️ SEGURO</strong>
+      <span id="secIp" style="font-size:11px;color:var(--dim);">IP: ---</span>
+    </div>
+    <div style="font-size:11px;color:var(--ble);margin-bottom:8px;" id="secCounts">AUTH: 0 • ERRO: 0 • SCAN: 0 • INTR: 0</div>
+    <div class="logs" id="secLogs">Conecte via Bluetooth para acompanhar eventos de segurança e erros em tempo real...</div>
+    <div class="btn-row">
+      <button class="btn-sm" onclick="sendCmd({cmd:'sec_ack'})">✅ Reconhecer</button>
+      <button class="btn-sm" onclick="sendCmd({cmd:'sec_trust'})">🤝 Confiar LAN</button>
+      <button class="btn-sm" style="color:#F87171;" onclick="sendCmd({cmd:'sec_sim'})">🚨 Simular</button>
+    </div>
+  </div>
+
+  <div class="card">
+    <h2>📊 Hardware & Rede em Tempo Real</h2>
+    <div class="kpi-grid">
+      <div class="kpi"><div class="kpi-lbl">CPU</div><div class="kpi-val" id="kCpu">--%</div><div class="kpi-sub" id="kCpuT">-- °C</div></div>
+      <div class="kpi"><div class="kpi-lbl">RAM / GPU</div><div class="kpi-val" id="kRam">--%</div><div class="kpi-sub" id="kGpu">GPU --%</div></div>
+      <div class="kpi"><div class="kpi-lbl">TRÁFEGO REDE</div><div class="kpi-val" id="kNet" style="color:var(--ble);font-size:14px;">↓0 ↑0M</div><div class="kpi-sub" id="kGw">GW -- • WAN --</div></div>
+      <div class="kpi"><div class="kpi-lbl">RADAR RF 32U</div><div class="kpi-val" id="kRf" style="color:#C084FC;font-size:15px;">-- APs</div><div class="kpi-sub" id="kCh">Livre: CH--</div></div>
+    </div>
+  </div>
+
+  <div class="card">
+    <h2>📺 Controle Remoto da CYD via Bluetooth (Telas 0..14)</h2>
+    <div class="scr-grid" id="scrGrid"></div>
+    <div class="btn-row" style="margin-top:10px;">
+      <button class="btn-sm" onclick="sendCmd('scan')">📡 Scan RF</button>
+      <button class="btn-sm" onclick="sendCmd({cmd:'speedtest'})">⚡ Speedtest</button>
+      <button class="btn-sm" onclick="sendCmd('status')">🔄 Sync Agora</button>
+    </div>
+  </div>
+
+  <script>
+    const NUS_SVC = "6e400001-b5a3-f393-e0a9-e50e24dcca9e";
+    const NUS_RX  = "6e400002-b5a3-f393-e0a9-e50e24dcca9e";
+    const NUS_TX  = "6e400003-b5a3-f393-e0a9-e50e24dcca9e";
+
+    let dev = null, rxChar = null, txChar = null, rxBuf = "", pktCnt = 0;
+
+    // Cria botoes T0..T14
+    const g = document.getElementById("scrGrid");
+    for (let i = 0; i <= 14; i++) {
+      const b = document.createElement("button");
+      b.className = "btn-sm";
+      b.innerText = "T" + i;
+      b.onclick = () => sendCmd({ cmd: "screen", s: i });
+      g.appendChild(b);
+    }
+
+    async function sendCmd(payload) {
+      if (!rxChar) {
+        document.getElementById("connMsg").innerText = "Conecte primeiro ao CYD-RADAR-32U.";
+        return;
+      }
+      const txt = (typeof payload === "string") ? payload : JSON.stringify(payload);
+      const data = new TextEncoder().encode(txt + "\n");
+      if (rxChar.writeValueWithoutResponse) await rxChar.writeValueWithoutResponse(data);
+      else await rxChar.writeValue(data);
+    }
+
+    async function toggleConnect() {
+      if (dev && dev.gatt && dev.gatt.connected) {
+        dev.gatt.disconnect();
+        return;
+      }
+      if (!navigator.bluetooth) {
+        document.getElementById("connMsg").innerText = "❌ Web Bluetooth não disponível neste navegador/origem. Use Chrome Android via HTTPS :8443.";
+        return;
+      }
+      try {
+        document.getElementById("connMsg").innerText = "🔍 Buscando CYD-RADAR-32U...";
+        dev = await navigator.bluetooth.requestDevice({
+          filters: [{ namePrefix: "CYD-RADAR" }, { services: [NUS_SVC] }],
+          optionalServices: [NUS_SVC]
+        });
+        dev.addEventListener("gattserverdisconnected", () => {
+          rxChar = null; txChar = null;
+          document.getElementById("blePill").innerText = "DESCONECTADO";
+          document.getElementById("blePill").style.color = "var(--warn)";
+          document.getElementById("btnConnect").innerText = "🔵 CONECTAR AO CYD-RADAR-32U (BLUETOOTH)";
+        });
+        const srv = await dev.gatt.connect();
+        const svc = await srv.getPrimaryService(NUS_SVC);
+        txChar = await svc.getCharacteristic(NUS_TX);
+        rxChar = await svc.getCharacteristic(NUS_RX);
+        await txChar.startNotifications();
+        txChar.addEventListener("characteristicvaluechanged", (e) => {
+          rxBuf += new TextDecoder().decode(e.target.value);
+          let nl;
+          while ((nl = rxBuf.indexOf("\n")) >= 0) {
+            const ln = rxBuf.slice(0, nl).trim();
+            rxBuf = rxBuf.slice(nl + 1);
+            if (ln) onBleLine(ln);
+          }
+        });
+        document.getElementById("blePill").innerText = "CONECTADO +9dBm";
+        document.getElementById("blePill").style.color = "var(--ok)";
+        document.getElementById("btnConnect").innerText = "🔌 DESCONECTAR BLUETOOTH";
+        document.getElementById("connMsg").innerText = `✅ Conectado a ${dev.name || "CYD-RADAR-32U"} — recebendo telemetria ao vivo!`;
+        await sendCmd("status");
+      } catch (err) {
+        document.getElementById("connMsg").innerText = "⚠️ " + (err.message || err);
+      }
+    }
+
+    function onBleLine(line) {
+      try {
+        const doc = JSON.parse(line);
+        pktCnt++;
+        const snap = doc.snap || doc;
+        if (snap.sys) {
+          document.getElementById("kCpu").innerText = `${snap.sys.cpu ?? "--"}%`;
+          document.getElementById("kCpuT").innerText = snap.sys.cput != null ? `${snap.sys.cput} °C` : `Dsk ${snap.sys.dsk ?? 0}%`;
+          document.getElementById("kRam").innerText = `${snap.sys.ram ?? "--"}%`;
+          document.getElementById("kGpu").innerText = `GPU ${snap.sys.gpu ?? "--"}% (${snap.sys.gput ?? "--"}°C)`;
+          document.getElementById("subInfo").innerText = `Ao vivo via BLE • Pacote #${pktCnt} • ${snap.ts || ""} • Tela ${snap.scr ?? "-"}`;
+        }
+        if (snap.net) {
+          document.getElementById("kNet").innerText = `↓${snap.net.rxm ?? 0} ↑${snap.net.txm ?? 0}M`;
+          document.getElementById("kGw").innerText = `GW ${snap.net.gwms ?? 0}ms • WAN ${snap.net.wanms ?? 0}ms • LAN ${snap.net.lan ?? 0}`;
+        }
+        if (snap.rf) {
+          document.getElementById("kRf").innerText = `${snap.rf.tot ?? 0} APs`;
+          document.getElementById("kCh").innerText = `Livre: CH${snap.rf.fch ?? 1} • Best: ${snap.rf.best ?? 0}dBm`;
+        }
+        if (doc.wrad) {
+          document.getElementById("kRf").innerText = `${doc.wrad.tot ?? 0} APs`;
+          document.getElementById("kCh").innerText = `Livre: CH${doc.wrad.fch ?? 1} • Best: ${doc.wrad.best ?? 0}dBm`;
+        }
+        if (snap.sec) {
+          const sc = snap.sec;
+          const card = document.getElementById("secCard");
+          const st = document.getElementById("secStatus");
+          const col = sc.lvl >= 2 ? "var(--crit)" : (sc.lvl === 1 ? "var(--warn)" : "var(--ok)");
+          st.innerText = (sc.lvl >= 2 ? "🚨 " : (sc.lvl === 1 ? "⚠️ " : "🛡️ ")) + (sc.st || "SEGURO");
+          st.style.color = col;
+          card.classList.toggle("alert-crit", sc.lvl >= 2);
+          document.getElementById("secIp").innerText = "IP: " + (sc.ip || "---");
+          document.getElementById("secCounts").innerText = `AUTH: ${sc.af ?? 0} • ERRO: ${sc.er ?? 0} • SCAN: ${sc.ps ?? 0} • INTR: ${sc.un ?? 0}`;
+          const logs = Array.isArray(sc.logs) ? sc.logs : [];
+          if (logs.length) {
+            document.getElementById("secLogs").innerHTML = logs.map(r => {
+              const c = r[0] >= 2 ? "#EF4444" : (r[0] === 1 ? "#FACC15" : "#CBD5E1");
+              return `<div style="color:${c};">[${r[1]}] ${String(r[2]).replace(/</g, "&lt;")}</div>`;
+            }).join("");
+          }
+          if (sc.lvl >= 2 && navigator.vibrate) navigator.vibrate([200, 80, 200]);
+        }
+      } catch (e) {}
+    }
+  </script>
+</body>
+</html>

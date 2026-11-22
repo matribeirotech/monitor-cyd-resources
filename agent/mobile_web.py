@@ -844,8 +844,8 @@ HTML_MOBILE_APP = r"""<!DOCTYPE html>
           <div class="sc-badge" id="badge-12">T12</div>
         </div>
         <div>
-          <div class="sc-title">Tela 12: Radar Wi-Fi</div>
-          <div class="sc-desc" id="sc12Desc">ESP32-WROOM-32U • Canais 2.4GHz & RSSI</div>
+          <div class="sc-title">Tela 12: Radar & Fluxo</div>
+          <div class="sc-desc" id="sc12Desc">Fluxo Animado Pacotes • RF 2.4GHz & BLE</div>
         </div>
       </div>
 
@@ -858,6 +858,49 @@ HTML_MOBILE_APP = r"""<!DOCTYPE html>
           <div class="sc-title">Tela 13: Rede & Roteador</div>
           <div class="sc-desc" id="sc13Desc">Gateway, LAN ARP & Fibra 700 Mbps</div>
         </div>
+      </div>
+
+      <div class="screen-card" data-screen="14" onclick="selectScreen(14)" style="grid-column: span 2;">
+        <div class="sc-top">
+          <div class="sc-icon">🛡️</div>
+          <div class="sc-badge" id="badge-14">T14</div>
+        </div>
+        <div>
+          <div class="sc-title">Tela 14: Segurança, IDS & Logs</div>
+          <div class="sc-desc" id="sc14Desc">Detecção de Invasão SSH/ARP/Portas & Erros do Sistema</div>
+        </div>
+      </div>
+    </div>
+
+    <div class="sec-header" style="margin-top:14px;">
+      <div class="sec-title">🛡️ SEGURANÇA, IDS & LOGS DO SISTEMA (TELA 14)</div>
+      <span style="font-size:10px; font-weight:800; font-family:monospace; color:#22C55E;" id="mSecBadge">SEGURO</span>
+    </div>
+    <div class="action-card" id="mSecCard" style="border-color:#22C55E44;">
+      <div style="display:flex; justify-content:space-between; align-items:center; margin-bottom:6px;">
+        <span style="font-size:11px; font-weight:800; font-family:monospace; color:#22C55E;" id="mSecStatus">🛡️ PERÍMETRO SEGURO</span>
+        <span style="font-size:10px; font-family:monospace; color:var(--text-dim);" id="mSecIp">IP: ---</span>
+      </div>
+      <div style="font-size:10.5px; font-family:monospace; color:#38BDF8; margin-bottom:8px;" id="mSecCounts">AUTH:0 • ERR:0 • SCAN:0 • INTR:0 • Portas:0</div>
+      <div style="background:#030508; border:1px solid #1E293B; border-radius:8px; padding:8px; font-family:monospace; font-size:10.5px; color:#E2E8F0; max-height:145px; overflow-y:auto; margin-bottom:8px;" id="mSecLogs">Monitorando logs de segurança e erros do sistema...</div>
+      <div class="btn-row" style="margin-bottom:6px;">
+        <button class="btn btn-secondary" onclick="securityAction('ack')" style="font-size:11px;">✅ Reconhecer</button>
+        <button class="btn btn-secondary" onclick="securityAction('trust')" style="font-size:11px;">🤝 Confiar LAN</button>
+        <button class="btn btn-secondary" onclick="securityAction('sim')" style="font-size:11px; color:#F87171;">🚨 Simular</button>
+      </div>
+      <button class="btn btn-secondary" onclick="selectScreen(14)" style="width:100%; font-size:11px;">📺 Abrir Tela 14 na CYD</button>
+    </div>
+
+    <div class="sec-header" style="margin-top:14px;">
+      <div class="sec-title">🔵 BLUETOOTH LONGO ALCANCE (ESP32-WROOM-32U • +9 dBm)</div>
+      <span style="font-size:10px; font-weight:800; font-family:monospace; color:#38BDF8;" id="mBleBadge">STANDBY</span>
+    </div>
+    <div class="action-card" style="border-color:#0284C744;">
+      <div style="font-size:11px; font-weight:700; font-family:monospace; color:#38BDF8; margin-bottom:6px;" id="mBleStatus">🔵 Pronto para parear com CYD-RADAR-32U (Antena Externa)</div>
+      <div style="font-size:10.5px; font-family:monospace; color:var(--text-dim); margin-bottom:8px;" id="mBleLive">Conecte via Bluetooth para monitorar CPU, Rede, RF e Alertas de Invasão em tempo real a longa distância!</div>
+      <div class="btn-row" style="margin-bottom:6px;">
+        <button class="btn" id="btnBleConnect" onclick="toggleBleConnection()" style="font-size:11px; background:#0284C7; color:#FFF;">🔵 Conectar BLE 32U</button>
+        <button class="btn btn-secondary" onclick="openHttpsBle()" style="font-size:11px;">🔒 Modo HTTPS /ble</button>
       </div>
     </div>
 
@@ -1323,6 +1366,9 @@ HTML_MOBILE_APP = r"""<!DOCTYPE html>
       appState.screen = scrIdx;
       updateScreenCardsUI(scrIdx);
       showToast("Mudando para Tela " + scrIdx + "...");
+      if (typeof bleDevice !== "undefined" && bleDevice && bleDevice.gatt && bleDevice.gatt.connected && bleRxChar) {
+        await bleSendRaw(JSON.stringify({ cmd: "screen", s: scrIdx }));
+      }
       try {
         await fetch("/api/screen", {
           method: "POST",
@@ -1670,6 +1716,141 @@ HTML_MOBILE_APP = r"""<!DOCTYPE html>
       reader.readAsDataURL(file);
     }
 
+    // =========================================================================
+    //  SEGURANCA / IDS (TELA 14) + BLUETOOTH LONGO ALCANCE (ESP32-WROOM-32U)
+    // =========================================================================
+    let lastHttpsPort = 8443;
+    let bleDevice = null;
+    let bleRxChar = null;
+    let bleTxChar = null;
+    let bleRxBuf = "";
+    let blePktCount = 0;
+
+    const NUS_SERVICE_UUID = "6e400001-b5a3-f393-e0a9-e50e24dcca9e";
+    const NUS_RX_CHAR_UUID = "6e400002-b5a3-f393-e0a9-e50e24dcca9e";
+    const NUS_TX_CHAR_UUID = "6e400003-b5a3-f393-e0a9-e50e24dcca9e";
+
+    async function securityAction(action) {
+      vibrate(20);
+      if (bleDevice && bleDevice.gatt && bleDevice.gatt.connected && bleRxChar) {
+        const map = { ack: "sec_ack", trust: "sec_trust", sim: "sec_sim" };
+        if (map[action]) await bleSendRaw(JSON.stringify({ cmd: map[action] }));
+      }
+      try {
+        await fetch("/api/security", {
+          method: "POST",
+          headers: {"Content-Type": "application/json"},
+          body: JSON.stringify({ action: action })
+        });
+        if (action === "sim") showToast("Simulação de invasão disparada na CYD!", "🚨");
+        else if (action === "ack") showToast("Alertas IDS reconhecidos", "🛡️");
+        else showToast("Baseline de segurança atualizado", "🤝");
+      } catch (e) {}
+    }
+
+    function openHttpsBle() {
+      const host = window.location.hostname || "127.0.0.1";
+      const port = lastHttpsPort || 8443;
+      window.location.href = `https://${host}:${port}/ble`;
+    }
+
+    async function bleSendRaw(txt) {
+      if (!bleRxChar) return;
+      try {
+        const enc = new TextEncoder().encode(txt + "\n");
+        if (bleRxChar.writeValueWithoutResponse) {
+          await bleRxChar.writeValueWithoutResponse(enc);
+        } else {
+          await bleRxChar.writeValue(enc);
+        }
+      } catch (e) {
+        console.error("BLE write err:", e);
+      }
+    }
+
+    async function toggleBleConnection() {
+      if (bleDevice && bleDevice.gatt && bleDevice.gatt.connected) {
+        bleDevice.gatt.disconnect();
+        return;
+      }
+      if (!navigator.bluetooth) {
+        showToast("Web Bluetooth exige HTTPS! Abrindo modo seguro :8443...", "🔒");
+        const stEl = document.getElementById("mBleStatus");
+        if (stEl) stEl.innerText = "⚠️ Navegador exige HTTPS para Bluetooth! Toque em '🔒 Modo HTTPS /ble'.";
+        return;
+      }
+      const stEl = document.getElementById("mBleStatus");
+      const btn = document.getElementById("btnBleConnect");
+      const badge = document.getElementById("mBleBadge");
+      try {
+        if (stEl) stEl.innerText = "🔍 Procurando CYD-RADAR-32U (Antena Externa)...";
+        bleDevice = await navigator.bluetooth.requestDevice({
+          filters: [{ namePrefix: "CYD-RADAR" }, { services: [NUS_SERVICE_UUID] }],
+          optionalServices: [NUS_SERVICE_UUID]
+        });
+        bleDevice.addEventListener("gattserverdisconnected", () => {
+          bleRxChar = null;
+          bleTxChar = null;
+          if (stEl) stEl.innerText = "⚪ Bluetooth desconectado da ESP32-WROOM-32U";
+          if (badge) { badge.innerText = "STANDBY"; badge.style.color = "#38BDF8"; }
+          if (btn) btn.innerText = "🔵 Conectar BLE 32U";
+        });
+        const server = await bleDevice.gatt.connect();
+        const service = await server.getPrimaryService(NUS_SERVICE_UUID);
+        bleTxChar = await service.getCharacteristic(NUS_TX_CHAR_UUID);
+        bleRxChar = await service.getCharacteristic(NUS_RX_CHAR_UUID);
+        await bleTxChar.startNotifications();
+        bleTxChar.addEventListener("characteristicvaluechanged", (ev) => {
+          const chunk = new TextDecoder().decode(ev.target.value);
+          bleRxBuf += chunk;
+          let nl;
+          while ((nl = bleRxBuf.indexOf("\n")) >= 0) {
+            const line = bleRxBuf.slice(0, nl).trim();
+            bleRxBuf = bleRxBuf.slice(nl + 1);
+            if (line) handleBleJsonLine(line);
+          }
+        });
+        if (stEl) stEl.innerText = `🟢 Conectado via BLE a ${bleDevice.name || "CYD-RADAR-32U"} (+9 dBm)`;
+        if (badge) { badge.innerText = "BLE LIVE"; badge.style.color = "#22C55E"; }
+        if (btn) btn.innerText = "🔌 Desconectar BLE";
+        showToast("Bluetooth Longo Alcance conectado!", "🔵");
+        await bleSendRaw("status");
+      } catch (err) {
+        if (stEl) stEl.innerText = "⚠️ Pareamento cancelado ou indisponível: " + (err.message || err);
+      }
+    }
+
+    function handleBleJsonLine(line) {
+      try {
+        const msg = JSON.parse(line);
+        blePktCount++;
+        const liveEl = document.getElementById("mBleLive");
+        const snap = msg.snap || msg;
+        if (snap && snap.sys && snap.sec) {
+          const s = snap.sys;
+          const n = snap.net || {};
+          const sc = snap.sec;
+          if (liveEl) {
+            liveEl.innerText = `[BLE #${blePktCount} • ${snap.ts || ""}] CPU ${s.cpu}% • RAM ${s.ram}% • DL ${n.rxm || 0}M ↑${n.txm || 0}M • IDS: ${sc.st} (AUTH:${sc.af} ERR:${sc.er})`;
+            liveEl.style.color = sc.lvl >= 2 ? "#EF4444" : "#22C55E";
+          }
+          if (sc.lvl >= 2 && navigator.vibrate) {
+            navigator.vibrate([180, 80, 180, 80, 260]);
+          }
+          // Espelha dados recebidos via BLE diretamente nos cards se SSE estiver offline
+          updateState({
+            screen: snap.scr,
+            sys: s,
+            security: {
+              level: sc.lvl, status: sc.st, auth_fails: sc.af, sys_errors: sc.er,
+              port_scans: sc.ps, unknown_lan: sc.un, last_ip: sc.ip,
+              events: (sc.logs || []).map(r => ({ sev: r[0], hm: r[1], cat: "BLE", msg: r[2] }))
+            }
+          });
+        }
+      } catch (e) {}
+    }
+
     function updateState(data) {
       if (!data) return;
       if (data.screen !== undefined && data.screen !== appState.screen) {
@@ -1818,9 +1999,65 @@ HTML_MOBILE_APP = r"""<!DOCTYPE html>
         }
       }
 
-      // Radar Wi-Fi RF (ESP32-WROOM-32U - Tela 12)
+      if (data.https_port) {
+        lastHttpsPort = data.https_port;
+      }
+
+      // Seguranca, IDS & Logs do Sistema (Tela 14)
+      if (data.security) {
+        const sc = data.security;
+        const lvl = Number(sc.level || 0);
+        const stTxt = sc.status || "SEGURO";
+        const col = lvl >= 2 ? "#EF4444" : (lvl === 1 ? "#F59E0B" : "#22C55E");
+        const ico = lvl >= 2 ? "🚨" : (lvl === 1 ? "⚠️" : "🛡️");
+
+        const bEl = document.getElementById("mSecBadge");
+        const sEl = document.getElementById("mSecStatus");
+        const iEl = document.getElementById("mSecIp");
+        const cEl = document.getElementById("mSecCounts");
+        const lEl = document.getElementById("mSecLogs");
+        const cardEl = document.getElementById("mSecCard");
+        const sc14 = document.getElementById("sc14Desc");
+
+        if (bEl) { bEl.innerText = stTxt; bEl.style.color = col; }
+        if (sEl) { sEl.innerText = `${ico} PERÍMETRO: ${stTxt}`; sEl.style.color = col; }
+        if (iEl) iEl.innerText = `IP: ${sc.last_ip || "---"}`;
+        if (cardEl) cardEl.style.borderColor = lvl >= 2 ? "#EF4444" : (lvl === 1 ? "#F59E0B66" : "#22C55E44");
+        if (cEl) {
+          cEl.innerText = `AUTH:${sc.auth_fails || 0} • ERR:${sc.sys_errors || 0} • SCAN:${sc.port_scans || 0} • INTR:${sc.unknown_lan || 0} • Portas:${sc.open_ports_count || 0}`;
+        }
+        if (sc14) {
+          sc14.innerText = `${ico} ${stTxt} • AUTH:${sc.auth_fails || 0} • ERR:${sc.sys_errors || 0} • Portas:${sc.open_ports_count || 0}`;
+        }
+        if (lEl) {
+          const evs = Array.isArray(sc.events) ? sc.events : [];
+          if (!evs.length) {
+            lEl.innerText = "Perímetro limpo • Nenhum evento suspeito detectado.";
+          } else {
+            lEl.innerHTML = evs.slice(0, 12).map(ev => {
+              const ec = ev.sev >= 2 ? "#EF4444" : (ev.sev === 1 ? "#FACC15" : "#94A3B8");
+              const tag = ev.sev >= 2 ? "CRIT" : (ev.sev === 1 ? "WARN" : "INFO");
+              const msg = String(ev.msg || "").replace(/</g, "&lt;").replace(/>/g, "&gt;");
+              return `<div style="padding:2px 0;border-bottom:1px solid #111827;color:${ec};">` +
+                     `<b>[${tag}]</b> ${ev.hm || "--:--"} ${ev.cat || ""}: ${msg}</div>`;
+            }).join("");
+          }
+        }
+      }
+
+      // Radar Wi-Fi RF & BLE (ESP32-WROOM-32U - Tela 12)
       if (data.wifi_radar) {
         const wr = data.wifi_radar;
+        const bleBadge = document.getElementById("mBleBadge");
+        if (bleBadge && !(bleDevice && bleDevice.gatt && bleDevice.gatt.connected)) {
+          if (wr.ble_connected) {
+            bleBadge.innerText = `BLE ON (${wr.ble_clients || 1})`;
+            bleBadge.style.color = "#22C55E";
+          } else if (wr.online) {
+            bleBadge.innerText = `ADV +${wr.ble_pwr_dbm || 9}dBm`;
+            bleBadge.style.color = "#38BDF8";
+          }
+        }
         const stEl = document.getElementById("mWradStatus");
         const mtEl = document.getElementById("mWradMeta");
         const chEl = document.getElementById("mWradChInfo");

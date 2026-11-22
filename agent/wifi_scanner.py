@@ -309,6 +309,7 @@ class WiFiScannerCollector:
         self._udp_port = int(udp_port or UDP_SCANNER_LISTEN_PORT)
         self._excluded_ports_fn = excluded_ports_fn
         self._on_log = on_log
+        self._on_ble_command = None
 
         self._running = False
         self._udp_thread: threading.Thread | None = None
@@ -320,6 +321,11 @@ class WiFiScannerCollector:
         self._transport: str = "UDP"      # UDP | SERIAL
         self._online: bool = False
         self._scanning: bool = False
+        self._ble_connected: bool = False
+        self._ble_clients: int = 0
+        self._ble_pwr: int = 9
+        self._ble_name: str = "CYD-RADAR-32U"
+        self._ble_last_push_ts: float = 0.0
         self._status_msg: str = f"Aguardando ESP32-WROOM-32U via Wi-Fi UDP :{self._udp_port}..."
         self._last_error: str = ""
         self._last_rx_mono: float = 0.0
@@ -365,6 +371,47 @@ class WiFiScannerCollector:
 
     def set_log_callback(self, fn):
         self._on_log = fn
+
+    def set_ble_command_callback(self, fn):
+        """Define callback chamado quando o smartphone conectado via BLE na ESP32-32U envia um comando."""
+        self._on_ble_command = fn
+
+    def is_ble_connected(self) -> bool:
+        with self._lock:
+            return bool(self._is_alive_locked() and self._ble_connected)
+
+    def push_ble_snapshot(self, snap: dict):
+        """Envia snapshot consolidado (HW + Rede + Seguranca/IDS + Mercado) via UDP :8890 para a ESP32-32U transmitir via BLE."""
+        if not isinstance(snap, dict):
+            return
+        pkt = {"cmd": "ble_push", "snap": snap}
+        try:
+            raw = (json.dumps(pkt, ensure_ascii=False, separators=(",", ":")) + "\n").encode("utf-8")
+        except Exception:
+            return
+        if len(raw) > 1380:
+            # Reduz logs caso exceda MTU UDP
+            snap_trim = dict(snap)
+            if isinstance(snap_trim.get("sec"), dict) and isinstance(snap_trim["sec"].get("logs"), list):
+                snap_trim["sec"] = dict(snap_trim["sec"])
+                snap_trim["sec"]["logs"] = snap_trim["sec"]["logs"][:3]
+            raw = (json.dumps({"cmd": "ble_push", "snap": snap_trim}, ensure_ascii=False, separators=(",", ":")) + "\n").encode("utf-8")
+
+        sock = self._udp_sock
+        if sock is not None:
+            self._send_udp_ctrl(sock, raw)
+            with self._lock:
+                self._ble_last_push_ts = time.time()
+            return
+        try:
+            s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+            s.setsockopt(socket.SOL_SOCKET, socket.SO_BROADCAST, 1)
+            self._send_udp_ctrl(s, raw)
+            s.close()
+            with self._lock:
+                self._ble_last_push_ts = time.time()
+        except Exception:
+            pass
 
     def start(self):
         if self._running:
@@ -513,6 +560,9 @@ class WiFiScannerCollector:
                 "fch": int(self._free_ch),
                 "age": min(age_s, 999),
                 "sc": int(self._scan_count),
+                "ble": 1 if (alive and self._ble_connected) else 0,
+                "bcli": int(self._ble_clients if alive else 0),
+                "bpwr": int(self._ble_pwr),
                 "ch": list(self._ch_counts),
                 "aps": top_aps,
             }
@@ -546,6 +596,10 @@ class WiFiScannerCollector:
                 "avg_rssi": self._avg_rssi if self._networks else 0,
                 "busiest_ch": self._busiest_ch,
                 "free_ch": self._free_ch,
+                "ble_connected": bool(alive and self._ble_connected),
+                "ble_clients": int(self._ble_clients if alive else 0),
+                "ble_pwr_dbm": int(self._ble_pwr),
+                "ble_name": str(self._ble_name or "CYD-RADAR-32U"),
                 "ch_counts": list(self._ch_counts),
                 "networks": [dict(n) for n in self._networks],
                 "history": list(self._history),
@@ -1027,12 +1081,21 @@ class WiFiScannerCollector:
             self._online = True
             self._scanning = False
             self._transport = transport
+            if "ble" in blk:
+                self._ble_connected = bool(int(blk.get("ble") or 0))
+            if "bcli" in blk:
+                self._ble_clients = max(0, int(blk.get("bcli") or 0))
+            if "bpwr" in blk:
+                self._ble_pwr = int(blk.get("bpwr") or 9)
+            if blk.get("bnam"):
+                self._ble_name = str(blk.get("bnam"))[:24]
             if ip_str:
                 self._scanner_ip = ip_str
             self._last_error = ""
             via_str = f"Wi-Fi {self._scanner_ip}" if transport == "UDP" and self._scanner_ip else transport
+            ble_tag = f" • BLE ON ({self._ble_clients})" if self._ble_connected else " • BLE +9dBm"
             self._status_msg = (
-                f"ESP32-WROOM-32U Online ({via_str}) • "
+                f"ESP32-WROOM-32U Online ({via_str}{ble_tag}) • "
                 f"{self._total_reported} redes • Livre: CH{free_ch}"
             )
             self._history.append({"t": now_str, "tot": self._total_reported, "best": best_rssi})
@@ -1092,8 +1155,16 @@ class WiFiScannerCollector:
                     continue
                 try:
                     doc = json.loads(raw)
-                    if isinstance(doc, dict) and ("wrad" in doc or "wrad_full" in doc):
-                        self._ingest_packet(doc, src_ip=addr[0], transport="UDP")
+                    if isinstance(doc, dict):
+                        if "wrad" in doc or "wrad_full" in doc:
+                            self._ingest_packet(doc, src_ip=addr[0], transport="UDP")
+                        elif "ble_cmd" in doc:
+                            cb = self._on_ble_command
+                            if cb is not None:
+                                try:
+                                    cb(doc["ble_cmd"], src_ip=addr[0])
+                                except Exception:
+                                    pass
                 except Exception:
                     continue
 

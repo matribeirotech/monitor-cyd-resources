@@ -1,0 +1,16 @@
+# Regras udev para CYD Cyber Deck (ESP32-2432S028R CH340/CH9102 e ESP32-WROOM-32U CP2102)
+# 1) Garante permissao de leitura/escrita ao usuario local (grupo dialout / uaccess)
+# 2) Bloqueia o ModemManager do Fedora/Ubuntu de sondar portas seriais ESP32 (causa resets/quedas!)
+# 3) Desativa USB autosuspend nas pontes USB-Serial para evitar desconexoes espontaneas
+
+# CH340 / CH341 (CYD ESP32-2432S028R)
+SUBSYSTEM=="tty", ATTRS{idVendor}=="1a86", ATTRS{idProduct}=="7523", MODE="0666", GROUP="dialout", TAG+="uaccess", ENV{ID_MM_DEVICE_IGNORE}="1"
+ACTION=="add", SUBSYSTEM=="usb", ATTR{idVendor}=="1a86", ATTR{idProduct}=="7523", TEST=="power/control", ATTR{power/control}="on", ENV{ID_MM_DEVICE_IGNORE}="1"
+
+# CH9102 (CYD revisoes mais novas)
+SUBSYSTEM=="tty", ATTRS{idVendor}=="1a86", ATTRS{idProduct}=="55d4", MODE="0666", GROUP="dialout", TAG+="uaccess", ENV{ID_MM_DEVICE_IGNORE}="1"
+ACTION=="add", SUBSYSTEM=="usb", ATTR{idVendor}=="1a86", ATTR{idProduct}=="55d4", TEST=="power/control", ATTR{power/control}="on", ENV{ID_MM_DEVICE_IGNORE}="1"
+
+# Silicon Labs CP2102 (ESP32-WROOM-32U / DevKit)
+SUBSYSTEM=="tty", ATTRS{idVendor}=="10c4", ATTRS{idProduct}=="ea60", MODE="0666", GROUP="dialout", TAG+="uaccess", ENV{ID_MM_DEVICE_IGNORE}="1"
+ACTION=="add", SUBSYSTEM=="usb", ATTR{idVendor}=="10c4", ATTR{idProduct}=="ea60", TEST=="power/control", ATTR{power/control}="on", ENV{ID_MM_DEVICE_IGNORE}="1"

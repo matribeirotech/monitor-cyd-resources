@@ -30,6 +30,7 @@ import queue
 import re
 import shutil
 import socket
+import ssl
 import struct
 import subprocess
 import sys
@@ -83,6 +84,114 @@ except ImportError:
     except Exception:
         import agent.ai_analyst as ai_analyst
 
+try:
+    import security_monitor
+except ImportError:
+    try:
+        from . import security_monitor
+    except Exception:
+        import agent.security_monitor as security_monitor
+
+
+def ensure_self_signed_ssl_cert() -> tuple[str, str]:
+    """Gera (uma unica vez) certificado autoassinado para HTTPS :8443 (habilita Web Bluetooth no celular)."""
+    base_dir = os.path.dirname(os.path.abspath(__file__))
+    ssl_dir = os.path.join(base_dir, ".cyd_ssl")
+    cert_path = os.path.join(ssl_dir, "cyd_cert.pem")
+    key_path = os.path.join(ssl_dir, "cyd_key.pem")
+    if os.path.exists(cert_path) and os.path.exists(key_path):
+        return cert_path, key_path
+    try:
+        os.makedirs(ssl_dir, exist_ok=True)
+        lan_ip = get_local_lan_ip()
+        cmd = [
+            "openssl", "req", "-x509", "-newkey", "rsa:2048",
+            "-keyout", key_path, "-out", cert_path,
+            "-days", "1825", "-nodes",
+            "-subj", f"/CN={lan_ip}",
+            "-addext", f"subjectAltName=IP:{lan_ip},IP:127.0.0.1,DNS:localhost",
+        ]
+        res = subprocess.run(cmd, capture_output=True, text=True, timeout=15)
+        if res.returncode == 0 and os.path.exists(cert_path) and os.path.exists(key_path):
+            return cert_path, key_path
+    except Exception:
+        pass
+    return "", ""
+
+
+def build_ble_live_snapshot(
+    state: dict,
+    sys_metrics: dict,
+    mkt_metrics: dict,
+    net_col=None,
+    sec_col=None,
+    wifi_scan_col=None,
+) -> dict:
+    """Monta snapshot compacto (~700 B) para streaming em tempo real via BLE na ESP32-WROOM-32U."""
+    s = sys_metrics or {}
+    m = mkt_metrics or {}
+    ns = net_col.get_ui_snapshot() if net_col is not None else {}
+    sc = sec_col.get_cyd_payload() if sec_col is not None else {}
+    ws = wifi_scan_col.get_ui_snapshot() if wifi_scan_col is not None else {}
+    return {
+        "ts": datetime.now().strftime("%H:%M:%S"),
+        "scr": int(state.get("screen", 0)),
+        "brt": int(state.get("brt", 200)),
+        "sys": {
+            "cpu": round(float(s.get("cpu", 0.0) or 0.0), 1),
+            "cput": round(float(s.get("cput", 0.0) or 0.0), 1) if s.get("cput") is not None else None,
+            "ram": round(float(s.get("ram", 0.0) or 0.0), 1),
+            "gpu": round(float(s.get("gpu", 0.0) or 0.0), 1),
+            "gput": round(float(s.get("gput", 0.0) or 0.0), 1) if s.get("gput") is not None else None,
+            "dsk": round(float(s.get("dsk", 0.0) or 0.0), 1),
+            "rx": round(float(s.get("rx", 0.0) or 0.0), 2),
+            "tx": round(float(s.get("tx", 0.0) or 0.0), 2),
+        },
+        "net": {
+            "gw": str(ns.get("gateway_ip", "--")),
+            "gwms": round(float(ns.get("gw_ms", 0.0) or 0.0), 1),
+            "wanms": round(float(ns.get("wan_ms", 0.0) or 0.0), 1),
+            "rxm": round(float(ns.get("rx_mbps", 0.0) or 0.0), 1),
+            "txm": round(float(ns.get("tx_mbps", 0.0) or 0.0), 1),
+            "lan": int(ns.get("lan_count", 0) or 0),
+        },
+        "sec": {
+            "lvl": int(sc.get("lvl", 0)),
+            "st": str(sc.get("st", "SEGURO")),
+            "af": int(sc.get("af", 0)),
+            "er": int(sc.get("er", 0)),
+            "ps": int(sc.get("ps", 0)),
+            "un": int(sc.get("un", 0)),
+            "ip": str(sc.get("ip", "---")),
+            "al": str(sc.get("al", "")),
+            "logs": (sc.get("logs") or [])[:4],
+        },
+        "rf": {
+            "tot": int(ws.get("total", 0) or 0),
+            "fch": int(ws.get("free_ch", 1) or 1),
+            "bch": int(ws.get("busiest_ch", 0) or 0),
+            "best": int(ws.get("best_rssi", 0) or 0),
+        },
+        "mkt": {
+            "usd": round(float(m.get("usd", 0.0) or 0.0), 2),
+            "btc": round(float(m.get("btc", 0.0) or 0.0), 0),
+            "btcc": round(float(m.get("btcc", 0.0) or 0.0), 2),
+        },
+    }
+
+
+def _read_ble_monitor_html() -> bytes:
+    """Le o dashboard standalone mobile/ble_monitor.html (servido em /ble)."""
+    base_dir = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    p = os.path.join(base_dir, "mobile", "ble_monitor.html")
+    if os.path.exists(p):
+        try:
+            with open(p, "rb") as f:
+                return f.read()
+        except Exception:
+            pass
+    return mobile_web.HTML_MOBILE_APP.encode("utf-8")
+
 IS_WINDOWS = platform.system() == "Windows"
 IS_LINUX = platform.system() == "Linux"
 if sys.stdout is None:
@@ -96,7 +205,7 @@ except ImportError:
     sys.exit("Faltando psutil. Instale as dependencias com: pip install -r agent/requirements.txt")
 
 BAUD = 115200
-INTERVAL = 1.0
+INTERVAL = 0.5
 APP_DIR = os.path.dirname(sys.executable) if getattr(sys, "frozen", False) else os.path.dirname(os.path.abspath(__file__))
 
 
@@ -778,14 +887,14 @@ class Collector:
         eliminando picos de CPU/RAM no agente e impedindo qualquer travamento na UI ou Serial.
     """
 
-    def __init__(self, game_processes=(), poll_interval: float = 1.0):
+    def __init__(self, game_processes=(), poll_interval: float = 0.5):
         psutil.cpu_percent(interval=None)
         self._lock = threading.Lock()
-        self.poll_interval = max(0.5, float(poll_interval))
+        self.poll_interval = max(0.25, float(poll_interval))
         self.host = socket.gethostname()[:14]
         self.prev_net = psutil.net_io_counters()
         self.prev_disk = psutil.disk_io_counters()
-        self.prev_t = time.time()
+        self.prev_mono = time.monotonic()
         self.boot_t = psutil.boot_time()
         self.cores = psutil.cpu_count(logical=True)
         self.game_processes = tuple(g.lower() for g in DEFAULT_GAME_PROCESSES + tuple(game_processes))
@@ -810,7 +919,8 @@ class Collector:
 
     def _collect_once_internal(self, include_heavy: bool = False):
         now = time.time()
-        dt = max(now - self.prev_t, 0.1)
+        now_m = time.monotonic()
+        dt = max(now_m - self.prev_mono, 0.1)
 
         cpu = psutil.cpu_percent(interval=None)
         cpuf_mhz = get_cpu_freq_mhz()
@@ -830,11 +940,11 @@ class Collector:
         else:
             dr = dw = 0.0
         self.prev_disk = dio
-        self.prev_t = now
+        self.prev_mono = now_m
 
         # Camada 2: Sensores pesados (WMI / LHM / GPU / Temperatura) em cache de 2.0s
-        if include_heavy or (now - self._last_heavy_scan >= 2.0):
-            self._last_heavy_scan = now
+        if include_heavy or (now_m - self._last_heavy_scan >= 2.0):
+            self._last_heavy_scan = now_m
             try:
                 web_data = _get_lhm_web_data()
                 self._cached_cput = cpu_temperature(web_data)
@@ -846,8 +956,8 @@ class Collector:
                 pass
 
         # Camada 3: Varredura de processos e jogos em cache de 6.0s
-        if now - self._last_proc_scan >= 6.0:
-            self._last_proc_scan = now
+        if now_m - self._last_proc_scan >= 6.0:
+            self._last_proc_scan = now_m
             top = ""
             gaming = False
             try:
@@ -916,7 +1026,7 @@ class Collector:
             except Exception:
                 pass
             elapsed = time.monotonic() - t0
-            time.sleep(max(0.25, self.poll_interval - elapsed))
+            time.sleep(max(0.15, self.poll_interval - elapsed))
 
     def sample_sys(self) -> dict:
         """Retorna instantaneamente (< 0.02ms) o snapshot de telemetria em cache sem bloquear I/O."""
@@ -935,27 +1045,71 @@ class Collector:
 
 
 # ---------------------------------------------------------------- serial ----
-def find_port(excluded_ports=None):
+# CYD ESP32-2432S028R usa CH340/CH9102 na maioria das revisoes; prioriza sobre CP2102 (ESP32-32U)
+CYD_USB_PRIORITY_IDS = {
+    (0x1A86, 0x7523),  # CH340
+    (0x1A86, 0x55D4),  # CH9102
+}
+
+
+def find_candidate_ports(excluded_ports=None, preferred_hint: str = "") -> list[str]:
+    """Retorna lista ordenada de portas seriais candidatas para a placa CYD."""
     excluded_canon = {wifi_scanner._canonical_port(p) for p in (excluded_ports or set()) if p}
+    result: list[str] = []
+    seen_canon: set[str] = set()
+
+    def _push(dev: str):
+        if not dev:
+            return
+        canon = wifi_scanner._canonical_port(dev)
+        if canon in excluded_canon or canon in seen_canon:
+            return
+        seen_canon.add(canon)
+        result.append(dev)
+
     if IS_LINUX and os.path.exists("/dev/mike"):
-        if wifi_scanner._canonical_port("/dev/mike") not in excluded_canon:
-            return "/dev/mike"
+        _push("/dev/mike")
+    if preferred_hint and (not IS_LINUX or os.path.exists(preferred_hint)):
+        _push(preferred_hint)
+
     try:
         from serial.tools import list_ports
     except ImportError:
         sys.exit("Faltando pyserial. Rode: pip install pyserial")
+
     cands = list(list_ports.comports())
+    # 1) Pontes tipicas da CYD (CH340/CH9102)
     for p in cands:
-        if wifi_scanner._canonical_port(p.device) in excluded_canon:
-            continue
+        if p.vid is not None and (p.vid, p.pid) in CYD_USB_PRIORITY_IDS:
+            _push(p.device)
+    # 2) Demais pontes USB-Serial ESP32 conhecidas (CP2102, FT232, JTAG)
+    for p in cands:
         if p.vid is not None and (p.vid, p.pid) in KNOWN_USB_IDS:
-            return p.device
+            _push(p.device)
+    # 3) Fallback por padrao de nome (ttyUSB / ttyACM / COM)
     for p in cands:
-        if wifi_scanner._canonical_port(p.device) in excluded_canon:
-            continue
         if re.search(r"ttyUSB|ttyACM|^COM\d+$", p.device):
-            return p.device
-    return None
+            _push(p.device)
+    return result
+
+
+def find_port(excluded_ports=None):
+    cands = find_candidate_ports(excluded_ports=excluded_ports)
+    return cands[0] if cands else None
+
+
+def _disable_hupcl_linux(ser) -> None:
+    """Desativa HUPCL no termios (Linux) para que close() nao pulse DTR/RTS e reinicie o ESP32."""
+    if not IS_LINUX or ser is None:
+        return
+    try:
+        import termios
+        fd = ser.fileno()
+        attrs = termios.tcgetattr(fd)
+        attrs[2] &= ~termios.HUPCL
+        termios.tcsetattr(fd, termios.TCSANOW, attrs)
+    except Exception:
+        pass
 
 
 UDP_DEFAULT_PORT = 8888
@@ -965,18 +1119,25 @@ UDP_MAX_DATAGRAM = 1400
 UDP_ALIVE_TIMEOUT_S = 6.0
 UDP_PING_INTERVAL_S = 2.0
 
+# Serial 115200 bps (~11.5 KB/s): linhas <= 900 B levam <= 78 ms no fio,
+# nunca estouram write_timeout nem fragmentam o heap/buffer RX do ESP32!
+SERIAL_MAX_LINE_BYTES = 900
+SERIAL_WRITE_TIMEOUT_S = 1.5
+SERIAL_PING_INTERVAL_S = 6.0
+SERIAL_INTER_FRAME_DELAY_S = 0.008
+
 
 def _json_compact(pkt) -> str:
     return json.dumps(pkt, separators=(",", ":"), ensure_ascii=True)
 
 
-def split_payload_for_udp(pkt: dict, max_bytes: int = UDP_MAX_DATAGRAM) -> list[str]:
+def split_payload(pkt: dict, max_bytes: int = UDP_MAX_DATAGRAM) -> list[str]:
     """
-    Fragmenta um payload JSON em datagramas independentes <= max_bytes.
+    Fragmenta um payload JSON em linhas/datagramas independentes <= max_bytes.
       - Agrupa chaves de topo ("sys", "mkt", "ui", "news"...) de forma gulosa: o firmware
         processa cada bloco de forma independente em applyJson(), entao a divisao e segura.
-      - Se um bloco isolado ainda exceder o limite (ex: "news" com fila de manchetes),
-        reduz a fila de manchetes progressivamente ate caber.
+      - Se um bloco isolado ainda exceder o limite (ex: "news" com fila de manchetes,
+        "wrad" com APs ou "sec" com logs), reduz as listas progressivamente ate caber.
     """
     raw = _json_compact(pkt)
     if len(raw) <= max_bytes or not isinstance(pkt, dict):
@@ -986,15 +1147,17 @@ def split_payload_for_udp(pkt: dict, max_bytes: int = UDP_MAX_DATAGRAM) -> list[
         blk = {key: val}
         if len(_json_compact(blk)) <= max_bytes:
             return blk
-        if key == "news" and isinstance(val, dict) and isinstance(val.get("queue"), list):
+        if isinstance(val, dict):
             v2 = dict(val)
-            q = list(v2["queue"])
-            while q and len(_json_compact({key: v2})) > max_bytes:
-                q = q[:-1]
-                v2["queue"] = q
-            if len(_json_compact({key: v2})) <= max_bytes:
-                return {key: v2}
-        return blk  # Ultimo recurso: envia mesmo assim (pode ser descartado pela placa)
+            for list_field in ("queue", "aps", "logs", "lines"):
+                if isinstance(v2.get(list_field), list):
+                    q = list(v2[list_field])
+                    while q and len(_json_compact({key: v2})) > max_bytes:
+                        q = q[:-1]
+                        v2[list_field] = q
+                    if len(_json_compact({key: v2})) <= max_bytes:
+                        return {key: v2}
+        return blk  # Ultimo recurso: envia mesmo assim
 
     datagrams: list[str] = []
     cur: dict = {}
@@ -1012,26 +1175,101 @@ def split_payload_for_udp(pkt: dict, max_bytes: int = UDP_MAX_DATAGRAM) -> list[
     return datagrams
 
 
+def split_payload_for_udp(pkt: dict, max_bytes: int = UDP_MAX_DATAGRAM) -> list[str]:
+    return split_payload(pkt, max_bytes=max_bytes)
+
+
+class TelemetryDiffTracker:
+    """
+    Rastreador diferencial de blocos de telemetria para a CYD:
+      - Envia 'sys' sempre (leve ~290 B, mantem graficos e gauges fluidos a 2 Hz).
+      - Envia blocos auxiliares ('pomo', 'media', 'wth', 'mkt', 'portf', 'news',
+        'wrad', 'neta', 'sec', 'ui') SOMENTE quando mudam ou em refresh escalonado,
+        reduzindo o trafego serial em ~80% e eliminando rajadas de 4 KB!
+    """
+
+    DEFAULT_TTLS = {
+        "ui": 25.0,
+        "pomo": 12.0,
+        "media": 10.0,
+        "wth": 30.0,
+        "mkt": 15.0,
+        "portf": 20.0,
+        "news": 25.0,
+        "wrad": 18.0,
+        "neta": 18.0,
+        "sec": 18.0,
+    }
+
+    def __init__(self):
+        self._lock = threading.Lock()
+        self._last_sig: dict[str, str] = {}
+        self._last_sent: dict[str, float] = {}
+        self._news_queue_synced: bool = False
+
+    def invalidate(self):
+        """Forca reenvio completo (em blocos fragmentados) apos reconexao ou reboot da CYD."""
+        with self._lock:
+            self._last_sig.clear()
+            self._last_sent.clear()
+            self._news_queue_synced = False
+
+    def needs_news_queue(self) -> bool:
+        with self._lock:
+            return not self._news_queue_synced
+
+    def mark_news_queue_synced(self):
+        with self._lock:
+            self._news_queue_synced = True
+
+    def build_delta(
+        self,
+        always_blocks: dict,
+        optional_blocks: dict,
+        force_all: bool = False,
+        now_m: float | None = None,
+    ) -> dict:
+        now_m = time.monotonic() if now_m is None else now_m
+        out = dict(always_blocks)
+        refreshed_this_tick = 0
+        with self._lock:
+            for k, val in optional_blocks.items():
+                if val is None:
+                    continue
+                sig = _json_compact(val)
+                prev_sig = self._last_sig.get(k)
+                last_t = self._last_sent.get(k, 0.0)
+                ttl = self.DEFAULT_TTLS.get(k, 20.0)
+                changed = (prev_sig != sig)
+                # Escalona refresh periodico (max 2 blocos nao-alterados por tick) para evitar rajadas
+                due_refresh = (not changed) and (now_m - last_t >= ttl) and (refreshed_this_tick < 2)
+                if force_all or changed or due_refresh:
+                    out[k] = val
+                    self._last_sig[k] = sig
+                    self._last_sent[k] = now_m
+                    if due_refresh:
+                        refreshed_this_tick += 1
+        return out
+
+
 class SerialManager:
     """
     Gerenciador Híbrido de Transporte (USB Serial 115200 bps + Wi-Fi UDP :8888):
-      - Isola 100% do I/O (pyserial + socket UDP) em threads dedicadas. O loop do Flet
-        NUNCA espera resposta da CYD nem bloqueia em `ser.write()` / `sendto()`.
-      - Rota única por pacote (nunca duplicada): se o mesmo pacote fosse por USB e UDP,
-        chunks de upload seriam gravados 2x no SD, o Buzzer tocaria 2x e os gráficos
-        avançariam em dobro. Política de roteamento:
+      - Isola 100% do I/O (pyserial + socket UDP) em threads dedicadas e callbacks em
+        worker separado (`SerialCallbackThread`), impedindo que Flet/UI trave a Serial.
+      - Fragmenta payloads grandes em linhas JSON <= 900 B na Serial (e <= 1400 B no UDP)
+        com pacing suave, eliminando `Write timeout` no driver CH340/Linux e overflow no ESP32.
+      - Handshake ativo (`ser_ping` / `udp_ping`) + desativação de `HUPCL` no Linux:
+        reconhece a placa CYD em ~200 ms, evita resets espúrios e nunca trava na porta
+        da ESP32-WROOM-32U (CP2102) em setups dual-ESP32.
+      - Rota única por pacote (nunca duplicada):
           1. UDP ativo + placa respondendo PONG (< 6s)  -> Wi-Fi UDP (rota principal)
           2. USB conectado                               -> USB Serial (fallback/debug)
           3. UDP ativo sem resposta e sem USB            -> Wi-Fi UDP "às cegas"
-      - Heartbeat `{"cmd":"udp_ping"}` a cada 2s; a CYD responde `UDP_PONG:<uptime>:<ip>`.
-        Uptime regressivo = placa reiniciou -> dispara `MONITOR_READY` para reenviar o estado.
       - 3 canais de prioridade:
           1. `transfer_queue`: blocos de imagem/capa para o Cartão SD (controle por ACK).
-          2. `event_queue`: tela, cor, brilho, alertas, Terminal (< 20ms). Aceita `dict`
-             ou tupla `("serial", dict)` para forçar a rota USB (ex: provisionamento Wi-Fi).
+          2. `event_queue`: tela, cor, brilho, alertas, Terminal (< 20ms).
           3. `_latest_telemetry`: slot atômico (descarta frames velhos, zero lag acumulado).
-      - Abertura da porta COM sem `sleep` bloqueante: a janela de boot do ESP32 (1.5s) é
-        controlada por timestamp, então o UDP continua transmitindo durante a reconexão USB.
     """
 
     def __init__(
@@ -1056,11 +1294,23 @@ class SerialManager:
         self._scanner_ignored_ports: dict[str, float] = {}
         self._wrong_board_port: str = ""
         self._active_serial_port: str = ""
+        self._last_good_port: str = ""
+        self._ser_confirmed_cyd: bool = False
+        self._ser_saw_boot: bool = False
+        self._ser_last_rx_t: float = 0.0
+        self._ser_last_ping_t: float = 0.0
+        self._ser_ping_sent_t: float = 0.0
+        self._ser_last_uptime: int = -1
+        self._write_timeouts: int = 0
 
         self.event_queue: queue.Queue = queue.Queue()
         self.transfer_queue: queue.Queue = queue.Queue()
         self.ack_event = threading.Event()
         self.last_ack = {"val": None}
+
+        # Fila assincrona de callbacks (evita que Flet UI / disco travem a SerialManagerThread!)
+        self._cb_queue: queue.Queue = queue.Queue(maxsize=256)
+        self._cb_thread: threading.Thread | None = None
 
         self._telemetry_lock = threading.Lock()
         self._latest_telemetry: dict | None = None
@@ -1095,6 +1345,7 @@ class SerialManager:
             "udp_rtt_ms": 0,
             "udp_tx": 0,
             "udp_drop": 0,
+            "serial_rtt_ms": 0,
         }
         self._running = False
         self._reconnect_flag = threading.Event()
@@ -1147,11 +1398,40 @@ class SerialManager:
         excluded.update(self._scanner_ignored_ports.keys())
         return excluded
 
+    def _dispatch_cb(self, kind: str, arg):
+        """Enfileira callback para execucao fora da SerialManagerThread (nao bloqueia I/O)."""
+        try:
+            self._cb_queue.put_nowait((kind, arg))
+        except queue.Full:
+            try:
+                self._cb_queue.get_nowait()
+                self._cb_queue.put_nowait((kind, arg))
+            except Exception:
+                pass
+
+    def _cb_worker(self):
+        while self._running or not self._cb_queue.empty():
+            try:
+                kind, arg = self._cb_queue.get(timeout=0.25)
+            except queue.Empty:
+                continue
+            try:
+                if kind == "rx" and self.on_rx_line:
+                    self.on_rx_line(arg)
+                elif kind == "status" and self.on_status_change:
+                    self.on_status_change(arg)
+                elif kind == "log" and self.on_log:
+                    self.on_log(arg)
+            except Exception:
+                pass
+
     def start(self):
         if self._running:
             return
         self._running = True
         self._ensure_udp_socket()
+        self._cb_thread = threading.Thread(target=self._cb_worker, daemon=True, name="SerialCallbackThread")
+        self._cb_thread.start()
         self._thread = threading.Thread(target=self._io_worker, daemon=True, name="SerialManagerThread")
         self._thread.start()
 
@@ -1169,19 +1449,29 @@ class SerialManager:
     def request_reconnect(self, new_port: str = None):
         if new_port is not None:
             self.preferred_port = new_port.strip() or None
+        self._scanner_ignored_ports.clear()
         self._reconnect_flag.set()
 
     def configure_udp(self, enabled: bool, ip: str = None, port: int = None):
         """Ativa/desativa a transmissão Wi-Fi UDP e define o IP:porta da placa CYD (thread-safe)."""
+        new_en = bool(enabled)
         with self._udp_lock:
-            self._udp_enabled = bool(enabled)
-            if ip is not None:
-                self._udp_ip = (ip or "").strip()
+            new_ip = (ip or "").strip() if ip is not None else self._udp_ip
             if port is not None:
                 try:
-                    self._udp_port = max(1, min(65535, int(port)))
+                    new_port = max(1, min(65535, int(port)))
                 except Exception:
-                    self._udp_port = UDP_DEFAULT_PORT
+                    new_port = UDP_DEFAULT_PORT
+            else:
+                new_port = self._udp_port
+
+            # Nao reinicia estado UDP nem gera log se nada mudou (ex: clique de tela no Flet!)
+            if new_en == self._udp_enabled and new_ip == self._udp_ip and new_port == self._udp_port:
+                return
+
+            self._udp_enabled = new_en
+            self._udp_ip = new_ip
+            self._udp_port = new_port
             self._udp_alive_t = 0.0
             self._udp_last_ping_t = 0.0
         self._ensure_udp_socket()
@@ -1192,11 +1482,11 @@ class SerialManager:
         )
         if self.on_log:
             if self._udp_enabled and self._udp_ip:
-                self.on_log(f"📶 Wi-Fi UDP ativado → {self._udp_target_str()} (USB Serial como fallback)")
+                self._dispatch_cb("log", f"📶 Wi-Fi UDP ativado → {self._udp_target_str()} (USB Serial como fallback)")
             elif self._udp_enabled:
-                self.on_log("📶 Wi-Fi UDP ativado, mas sem IP da CYD configurado.")
+                self._dispatch_cb("log", "📶 Wi-Fi UDP ativado, mas sem IP da CYD configurado.")
             else:
-                self.on_log("🔌 Wi-Fi UDP desativado. Transmissão 100% via USB Serial.")
+                self._dispatch_cb("log", "🔌 Wi-Fi UDP desativado. Transmissão 100% via USB Serial.")
 
     def is_udp_alive(self) -> bool:
         return self._udp_ready() and (time.monotonic() - self._udp_alive_t) < UDP_ALIVE_TIMEOUT_S
@@ -1262,10 +1552,7 @@ class SerialManager:
                     changed = True
             snap = dict(self._status)
         if changed and self.on_status_change:
-            try:
-                self.on_status_change(snap)
-            except Exception:
-                pass
+            self._dispatch_cb("status", snap)
 
     def _ensure_udp_socket(self):
         """Cria (uma única vez) o socket UDP não-bloqueante + thread receptora de respostas."""
@@ -1287,7 +1574,7 @@ class SerialManager:
             except Exception as ex:
                 self._udp_sock = None
                 if self.on_log:
-                    self.on_log(f"⚠️ Falha ao criar socket UDP: {str(ex)[:60]}")
+                    self._dispatch_cb("log", f"⚠️ Falha ao criar socket UDP: {str(ex)[:60]}")
                 return
         self._udp_rx_thread = threading.Thread(target=self._udp_rx_worker, daemon=True, name="UdpRxThread")
         self._udp_rx_thread.start()
@@ -1299,7 +1586,7 @@ class SerialManager:
             return 0
         sent = 0
         target = (self._udp_ip, self._udp_port)
-        for dg in split_payload_for_udp(pkt):
+        for dg in split_payload(pkt, max_bytes=UDP_MAX_DATAGRAM):
             try:
                 sock.sendto(dg.encode("utf-8"), target)
                 sent += len(dg)
@@ -1313,19 +1600,24 @@ class SerialManager:
         return sent
 
     def _write_json_line(self, ser, pkt: dict) -> int:
-        raw_bytes = (_json_compact(pkt) + "\n").encode("utf-8")
-        # Se o buffer de saída do driver estiver congestionado, faz flush preventivo
-        try:
-            out_w = getattr(ser, "out_waiting", 0)
-            if out_w and out_w > 4096:
-                ser.reset_output_buffer()
-        except Exception:
-            pass
-        ser.write(raw_bytes)
-        ser.flush()
+        """
+        Envia o pacote via USB Serial fragmentado em linhas JSON <= 900 B (<= 78 ms no fio)
+        sem tcdrain() bloqueante, drenando RX entre sub-frames para maxima fluidez e zero timeouts.
+        """
+        lines = split_payload(pkt, max_bytes=SERIAL_MAX_LINE_BYTES)
+        total_sent = 0
+        for idx, line_str in enumerate(lines):
+            raw_bytes = (line_str + "\n").encode("utf-8")
+            ser.write(raw_bytes)
+            total_sent += len(raw_bytes)
+            if idx + 1 < len(lines):
+                # Pacing curto entre sub-frames: evita acumulo no buffer CH340 e drena RX da CYD
+                self._read_available_lines(ser)
+                time.sleep(SERIAL_INTER_FRAME_DELAY_S)
+        self._write_timeouts = 0
         with self._status_lock:
             self._status["tx_packets"] += 1
-        return len(raw_bytes)
+        return total_sent
 
     def _resolve_route(self, ser_ready: bool) -> str | None:
         if self._udp_ready() and self.is_udp_alive():
@@ -1347,20 +1639,50 @@ class SerialManager:
         """Processa uma linha recebida da CYD (mesmo tratamento para USB e UDP)."""
         if not raw:
             return
-        # Protecao dual-ESP32: se esta porta serial responder como ESP32 Scanner, libera imediatamente
-        if via == "serial" and not self.preferred_port and wifi_scanner.is_scanner_banner_line(raw):
-            cur_p = self._active_serial_port
-            if cur_p:
-                self._scanner_ignored_ports[wifi_scanner._canonical_port(cur_p)] = time.monotonic() + 30.0
-                self._wrong_board_port = cur_p
-            return
+        now_m = time.monotonic()
+
+        if via == "serial":
+            self._ser_last_rx_t = now_m
+            # Detecta ROM boot do ESP32 durante abertura da porta (nao interromper o boot cedo demais)
+            if raw.startswith("ets ") or raw.startswith("rst:0x") or raw.startswith("configsip:"):
+                self._ser_saw_boot = True
+                return
+            # Protecao dual-ESP32: se esta porta serial responder como ESP32 Scanner, libera imediatamente
+            if not self.preferred_port and wifi_scanner.is_scanner_banner_line(raw):
+                cur_p = self._active_serial_port
+                if cur_p:
+                    self._scanner_ignored_ports[wifi_scanner._canonical_port(cur_p)] = now_m + 300.0
+                    self._wrong_board_port = cur_p
+                return
+            # Confirma identidade da placa CYD a partir de qualquer assinatura conhecida
+            if wifi_scanner.is_cyd_banner_line(raw) or raw.startswith("SER_PONG:"):
+                self._ser_confirmed_cyd = True
+                if self._active_serial_port:
+                    self._last_good_port = self._active_serial_port
+
         with self._status_lock:
             self._status["rx_packets"] += 1
 
-        if raw.startswith("UDP_PONG"):
-            # Formato: UDP_PONG:<uptime_s>:<ip>
+        # Heartbeat Serial (SER_PONG:<uptime>:<ip>:<heap> ou UDP_PONG recebido pela USB)
+        if raw.startswith("SER_PONG:") or (via == "serial" and raw.startswith("UDP_PONG")):
             parts = raw.split(":")
-            now_m = time.monotonic()
+            rtt = int((now_m - self._ser_ping_sent_t) * 1000) if self._ser_ping_sent_t else 0
+            try:
+                up = int(parts[1]) if len(parts) > 1 else -1
+            except Exception:
+                up = -1
+            rebooted = self._ser_last_uptime >= 0 and 0 <= up < self._ser_last_uptime
+            self._ser_last_uptime = up
+            if len(parts) > 2 and parts[2]:
+                self.detected_ip = parts[2]
+            self._update_status(serial_rtt_ms=max(0, min(rtt, 9999)))
+            if rebooted and self.on_rx_line:
+                self._dispatch_cb("rx", "MONITOR_READY")
+            return
+
+        # Heartbeat UDP (somente quando recebido de fato via socket UDP!)
+        if raw.startswith("UDP_PONG") and via == "udp":
+            parts = raw.split(":")
             rtt = int((now_m - self._udp_ping_sent_t) * 1000) if self._udp_ping_sent_t else 0
             self._udp_alive_t = now_m
             try:
@@ -1373,10 +1695,7 @@ class SerialManager:
                 self.detected_ip = parts[2]
             self._update_status(udp_alive=True, udp_rtt_ms=max(0, min(rtt, 9999)))
             if rebooted and self.on_rx_line:
-                try:
-                    self.on_rx_line("MONITOR_READY")
-                except Exception:
-                    pass
+                self._dispatch_cb("rx", "MONITOR_READY")
             return
 
         if raw.startswith("WIFI_IP:"):
@@ -1386,10 +1705,7 @@ class SerialManager:
             self.last_ack["val"] = raw
             self.ack_event.set()
         elif self.on_rx_line:
-            try:
-                self.on_rx_line(raw)
-            except Exception:
-                pass
+            self._dispatch_cb("rx", raw)
 
     def _udp_rx_worker(self):
         """Thread receptora: respostas da CYD (TERM_LOG, ACK_, SD_FILES, UDP_PONG) via Wi-Fi."""
@@ -1432,44 +1748,50 @@ class SerialManager:
             except Exception:
                 break
             lines_read += 1
-            self._handle_rx_line(raw, via="serial")
+            if raw:
+                self._handle_rx_line(raw, via="serial")
 
     def _io_worker(self):
         import serial
 
         ser = None
-        ser_settle_until = 0.0  # Janela de boot do ESP32 após abrir a COM (DTR/RTS reset)
+        ser_opened_at = 0.0
+        ser_probe_stage = 0
         ser_ready = False
         next_port_scan = 0.0
         bytes_window = 0
         window_t0 = time.monotonic()
 
         def _close_serial():
-            nonlocal ser, ser_ready
+            nonlocal ser, ser_ready, ser_opened_at, ser_probe_stage
             if ser is not None:
                 try:
-                    ser.reset_input_buffer()
-                    ser.reset_output_buffer()
                     ser.close()
                 except Exception:
                     pass
             ser = None
             ser_ready = False
+            ser_opened_at = 0.0
+            ser_probe_stage = 0
             self._active_serial_port = ""
+            self._ser_confirmed_cyd = False
+            self._ser_saw_boot = False
+            self._ser_last_uptime = -1
+            self._write_timeouts = 0
 
         while self._running:
             now_m = time.monotonic()
 
-            # ---------- 1) Ciclo de vida da porta USB (100% não-bloqueante) ----------
+            # ---------- 1) Ciclo de vida da porta USB (100% não-bloqueante + handshake ativo) ----------
             try:
                 if self._wrong_board_port:
                     wrong_p = self._wrong_board_port
                     self._wrong_board_port = ""
                     _close_serial()
-                    next_port_scan = now_m + 0.5
+                    next_port_scan = now_m + 0.35
                     self._update_status(connected=False, state="SEARCHING", port="")
                     if self.on_log:
-                        self.on_log(f"📡 Porta {wrong_p} identificada como ESP32 Scanner Wi-Fi (liberada para o Radar RF).")
+                        self._dispatch_cb("log", f"📡 Porta {wrong_p} identificada como ESP32 Scanner Wi-Fi (liberada para o Radar RF).")
 
                 if self._reconnect_flag.is_set():
                     self._reconnect_flag.clear()
@@ -1478,35 +1800,100 @@ class SerialManager:
                     self._update_status(connected=False, state="RECONNECTING", port="", tx_bytes_sec=0)
 
                 if ser is None and now_m >= next_port_scan:
-                    port = self.preferred_port or find_port(excluded_ports=self._get_excluded_ports())
+                    cands = [self.preferred_port] if self.preferred_port else find_candidate_ports(
+                        excluded_ports=self._get_excluded_ports(),
+                        preferred_hint=self._last_good_port,
+                    )
+                    port = cands[0] if cands else None
                     if not port:
                         self._update_status(connected=False, state="SEARCHING", port="")
-                        next_port_scan = now_m + 1.5
+                        next_port_scan = now_m + 1.2
                     else:
                         self._update_status(connected=False, state="CONNECTING", port=port)
-                        ser = serial.Serial(port=port, baudrate=self.baud, timeout=0.04, write_timeout=0.35)
+                        ser = serial.Serial(
+                            port=port,
+                            baudrate=self.baud,
+                            timeout=0.03,
+                            write_timeout=SERIAL_WRITE_TIMEOUT_S,
+                            exclusive=True,
+                        )
+                        _disable_hupcl_linux(ser)
                         self._active_serial_port = port
-                        ser_settle_until = now_m + 1.5
+                        self._ser_confirmed_cyd = False
+                        self._ser_saw_boot = False
+                        self._ser_last_rx_t = now_m
+                        self._ser_last_ping_t = now_m
+                        self._ser_ping_sent_t = 0.0
+                        self._write_timeouts = 0
+                        ser_opened_at = now_m
+                        ser_probe_stage = 0
                         ser_ready = False
 
-                if ser is not None and not ser_ready and now_m >= ser_settle_until:
-                    # Antes de limpar o buffer, verifica se o banner de boot e da ESP32 Scanner
+                if ser is not None and not ser_ready:
+                    # Drena qualquer banner de boot ou resposta de handshake em tempo real
                     self._read_available_lines(ser)
                     if self._wrong_board_port:
                         continue
-                    ser.reset_input_buffer()
-                    ser.reset_output_buffer()
-                    ser_ready = True
-                    port_name = getattr(ser, "port", "") or ""
-                    self._active_serial_port = port_name
-                    self._update_status(connected=True, state="CONNECTED", port=port_name, last_error="")
-                    if self.on_log:
-                        self.on_log(f"⚡ USB Serial conectada em {port_name} ({self.baud} bps • Non-Blocking I/O)")
-                    if self.on_rx_line:
+
+                    age = now_m - ser_opened_at
+                    # Envia handshake ativo leve apos 180ms (e fallback udp_ping apos 550ms para firmwares antigos)
+                    if ser_probe_stage == 0 and age >= 0.18:
+                        ser_probe_stage = 1
+                        self._ser_ping_sent_t = now_m
                         try:
-                            self.on_rx_line("SERIAL_CONNECTED")
+                            ser.write(b'{"cmd":"ser_ping"}\n')
                         except Exception:
                             pass
+                    elif ser_probe_stage == 1 and age >= 0.55 and not self._ser_confirmed_cyd:
+                        ser_probe_stage = 2
+                        self._ser_ping_sent_t = now_m
+                        try:
+                            ser.write(b'{"cmd":"udp_ping"}\n')
+                        except Exception:
+                            pass
+                    elif ser_probe_stage == 2 and self._ser_saw_boot and age >= 2.2 and not self._ser_confirmed_cyd:
+                        ser_probe_stage = 3
+                        self._ser_ping_sent_t = now_m
+                        try:
+                            ser.write(b'{"cmd":"ser_ping"}\n')
+                        except Exception:
+                            pass
+
+                    # Criterios de pronto:
+                    # 1) Confirmou assinatura CYD (SER_PONG / UDP_PONG / MONITOR_READY / SD_FILES) -> imediato!
+                    # 2) Se nao confirmou ainda e existem outras portas candidatas (ex: dual-ESP32), rotaciona apos 1.9s
+                    # 3) Se e a unica porta (ou preferida), libera apos 1.6s (ou 4.2s se detectou boot ROM ESP32)
+                    ready_now = False
+                    if self._ser_confirmed_cyd:
+                        ready_now = True
+                    else:
+                        settle_limit = 4.2 if self._ser_saw_boot else 1.6
+                        if age >= settle_limit:
+                            if not self.preferred_port and not self._ser_saw_boot:
+                                other_cands = find_candidate_ports(
+                                    excluded_ports=self._get_excluded_ports() | {self._active_serial_port}
+                                )
+                                if other_cands:
+                                    bad_p = self._active_serial_port
+                                    self._scanner_ignored_ports[wifi_scanner._canonical_port(bad_p)] = now_m + 20.0
+                                    _close_serial()
+                                    next_port_scan = now_m + 0.15
+                                    if self.on_log:
+                                        self._dispatch_cb("log", f"🔎 Porta {bad_p} sem resposta CYD; testando {other_cands[0]}...")
+                                    continue
+                            ready_now = True
+
+                    if ready_now:
+                        ser_ready = True
+                        port_name = getattr(ser, "port", "") or ""
+                        self._active_serial_port = port_name
+                        self._ser_last_ping_t = now_m
+                        self._update_status(connected=True, state="CONNECTED", port=port_name, last_error="")
+                        if self.on_log:
+                            tag = "CYD validada" if self._ser_confirmed_cyd else "handshake padrão"
+                            self._dispatch_cb("log", f"⚡ USB Serial conectada em {port_name} ({self.baud} bps • {tag})")
+                        if self.on_rx_line:
+                            self._dispatch_cb("rx", "SERIAL_CONNECTED")
             except Exception as ex:
                 err_s = str(ex)[:60]
                 if IS_LINUX and ("Permission denied" in str(ex) or "Errno 13" in str(ex)):
@@ -1514,15 +1901,16 @@ class SerialManager:
                     if now_warn - getattr(self, "_last_perm_warn_t", 0.0) >= 15.0:
                         self._last_perm_warn_t = now_warn
                         if self.on_log:
-                            self.on_log(
+                            self._dispatch_cb(
+                                "log",
                                 f"⚠️ Sem permissão na porta {port} (Errno 13)! "
-                                "No Ubuntu/Linux rode: ./linux/install_ubuntu.sh ou 'sudo usermod -aG dialout $USER' e relogue."
+                                "No Linux/Fedora rode: 'sudo usermod -aG dialout $USER' e relogue.",
                             )
                 _close_serial()
-                next_port_scan = now_m + 1.5
+                next_port_scan = now_m + 1.2
                 self._update_status(connected=False, state="DISCONNECTED", port="", last_error=err_s)
 
-            # ---------- 2) Heartbeat UDP + estado da rota Wi-Fi ----------
+            # ---------- 2) Heartbeat UDP + Keepalive Serial + estado da rota ----------
             if self._udp_ready() and (now_m - self._udp_last_ping_t) >= UDP_PING_INTERVAL_S:
                 self._udp_last_ping_t = now_m
                 self._udp_ping_sent_t = now_m
@@ -1538,9 +1926,19 @@ class SerialManager:
             try:
                 if ser_ready:
                     self._read_available_lines(ser)
+                    # Keepalive leve USB a cada 6s de silencio RX (mede RTT e detecta reboot silencioso)
+                    if (
+                        route == "serial"
+                        and self.transfer_queue.empty()
+                        and (now_m - self._ser_last_ping_t) >= SERIAL_PING_INTERVAL_S
+                        and (now_m - self._ser_last_rx_t) >= SERIAL_PING_INTERVAL_S
+                    ):
+                        self._ser_last_ping_t = now_m
+                        self._ser_ping_sent_t = now_m
+                        ser.write(b'{"cmd":"ser_ping"}\n')
 
                 if route is None:
-                    time.sleep(0.05)
+                    time.sleep(0.04)
                     continue
 
                 # Prioridade 1: Transferência de blocos para o Cartão SD (sincronizada por ACK)
@@ -1559,7 +1957,7 @@ class SerialManager:
                         if forced == "serial":
                             if not ser_ready:
                                 if self.on_log:
-                                    self.on_log("⚠️ Comando exige USB Serial conectada (descartado).")
+                                    self._dispatch_cb("log", "⚠️ Comando exige USB Serial conectada (descartado).")
                                 ev_sent += 1
                                 continue
                             ev_route = "serial"
@@ -1583,14 +1981,34 @@ class SerialManager:
                     with self._status_lock:
                         self._status["tx_bytes_sec"] = bps
 
+            except serial.SerialTimeoutException as tex:
+                # Timeout pontual de escrita NAO deve derrubar uma conexao USB saudavel de imediato
+                self._write_timeouts += 1
+                err_s = str(tex)[:60]
+                if self._write_timeouts < 3 and ser is not None:
+                    try:
+                        ser.write(b"\n")  # Ressincroniza lineBuf na CYD
+                    except Exception:
+                        pass
+                    if self.on_log:
+                        self._dispatch_cb("log", f"⏳ Lentidão pontual USB ({self._write_timeouts}/3: {err_s}), recuperando...")
+                    time.sleep(0.05)
+                    continue
+                self._update_status(connected=False, state="DISCONNECTED", port="", last_error=err_s)
+                if self.on_log:
+                    self._dispatch_cb("log", f"⚠️ Múltiplos timeouts USB ({err_s}). Reconectando porta...")
+                _close_serial()
+                next_port_scan = time.monotonic() + 1.0
+                continue
+
             except Exception as ex:
-                # Somente erros de I/O USB chegam aqui (envios UDP nunca lançam exceção)
+                # Somente erros fatais de I/O USB chegam aqui (envios UDP nunca lançam exceção)
                 err_s = str(ex)[:60]
                 self._update_status(connected=False, state="DISCONNECTED", port="", last_error=err_s)
                 if self.on_log:
-                    self.on_log(f"⚠️ Porta USB desconectada ou ocupada ({err_s}). Reconectando em background...")
+                    self._dispatch_cb("log", f"⚠️ Porta USB desconectada ou ocupada ({err_s}). Reconectando em background...")
                 _close_serial()
-                next_port_scan = time.monotonic() + 1.5
+                next_port_scan = time.monotonic() + 1.0
                 continue
 
             time.sleep(0.015)
@@ -1786,11 +2204,11 @@ DEFAULT_ALERT_RULES = [
 ]
 
 
-_LINUX_IDLE_CACHE = {"ts": 0.0, "val": 0.0}
+_LINUX_IDLE_CACHE = {"ts": 0.0, "val": 0.0, "gdbus_fails": 0, "gdbus_backoff": 0.0}
 
 
 def get_system_idle_seconds() -> float:
-    """Retorna o tempo de inatividade do usuário (sem uso de mouse/teclado) em segundos no Windows e Linux (Zorin OS Wayland/X11)."""
+    """Retorna o tempo de inatividade do usuário (sem uso de mouse/teclado) em segundos no Windows e Linux (Fedora/Ubuntu GNOME Wayland/X11)."""
     try:
         if sys.platform == "win32":
             class LASTINPUTINFO(ctypes.Structure):
@@ -1803,12 +2221,12 @@ def get_system_idle_seconds() -> float:
                 return max(0.0, millis / 1000.0)
         elif IS_LINUX:
             now_m = time.monotonic()
-            if now_m - _LINUX_IDLE_CACHE["ts"] < 2.0:
+            if now_m - _LINUX_IDLE_CACHE["ts"] < 3.0:
                 return _LINUX_IDLE_CACHE["val"]
             _LINUX_IDLE_CACHE["ts"] = now_m
 
-            # 1) Zorin OS / Ubuntu (GNOME Shell Mutter IdleMonitor via D-Bus - suporta Wayland e X11)
-            if shutil.which("gdbus"):
+            # 1) GNOME Shell Mutter IdleMonitor via D-Bus (Fedora / Ubuntu Wayland e X11)
+            if shutil.which("gdbus") and now_m >= _LINUX_IDLE_CACHE["gdbus_backoff"]:
                 try:
                     res = subprocess.run(
                         [
@@ -1817,7 +2235,7 @@ def get_system_idle_seconds() -> float:
                             "--object-path", "/org/gnome/Mutter/IdleMonitor/Core",
                             "--method", "org.gnome.Mutter.IdleMonitor.GetIdletime",
                         ],
-                        capture_output=True, text=True, timeout=0.45,
+                        capture_output=True, text=True, timeout=0.35,
                     )
                     if res.returncode == 0 and res.stdout:
                         m = re.search(r"uint64\s+(\d+)|\((\d+),?\)", res.stdout)
@@ -1825,9 +2243,15 @@ def get_system_idle_seconds() -> float:
                             ms = int(m.group(1) or m.group(2))
                             val = max(0.0, ms / 1000.0)
                             _LINUX_IDLE_CACHE["val"] = val
+                            _LINUX_IDLE_CACHE["gdbus_fails"] = 0
                             return val
+                    _LINUX_IDLE_CACHE["gdbus_fails"] += 1
+                    if _LINUX_IDLE_CACHE["gdbus_fails"] >= 3:
+                        _LINUX_IDLE_CACHE["gdbus_backoff"] = now_m + 60.0
                 except Exception:
-                    pass
+                    _LINUX_IDLE_CACHE["gdbus_fails"] += 1
+                    if _LINUX_IDLE_CACHE["gdbus_fails"] >= 3:
+                        _LINUX_IDLE_CACHE["gdbus_backoff"] = now_m + 60.0
 
             # 2) Utilitário leve xprintidle (X11 / Zorin OS Lite XFCE)
             if shutil.which("xprintidle"):
@@ -4012,17 +4436,18 @@ class CyberDeckTerminalEngine:
     TERM_COLS = 48
     TERM_ROWS = 14
 
-    def __init__(self, max_history: int = 150, collector=None, wifi_scan_col=None, net_col=None, ai_eng=None):
+    def __init__(self, max_history: int = 150, collector=None, wifi_scan_col=None, net_col=None, ai_eng=None, sec_col=None):
         self._lock = threading.Lock()
         self.max_history = max_history
         self.collector = collector
         self.wifi_scan_col = wifi_scan_col
         self.net_col = net_col
         self.ai_eng = ai_eng
+        self.sec_col = sec_col
         self._lines: list[str] = [
             "================================================",
-            " CYD CYBER DECK TERMINAL v4.7 [RF + IA HIBRIDA]",
-            " Digite 'help' (rf | net | ai | sys | esp)",
+            " CYD CYBER DECK TERMINAL v4.8 [IDS + BLE + IA]",
+            " Digite 'help' (sec | ble | rf | net | ai | sys)",
             "================================================",
         ]
         self._cmd_history: list[str] = []
@@ -4613,6 +5038,44 @@ class CyberDeckTerminalEngine:
                         "[OK] Status Geral: REDE INTEGRA" if overall_ok else "[WARN] Status Geral: VERIFICAR LINK",
                     ])
 
+                # ================================== SEC / IDS (TELA 14) ===================
+                elif verb in ("sec", "seg", "ids", "security"):
+                    sub_s = (args[0].lower() if args else "status")
+                    if self.sec_col is None:
+                        _send_cyd_lines(["[ERR] Modulo SecurityMonitor indisponivel."])
+                    elif sub_s in ("ack", "clear", "ok"):
+                        self.sec_col.ack_alerts()
+                        _send_cyd_lines(["[OK] Alertas IDS reconhecidos • Status: SEGURO"])
+                    elif sub_s in ("trust", "baseline"):
+                        self.sec_col.trust_baseline()
+                        _send_cyd_lines(["[OK] Baseline LAN/Portas atualizado como confiavel."])
+                    elif sub_s in ("sim", "test", "invasao"):
+                        self.sec_col.simulate_intrusion()
+                        _send_cyd_lines(["[ALERTA] Simulacao de invasao disparada na Tela 14!"])
+                    else:
+                        sn = self.sec_col.get_ui_snapshot()
+                        out_s = [
+                            f"[IDS] Status: {sn.get('status')} (LVL {sn.get('level')}) | IP: {sn.get('last_ip')}",
+                            f"AUTH:{sn.get('auth_fails')} ERR:{sn.get('sys_errors')} SCAN:{sn.get('port_scans')} LAN+:{sn.get('unknown_lan')}",
+                            f"Portas LISTEN:{sn.get('open_ports_count')} | Conexoes ext:{sn.get('ext_conns_count')}",
+                        ]
+                        for ev in (sn.get("events") or [])[:5]:
+                            out_s.append(f" [{ev.get('hm')}] {ev.get('cat')}: {ev.get('msg')[:32]}")
+                        _send_cyd_lines(out_s)
+
+                # ================================== BLE (ESP32-32U) =======================
+                elif verb in ("ble", "bt", "bluetooth"):
+                    if self.wifi_scan_col is None:
+                        _send_cyd_lines(["[ERR] ESP32-WROOM-32U indisponivel."])
+                    else:
+                        ws = self.wifi_scan_col.get_ui_snapshot()
+                        _send_cyd_lines([
+                            f"[BLE] Dispositivo: {ws.get('ble_name', 'CYD-RADAR-32U')} (+{ws.get('ble_pwr_dbm', 9)} dBm)",
+                            f"Status: {'CONECTADO' if ws.get('ble_connected') else 'ADVERTISING'} | Clientes: {ws.get('ble_clients', 0)}",
+                            f"32U IP: {ws.get('scanner_ip') or 'OFFLINE'} | Servico NUS: 6e400001...",
+                            "Use HTTPS :8443 ou /ble no celular p/ parear.",
+                        ])
+
                 # ================================== WHOAMI ================================
                 elif verb == "whoami":
                     user = getpass.getuser()
@@ -5169,11 +5632,12 @@ def launch_flet_gui(
     wifi_scan_col: wifi_scanner.WiFiScannerCollector = None,
     net_col: net_analyzer.NetworkAnalyzerCollector = None,
     ai_eng: ai_analyst.NetworkAIAnalyst = None,
+    sec_col: security_monitor.SecurityMonitorCollector = None,
 ):
     import flet as ft
 
     if term_eng is None:
-        term_eng = CyberDeckTerminalEngine(collector=col, wifi_scan_col=wifi_scan_col, net_col=net_col, ai_eng=ai_eng)
+        term_eng = CyberDeckTerminalEngine(collector=col, wifi_scan_col=wifi_scan_col, net_col=net_col, ai_eng=ai_eng, sec_col=sec_col)
     else:
         if term_eng.collector is None:
             term_eng.collector = col
@@ -5183,6 +5647,8 @@ def launch_flet_gui(
             term_eng.net_col = net_col
         if term_eng.ai_eng is None and ai_eng is not None:
             term_eng.ai_eng = ai_eng
+        if getattr(term_eng, "sec_col", None) is None and sec_col is not None:
+            term_eng.sec_col = sec_col
 
     # Helpers compativeis entre Flet 0.2x e Flet 1.0+
     _ICONS = getattr(ft, "Icons", getattr(ft, "icons", None))
@@ -5351,6 +5817,8 @@ def launch_flet_gui(
             try:
                 if net_col is not None:
                     net_col.stop()
+                if sec_col is not None:
+                    sec_col.stop()
             except Exception:
                 pass
             try:
@@ -5446,6 +5914,7 @@ def launch_flet_gui(
             udp_port=int(cfg.get("udp_port", UDP_DEFAULT_PORT) or UDP_DEFAULT_PORT),
             excluded_ports_fn=(wifi_scan_col.get_active_ports if wifi_scan_col is not None else None),
         )
+        diff_tracker = TelemetryDiffTracker()
         if wifi_scan_col is not None:
             wifi_scan_col.set_excluded_ports_fn(serial_mgr.get_active_ports)
         ui_event_queue = serial_mgr.event_queue
@@ -5515,22 +5984,9 @@ def launch_flet_gui(
                 port=state.get("udp_port", UDP_DEFAULT_PORT),
             )
             mkt_col.set_custom_tickers([p.get("ticker", "") for p in state["portfolio"]])
-            portf_pkt, _ = mkt_col.compute_portfolio(state["portfolio"], state["portfolio_pnl_mode"])
-            state["ui_dirty"] = True
-            ev_pkt = {
-                "ui": get_ui_dict(),
-                "mkt": mkt_col.get_market_dict(),
-                "portf": portf_pkt,
-                "pomo": pomo_eng.get_payload(),
-                "media": media_col.get_cyd_payload(state["synced_cover_id"]),
-                "wth": wth_col.get_cyd_payload(),
-                "news": gems_eng.get_cyd_news_payload(include_queue=True, force=True),
-            }
-            if wifi_scan_col is not None:
-                ev_pkt["wrad"] = wifi_scan_col.get_cyd_payload()
-            if net_col is not None:
-                ev_pkt["neta"] = net_col.get_cyd_payload()
-            serial_mgr.send_event(ev_pkt, coalesce=True)
+            # Envio event-driven ultra-leve (< 80 B -> < 10 ms): resposta instantanea na CYD!
+            # Blocos auxiliares (mkt, portf, wrad, neta, sec, news) sao sincronizados pelo TelemetryDiffTracker.
+            serial_mgr.send_event({"ui": get_ui_dict()}, coalesce=True)
 
         def append_log(msg: str):
             ts = datetime.now().strftime("%H:%M:%S")
@@ -5556,6 +6012,7 @@ def launch_flet_gui(
             11: "Terminal CYD",
             12: "Radar Wi-Fi",
             13: "Rede & Roteador",
+            14: "Segurança & IDS",
         }
 
         def switch_tab(tab_idx: int):
@@ -5979,8 +6436,9 @@ def launch_flet_gui(
             (9, "🎵 Tela 9: Spotify & YT Music", "Capa 320x240 no SD + Overlay Translúcido Título/Artista", "ALBUM"),
             (10, "📰 Tela 10: Clima & News Feed", "Clima Regional (Votuporanga) + Manchetes Deslizantes (TFT_eSprite 15s)", "NEWSPAPER"),
             (11, "💻 Tela 11: Terminal Cyber Deck", "Console Verde Clássico c/ Scroll + ping, fetch, docker & Wi-Fi Scan", "TERMINAL"),
-            (12, "📡 Tela 12: Radar Wi-Fi RF", "ESP32-WROOM-32U Antena Externa • Canais 2.4 GHz & Top Redes Próximas", "RADAR"),
+            (12, "📡 Tela 12: Radar Wi-Fi & Fluxo", "ESP32-WROOM-32U • Fluxo Animado de Pacotes, Canais 2.4 GHz & BLE", "RADAR"),
             (13, "🌐 Tela 13: Rede & Roteador", "Gateway, Ping/Jitter, LAN ARP & Speedtest Fibra 700 Mbps", "ROUTER"),
+            (14, "🛡️ Tela 14: Segurança & IDS", "Logs/Erros do Sistema, Detecção de Invasão SSH/ARP/Portas & Alarme", "SECURITY"),
         ]
         screen_cards = []
 
@@ -8962,7 +9420,105 @@ def launch_flet_gui(
             padding=12,
         )
 
+        # ---------------- 14B. SEGURANCA, IDS & BLUETOOTH LONGO ALCANCE (TELA 14) --
+        lbl_sec_status = ft.Text(
+            "🛡️ IDS: inicializando monitoramento...",
+            size=11,
+            weight=ft.FontWeight.BOLD,
+            color="#22C55E",
+            font_family="Consolas",
+        )
+        lbl_sec_meta = ft.Text(
+            "AUTH:0 • ERR:0 • SCAN:0 • LAN+:0 • BLE: aguardando ESP32-32U",
+            size=10,
+            color="#94A3B8",
+            font_family="Consolas",
+        )
+        sec_logs_col = ft.Column(spacing=2, scroll=ft.ScrollMode.AUTO, height=110)
+
+        def refresh_security_ui():
+            if sec_col is None:
+                return
+            sn = sec_col.get_ui_snapshot()
+            lvl = int(sn.get("level", 0))
+            st_txt = sn.get("status", "SEGURO")
+            ico = "🚨" if lvl >= 2 else ("⚠️" if lvl == 1 else "🛡️")
+            lbl_sec_status.value = f"{ico} PERÍMETRO: {st_txt} | Últ. IP: {sn.get('last_ip', '---')} | Scan: {sn.get('last_scan_str', '--:--')}"
+            lbl_sec_status.color = "#EF4444" if lvl >= 2 else ("#F59E0B" if lvl == 1 else "#22C55E")
+            ble_st = "BLE OFF"
+            if wifi_scan_col is not None:
+                ws = wifi_scan_col.get_ui_snapshot()
+                ble_st = f"BLE {'CONECTADO' if ws.get('ble_connected') else 'ADV +9dBm'} ({ws.get('ble_name', 'CYD-RADAR-32U')})"
+            lbl_sec_meta.value = (
+                f"AUTH:{sn.get('auth_fails', 0)} • ERR:{sn.get('sys_errors', 0)} • "
+                f"SCAN:{sn.get('port_scans', 0)} • INTR:{sn.get('unknown_lan', 0)} • "
+                f"Portas:{sn.get('open_ports_count', 0)} • {ble_st}"
+            )
+            sec_logs_col.controls.clear()
+            for ev in (sn.get("events") or [])[:10]:
+                ev_col = "#EF4444" if ev.get("sev", 0) >= 2 else ("#FACC15" if ev.get("sev", 0) == 1 else "#CBD5E1")
+                sec_logs_col.controls.append(
+                    ft.Text(
+                        f"[{ev.get('hm', '--:--')}] {ev.get('cat', 'SYS'):<5} {ev.get('msg', '')}",
+                        size=10,
+                        color=ev_col,
+                        font_family="Consolas",
+                    )
+                )
+
+        def on_sec_ack(_e=None):
+            if sec_col is not None:
+                sec_col.ack_alerts()
+                ui_event_queue.put({"sec": sec_col.get_cyd_payload()})
+                refresh_security_ui()
+                append_log("🛡️ Alertas IDS reconhecidos • Status SEGURO")
+
+        def on_sec_trust(_e=None):
+            if sec_col is not None:
+                sec_col.trust_baseline()
+                refresh_security_ui()
+                append_log("🤝 Baseline LAN & Portas confiável atualizado")
+
+        def on_sec_sim(_e=None):
+            if sec_col is not None:
+                sec_col.simulate_intrusion()
+                ui_event_queue.put({"sec": sec_col.get_cyd_payload()})
+                refresh_security_ui()
+                append_log("🚨 Simulação de invasão disparada na CYD (Tela 14)!")
+
+        sec_security_ids = ft.Container(
+            content=ft.Column(
+                [
+                    ft.Row(
+                        [
+                            ft.Text("🛡️ MONITOR DE SEGURANÇA, IDS & BLUETOOTH 32U (TELA 14)", size=13, weight=ft.FontWeight.BOLD, color="#22C55E"),
+                            ft.Row(
+                                [
+                                    ft.OutlinedButton("✅ Reconhecer", on_click=on_sec_ack),
+                                    ft.OutlinedButton("🤝 Confiar LAN", on_click=on_sec_trust),
+                                    ft.OutlinedButton("🚨 Simular Invasão", on_click=on_sec_sim),
+                                    ft.OutlinedButton("📺 Exibir Tela 14", on_click=lambda e: on_select_screen(14)),
+                                ],
+                                spacing=6,
+                            ),
+                        ],
+                        alignment=ft.MainAxisAlignment.SPACE_BETWEEN,
+                    ),
+                    lbl_sec_status,
+                    lbl_sec_meta,
+                    sec_logs_col,
+                ],
+                spacing=6,
+            ),
+            bgcolor="#0B0F17",
+            border=border_all(1, "#22C55E44"),
+            border_radius=14,
+            padding=14,
+        )
+
         # ---------------- SERVIDOR WEB / REST API MOBILE (WI-FI) -------------
+        https_port_gui = [0]
+
         class MobileRequestHandler(http.server.BaseHTTPRequestHandler):
             def log_message(self, format, *args):
                 pass  # Mantem o terminal limpo
@@ -8999,7 +9555,9 @@ def launch_flet_gui(
                     "terminal": term_eng.get_snapshot() if term_eng else {},
                     "wifi_radar": wifi_scan_col.get_ui_snapshot() if wifi_scan_col else {},
                     "net_analyzer": net_col.get_ui_snapshot() if net_col else {},
+                    "security": sec_col.get_ui_snapshot() if sec_col else {},
                     "ai": ai_eng.get_status_snapshot(probe_local=False) if ai_eng else {},
+                    "https_port": https_port_gui[0],
                     "upload": upload_state,
                     "connected": True,
                 }
@@ -9010,6 +9568,16 @@ def launch_flet_gui(
 
                 if p in ("/", "/index.html"):
                     content = mobile_web.HTML_MOBILE_APP.encode("utf-8")
+                    self.send_response(200)
+                    self.send_header("Content-Type", "text/html; charset=utf-8")
+                    self.send_header("Content-Length", str(len(content)))
+                    self.send_header("Cache-Control", "no-cache")
+                    self._send_cors()
+                    self.end_headers()
+                    self.wfile.write(content)
+
+                elif p in ("/ble", "/ble.html"):
+                    content = _read_ble_monitor_html()
                     self.send_response(200)
                     self.send_header("Content-Type", "text/html; charset=utf-8")
                     self.send_header("Content-Length", str(len(content)))
@@ -9051,7 +9619,7 @@ def launch_flet_gui(
                     if val is not None:
                         try:
                             scr_idx = int(val)
-                            if 0 <= scr_idx <= 13:
+                            if 0 <= scr_idx <= 14:
                                 on_select_screen(scr_idx)
                                 append_log(f"📱 Smartphone selecionou Tela {scr_idx}")
                         except Exception:
@@ -9086,12 +9654,28 @@ def launch_flet_gui(
 
                 if p == "/api/screen":
                     scr = int(body.get("screen", state["screen"]))
-                    if 0 <= scr <= 13:
+                    if 0 <= scr <= 14:
                         on_select_screen(scr)
                         append_log(f"📱 Smartphone selecionou Tela {scr}")
                     else:
                         ok = False
-                        err_msg = "Tela inválida (0-13)"
+                        err_msg = "Tela inválida (0-14)"
+
+                elif p == "/api/security":
+                    act = str(body.get("action", "status")).lower()
+                    if sec_col is not None:
+                        if act == "ack":
+                            sec_col.ack_alerts()
+                            append_log("🛡️ Alertas IDS reconhecidos via Web/Mobile")
+                        elif act == "trust":
+                            sec_col.trust_baseline()
+                            append_log("🤝 Baseline de segurança (LAN/Portas) atualizado")
+                        elif act == "sim":
+                            sec_col.simulate_intrusion()
+                            append_log("🚨 Simulação de invasão disparada na Tela 14!")
+                        elif act == "scan":
+                            sec_col.force_scan()
+                        ui_event_queue.put({"sec": sec_col.get_cyd_payload()})
 
                 elif p == "/api/net_analyzer":
                     act = str(body.get("action", "refresh")).lower()
@@ -9378,6 +9962,52 @@ def launch_flet_gui(
         if mobile_server:
             threading.Thread(target=mobile_server.serve_forever, daemon=True).start()
 
+        # Servidor HTTPS opcional (:8443) para habilitar Web Bluetooth (ESP32-32U) direto no celular Android/iOS
+        cert_f, key_f = ensure_self_signed_ssl_cert()
+        if cert_f and key_f:
+            try:
+                https_srv = _MobileHTTPServer(("0.0.0.0", 8443), MobileRequestHandler)
+                ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+                ctx.load_cert_chain(certfile=cert_f, keyfile=key_f)
+                https_srv.socket = ctx.wrap_socket(https_srv.socket, server_side=True)
+                https_port_gui[0] = 8443
+                threading.Thread(target=https_srv.serve_forever, daemon=True, name="GuiMobileHTTPS").start()
+            except Exception:
+                pass
+
+        # Callback para comandos vindos do smartphone conectado via Bluetooth na ESP32-WROOM-32U
+        def _handle_ble_cmd_gui(ble_cmd: dict, src_ip: str = ""):
+            raw_c = str(ble_cmd.get("raw", "")).strip()
+            js = ble_cmd.get("json") if isinstance(ble_cmd.get("json"), dict) else {}
+            cmd_name = str(js.get("cmd", "")).lower().strip()
+            low_raw = raw_c.lower()
+            try:
+                if cmd_name == "screen" or low_raw.startswith("screen "):
+                    s_val = int(js.get("s", js.get("screen", low_raw.split()[-1])))
+                    if 0 <= s_val <= 14:
+                        on_select_screen(s_val)
+                        append_log(f"🔵 Mobile BLE selecionou Tela {s_val}")
+                elif cmd_name == "sec_ack" or low_raw == "sec_ack":
+                    on_sec_ack()
+                elif cmd_name == "sec_sim" or low_raw == "sec_sim":
+                    on_sec_sim()
+                elif cmd_name == "sec_trust" or low_raw == "sec_trust":
+                    on_sec_trust()
+                elif cmd_name == "speedtest" or low_raw == "speed":
+                    if net_col is not None:
+                        net_col.trigger_speedtest()
+                        append_log("🔵 Mobile BLE disparou Speedtest Fibra")
+                elif cmd_name == "brt" or low_raw.startswith("brt "):
+                    bv = max(0, min(255, int(js.get("v", low_raw.split()[-1]))))
+                    state["brt"] = bv
+                    persist_and_queue_ui()
+                    append_log(f"🔵 Mobile BLE ajustou brilho para {bv}")
+            except Exception as ex:
+                append_log(f"🔵 Erro comando BLE '{raw_c}': {ex}")
+
+        if wifi_scan_col is not None:
+            wifi_scan_col.set_ble_command_callback(_handle_ble_cmd_gui)
+
         lbl_mobile_title = ft.Text(
             "📱 CONTROLE REMOTO PELO CELULAR (WI-FI)",
             size=13,
@@ -9545,9 +10175,9 @@ def launch_flet_gui(
                 expand=True,
                 visible=False,
             ),
-            # Aba 7: Radar Wi-Fi RF (Tela 12) + Análise de Rede (Tela 13) + Agente IA + Wi-Fi UDP + Controle Remoto + Console
+            # Aba 7: Segurança/IDS (Tela 14) + Radar Wi-Fi RF (Tela 12) + Análise de Rede (Tela 13) + Agente IA + Wi-Fi UDP + Controle Remoto + Console
             ft.Column(
-                [sec_ai_analyst, sec_wifi_radar, sec_net_analyzer, sec_wifi_udp, sec_mobile_remote, sec_console],
+                [sec_security_ids, sec_ai_analyst, sec_wifi_radar, sec_net_analyzer, sec_wifi_udp, sec_mobile_remote, sec_console],
                 spacing=10,
                 scroll=ft.ScrollMode.AUTO,
                 expand=True,
@@ -9738,6 +10368,7 @@ def launch_flet_gui(
             elif act == 7:
                 refresh_wifi_radar_ui()
                 refresh_net_analyzer_ui()
+                refresh_security_ui()
                 txt_console.value = "\n".join(log_lines)
 
             safe_update(nav_rail, tabs_viewport)
@@ -9831,15 +10462,21 @@ def launch_flet_gui(
                 dirty_list.extend([lbl_udp_route_badge, lbl_udp_diag])
             safe_update(*dirty_list)
 
+        _last_ser_state_gui = [""]
+
         def on_serial_status_change(snap: dict):
             st_code = str(snap.get("state", "")).lower()
             port_str = snap.get("port", "")
-            if st_code == "connected":
-                state["ui_dirty"] = True
-                append_log(f"✅ SerialManager conectado em {port_str} ({snap.get('baud', BAUD)} bps — I/O Assíncrono)")
-                request_sd_files()
-            elif st_code in ("error", "disconnected"):
-                append_log(f"⚠️ Serial desconectada ({snap.get('last_error', 'erro I/O')}). Tentando reconectar...")
+            prev_st = _last_ser_state_gui[0]
+            _last_ser_state_gui[0] = st_code
+            if st_code != prev_st:
+                if st_code == "connected":
+                    diff_tracker.invalidate()
+                    state["ui_dirty"] = True
+                    append_log(f"✅ SerialManager conectado em {port_str} ({snap.get('baud', BAUD)} bps — I/O Assíncrono)")
+                    request_sd_files()
+                elif st_code in ("error", "disconnected"):
+                    append_log(f"⚠️ Serial desconectada ({snap.get('last_error', 'erro I/O')}). Tentando reconectar...")
             refresh_serial_indicators(snap)
 
         def on_serial_rx_line(raw: str):
@@ -9850,10 +10487,12 @@ def launch_flet_gui(
                     if state.get("active_tab") == 4:
                         refresh_terminal_ui()
                         safe_update(sec_cyber_terminal)
-            elif raw == "MONITOR_READY":
+            elif raw in ("MONITOR_READY", "SERIAL_CONNECTED"):
+                diff_tracker.invalidate()
                 state["ui_dirty"] = True
-                state["synced_cover_id"] = ""  # Reenvia capa atual após reboot da CYD
-                request_sd_files()
+                if raw == "MONITOR_READY":
+                    state["synced_cover_id"] = ""  # Reenvia capa atual após reboot da CYD
+                    request_sd_files()
             elif raw.startswith("SD_FILES:"):
                 try:
                     files = json.loads(raw.split("SD_FILES:", 1)[1])
@@ -10009,9 +10648,11 @@ def launch_flet_gui(
         def orchestrator_worker():
             """
             Worker leve de orquestração (sem qualquer I/O Serial bloqueante).
-            Consome snapshots em cache O(1) do Collector e alimenta o SerialManager assíncrono.
+            Consome snapshots em cache O(1) do Collector, aplica envio diferencial
+            (`TelemetryDiffTracker`) e alimenta o SerialManager ANTES de atualizar a UI Flet.
             """
-            last_telemetry_t = 0.0
+            last_telemetry_m = 0.0
+            last_gui_refresh_m = 0.0
             last_fired_alerts = {}
             last_dispatched_brt = -1
             last_storm_alert_state = False
@@ -10021,6 +10662,7 @@ def launch_flet_gui(
             while state["running"]:
                 try:
                     now = time.time()
+                    now_m = time.monotonic()
                     mkt_metrics = mkt_col.get_market_dict()
 
                     # Tick contínuo do Pomodoro mesmo se a CYD estiver desconectada
@@ -10061,8 +10703,8 @@ def launch_flet_gui(
                                 pending_cov_t0 = now + 8.0
                                 start_media_cover_transfer(cov_id, cov_bytes, manual=False)
 
-                    if now - last_telemetry_t >= cli_args.interval:
-                        last_telemetry_t = now
+                    if now_m - last_telemetry_m >= cli_args.interval:
+                        last_telemetry_m = now_m
                         # Coleta instantânea em O(1) do cache preparado pelo worker de background
                         sys_metrics = col.sample_sys()
 
@@ -10073,15 +10715,48 @@ def launch_flet_gui(
                                 "news": gems_eng.get_cyd_news_payload(include_queue=False, force=True),
                             })
 
-                        update_pc_telemetry_cards(sys_metrics, mkt_metrics)
-
                         wth_payload = wth_col.get_cyd_payload()
-                        payload = {
-                            "sys": sys_metrics,
+                        full_sync_req = bool(state["ui_dirty"])
+                        if full_sync_req:
+                            state["ui_dirty"] = False
+                            state["last_ui_sync"] = now
+
+                        optional_blocks = {
+                            "ui": get_ui_dict(),
                             "pomo": pomo_eng.get_payload(),
                             "media": media_col.get_cyd_payload(state["synced_cover_id"]),
                             "wth": wth_payload,
                         }
+
+                        # Blocos mais pesados coletados a cada >= 2.0s (mas enviados somente se mudaram!)
+                        if full_sync_req or (now_m - state["last_mkt_sync"] >= 2.0):
+                            state["last_mkt_sync"] = now_m
+                            if mkt_metrics.get("usd", 0) > 0 or mkt_metrics.get("btc", 0) > 0:
+                                optional_blocks["mkt"] = mkt_metrics
+                            optional_blocks["portf"] = mkt_col.compute_portfolio(
+                                state["portfolio"],
+                                state["portfolio_pnl_mode"],
+                            )[0]
+                            need_q = full_sync_req or diff_tracker.needs_news_queue()
+                            optional_blocks["news"] = gems_eng.get_cyd_news_payload(
+                                include_queue=need_q,
+                                force=need_q,
+                            )
+                            if need_q:
+                                diff_tracker.mark_news_queue_synced()
+                            if wifi_scan_col is not None:
+                                optional_blocks["wrad"] = wifi_scan_col.get_cyd_payload()
+                            if net_col is not None:
+                                optional_blocks["neta"] = net_col.get_cyd_payload()
+                            if sec_col is not None:
+                                optional_blocks["sec"] = sec_col.get_cyd_payload()
+
+                        payload = diff_tracker.build_delta(
+                            always_blocks={"sys": sys_metrics},
+                            optional_blocks=optional_blocks,
+                            force_all=full_sync_req,
+                            now_m=now_m,
+                        )
 
                         # Alerta físico automático quando aviso de tempestade entra em vigor
                         curr_storm = bool(wth_payload.get("alrt", False))
@@ -10096,35 +10771,34 @@ def launch_flet_gui(
                             payload["alrt"] = trig["alrt"]
                             append_log(f"🚨 ALERTA ATIVADO: {trig['rule_name']} ({trig['curr_val']:.1f} {trig['op']} {trig['target_val']:.1f}) -> Disparando Buzzer/LED na CYD!")
 
-                        if state["ui_dirty"] or (now - state["last_ui_sync"] >= 10.0):
-                            payload["ui"] = get_ui_dict()
-                            state["ui_dirty"] = False
-                            state["last_ui_sync"] = now
+                        # Alarme fisico imediato na CYD se IDS detectar tentativa de invasao
+                        if sec_col is not None:
+                            sec_al = sec_col.consume_pending_alarm()
+                            if sec_al:
+                                payload["alrt"] = sec_al["alrt"]
+                                payload["sec"] = sec_col.get_cyd_payload()
+                                append_log(f"🚨 ALARME IDS CYD: {sec_al['msg']}")
 
-                        if (now - state["last_mkt_sync"] >= 2.0) or ("ui" in payload):
-                            if mkt_metrics.get("usd", 0) > 0 or mkt_metrics.get("btc", 0) > 0:
-                                payload["mkt"] = mkt_metrics
-                                state["last_mkt_sync"] = now
-                            payload["portf"] = mkt_col.compute_portfolio(
-                                state["portfolio"],
-                                state["portfolio_pnl_mode"],
-                            )[0]
-                            payload["news"] = gems_eng.get_cyd_news_payload(
-                                include_queue=("ui" in payload),
-                                force=("ui" in payload),
-                            )
-                            if wifi_scan_col is not None:
-                                payload["wrad"] = wifi_scan_col.get_cyd_payload()
-                            if net_col is not None:
-                                payload["neta"] = net_col.get_cyd_payload()
-
-                        # Envia de forma 100% não-bloqueante para o SerialManager (substitui amostra obsoleta se ocupada)
+                        # PRIORIDADE MAXIMA: despacha telemetria para a CYD ANTES de atualizar a UI Flet!
                         serial_mgr.send_telemetry(payload)
+
+                        # Envia snapshot em tempo real para a ESP32-WROOM-32U transmitir via Bluetooth Longo Alcance
+                        if wifi_scan_col is not None:
+                            ble_int = 1.2 if wifi_scan_col.is_ble_connected() else 4.5
+                            if (now - state.get("last_ble_push", 0.0)) >= ble_int:
+                                state["last_ble_push"] = now
+                                ble_snap = build_ble_live_snapshot(state, sys_metrics, mkt_metrics, net_col, sec_col, wifi_scan_col)
+                                wifi_scan_col.push_ble_snapshot(ble_snap)
+
+                        # Atualiza cartoes Flet no maximo a 1 Hz (mantem CPU desktop baixa mesmo com CYD a 2 Hz)
+                        if now_m - last_gui_refresh_m >= 1.0:
+                            last_gui_refresh_m = now_m
+                            update_pc_telemetry_cards(sys_metrics, mkt_metrics)
 
                 except Exception as ex:
                     append_log(f"Erro no orquestrador: {ex}")
 
-                time.sleep(0.10)
+                time.sleep(0.08)
 
             serial_mgr.stop()
 
@@ -10149,12 +10823,13 @@ def run_headless_daemon(
     wifi_scan_col: wifi_scanner.WiFiScannerCollector = None,
     net_col: net_analyzer.NetworkAnalyzerCollector = None,
     ai_eng: ai_analyst.NetworkAIAnalyst = None,
+    sec_col: security_monitor.SecurityMonitorCollector = None,
 ):
     """Executa o agente CYD em segundo plano puro (sem janela Flet), ideal para systemd --user."""
     import signal
 
     if term_eng is None:
-        term_eng = CyberDeckTerminalEngine(collector=col, wifi_scan_col=wifi_scan_col, net_col=net_col, ai_eng=ai_eng)
+        term_eng = CyberDeckTerminalEngine(collector=col, wifi_scan_col=wifi_scan_col, net_col=net_col, ai_eng=ai_eng, sec_col=sec_col)
     else:
         if term_eng.collector is None:
             term_eng.collector = col
@@ -10164,6 +10839,8 @@ def run_headless_daemon(
             term_eng.net_col = net_col
         if term_eng.ai_eng is None and ai_eng is not None:
             term_eng.ai_eng = ai_eng
+        if getattr(term_eng, "sec_col", None) is None and sec_col is not None:
+            term_eng.sec_col = sec_col
 
     cfg = load_ui_config()
     state = {
@@ -10226,11 +10903,14 @@ def run_headless_daemon(
         excluded_ports_fn=(wifi_scan_col.get_active_ports if wifi_scan_col is not None else None),
         on_log=log_h,
     )
+    diff_tracker_hl = TelemetryDiffTracker()
     if wifi_scan_col is not None:
         wifi_scan_col.set_excluded_ports_fn(serial_mgr.get_active_ports)
         wifi_scan_col.set_log_callback(log_h)
     if net_col is not None:
         net_col.set_log_callback(log_h)
+    if sec_col is not None:
+        sec_col.set_log_callback(log_h)
     if ai_eng is not None:
         ai_eng.set_log_callback(log_h)
     ui_event_queue = serial_mgr.event_queue
@@ -10291,22 +10971,7 @@ def run_headless_daemon(
             port=state.get("udp_port", UDP_DEFAULT_PORT),
         )
         mkt_col.set_custom_tickers([p.get("ticker", "") for p in state["portfolio"]])
-        portf_pkt, _ = mkt_col.compute_portfolio(state["portfolio"], state["portfolio_pnl_mode"])
-        state["ui_dirty"] = True
-        ev_pkt = {
-            "ui": get_ui_dict(),
-            "mkt": mkt_col.get_market_dict(),
-            "portf": portf_pkt,
-            "pomo": pomo_eng.get_payload(),
-            "media": media_col.get_cyd_payload(state["synced_cover_id"]),
-            "wth": wth_col.get_cyd_payload(),
-            "news": gems_eng.get_cyd_news_payload(include_queue=True, force=True),
-        }
-        if wifi_scan_col is not None:
-            ev_pkt["wrad"] = wifi_scan_col.get_cyd_payload()
-        if net_col is not None:
-            ev_pkt["neta"] = net_col.get_cyd_payload()
-        serial_mgr.send_event(ev_pkt, coalesce=True)
+        serial_mgr.send_event({"ui": get_ui_dict()}, coalesce=True)
 
     def request_sd_files():
         ui_event_queue.put({"cmd": "list_sd"})
@@ -10415,10 +11080,17 @@ def run_headless_daemon(
 
         threading.Thread(target=_cov_worker, daemon=True).start()
 
+    _last_ser_state_hl = [""]
+
     def on_serial_status_change(snap: dict):
         st_code = str(snap.get("state", "")).lower()
         port_str = snap.get("port", "")
+        prev_st = _last_ser_state_hl[0]
+        _last_ser_state_hl[0] = st_code
+        if st_code == prev_st:
+            return
         if st_code == "connected":
+            diff_tracker_hl.invalidate()
             state["ui_dirty"] = True
             log_h(f"SerialManager conectado em {port_str} ({snap.get('baud', BAUD)} bps)")
             request_sd_files()
@@ -10430,10 +11102,12 @@ def run_headless_daemon(
             t_line = raw.split("TERM_LOG:", 1)[1].strip()
             if t_line:
                 term_eng.append_line(t_line)
-        elif raw == "MONITOR_READY":
+        elif raw in ("MONITOR_READY", "SERIAL_CONNECTED"):
+            diff_tracker_hl.invalidate()
             state["ui_dirty"] = True
-            state["synced_cover_id"] = ""
-            request_sd_files()
+            if raw == "MONITOR_READY":
+                state["synced_cover_id"] = ""
+                request_sd_files()
         elif raw.startswith("SD_FILES:"):
             try:
                 files = json.loads(raw.split("SD_FILES:", 1)[1])
@@ -10450,6 +11124,8 @@ def run_headless_daemon(
             log_h(f"Cartão MicroSD montado ({raw}).")
 
     serial_mgr.set_callbacks(on_rx_line=on_serial_rx_line, on_status_change=on_serial_status_change)
+
+    https_port_hl = [0]
 
     class HeadlessMobileHandler(http.server.BaseHTTPRequestHandler):
         def log_message(self, format, *args):
@@ -10487,7 +11163,9 @@ def run_headless_daemon(
                 "terminal": term_eng.get_snapshot() if term_eng else {},
                 "wifi_radar": wifi_scan_col.get_ui_snapshot() if wifi_scan_col else {},
                 "net_analyzer": net_col.get_ui_snapshot() if net_col else {},
+                "security": sec_col.get_ui_snapshot() if sec_col else {},
                 "ai": ai_eng.get_status_snapshot(probe_local=False) if ai_eng else {},
+                "https_port": https_port_hl[0],
                 "upload": upload_state,
                 "connected": True,
             }
@@ -10497,6 +11175,15 @@ def run_headless_daemon(
             p = parsed.path
             if p in ("/", "/index.html"):
                 content = mobile_web.HTML_MOBILE_APP.encode("utf-8")
+                self.send_response(200)
+                self.send_header("Content-Type", "text/html; charset=utf-8")
+                self.send_header("Content-Length", str(len(content)))
+                self.send_header("Cache-Control", "no-cache")
+                self._send_cors()
+                self.end_headers()
+                self.wfile.write(content)
+            elif p in ("/ble", "/ble.html"):
+                content = _read_ble_monitor_html()
                 self.send_response(200)
                 self.send_header("Content-Type", "text/html; charset=utf-8")
                 self.send_header("Content-Length", str(len(content)))
@@ -10533,7 +11220,7 @@ def run_headless_daemon(
                 if val is not None:
                     try:
                         scr_idx = int(val)
-                        if 0 <= scr_idx <= 13:
+                        if 0 <= scr_idx <= 14:
                             state["screen"] = scr_idx
                             persist_and_queue_ui()
                     except Exception:
@@ -10565,11 +11252,26 @@ def run_headless_daemon(
             err_msg = ""
             if p == "/api/screen":
                 scr = int(body.get("screen", state["screen"]))
-                if 0 <= scr <= 13:
+                if 0 <= scr <= 14:
                     state["screen"] = scr
                     persist_and_queue_ui()
                 else:
-                    ok, err_msg = False, "Tela inválida (0-13)"
+                    ok, err_msg = False, "Tela inválida (0-14)"
+            elif p == "/api/security":
+                act = str(body.get("action", "status")).lower()
+                if sec_col is not None:
+                    if act == "ack":
+                        sec_col.ack_alerts()
+                        log_h("Alertas IDS reconhecidos via API/CLI")
+                    elif act == "trust":
+                        sec_col.trust_baseline()
+                        log_h("Baseline de seguranca LAN/Portas atualizado")
+                    elif act == "sim":
+                        sec_col.simulate_intrusion()
+                        log_h("Simulacao de invasao disparada na Tela 14!")
+                    elif act == "scan":
+                        sec_col.force_scan()
+                    ui_event_queue.put({"sec": sec_col.get_cyd_payload()})
             elif p == "/api/net_analyzer":
                 act = str(body.get("action", "refresh")).lower()
                 if net_col is not None:
@@ -10832,6 +11534,62 @@ def run_headless_daemon(
         threading.Thread(target=mobile_server.serve_forever, daemon=True, name="HeadlessMobileHTTP").start()
         log_h(f"Painel Web/Mobile ativo em http://{get_local_lan_ip()}:{mobile_port} (http://127.0.0.1:{mobile_port})")
 
+    # Espelho HTTPS (:8443) para Web Bluetooth (ESP32-32U) direto no celular
+    https_server_hl = None
+    cert_f, key_f = ensure_self_signed_ssl_cert()
+    if cert_f and key_f:
+        try:
+            https_server_hl = _HeadlessHTTPServer(("0.0.0.0", 8443), HeadlessMobileHandler)
+            ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+            ctx.load_cert_chain(certfile=cert_f, keyfile=key_f)
+            https_server_hl.socket = ctx.wrap_socket(https_server_hl.socket, server_side=True)
+            https_port_hl[0] = 8443
+            threading.Thread(target=https_server_hl.serve_forever, daemon=True, name="HeadlessMobileHTTPS").start()
+            log_h(f"Painel HTTPS (Web Bluetooth BLE) ativo em https://{get_local_lan_ip()}:8443/ble")
+        except Exception as ex:
+            log_h(f"Aviso HTTPS :8443 indisponivel: {ex}")
+
+    def _handle_ble_cmd_hl(ble_cmd: dict, src_ip: str = ""):
+        raw_c = str(ble_cmd.get("raw", "")).strip()
+        js = ble_cmd.get("json") if isinstance(ble_cmd.get("json"), dict) else {}
+        cmd_name = str(js.get("cmd", "")).lower().strip()
+        low_raw = raw_c.lower()
+        try:
+            if cmd_name == "screen" or low_raw.startswith("screen "):
+                s_val = int(js.get("s", js.get("screen", low_raw.split()[-1])))
+                if 0 <= s_val <= 14:
+                    state["screen"] = s_val
+                    persist_and_queue_ui()
+                    log_h(f"[BLE] Mobile selecionou Tela {s_val}")
+            elif cmd_name == "sec_ack" or low_raw == "sec_ack":
+                if sec_col is not None:
+                    sec_col.ack_alerts()
+                    ui_event_queue.put({"sec": sec_col.get_cyd_payload()})
+                    log_h("[BLE] Mobile reconheceu alertas IDS")
+            elif cmd_name == "sec_sim" or low_raw == "sec_sim":
+                if sec_col is not None:
+                    sec_col.simulate_intrusion()
+                    ui_event_queue.put({"sec": sec_col.get_cyd_payload()})
+                    log_h("[BLE] Mobile disparou simulacao de invasao")
+            elif cmd_name == "sec_trust" or low_raw == "sec_trust":
+                if sec_col is not None:
+                    sec_col.trust_baseline()
+                    log_h("[BLE] Mobile atualizou baseline LAN")
+            elif cmd_name == "speedtest" or low_raw == "speed":
+                if net_col is not None:
+                    net_col.trigger_speedtest()
+                    log_h("[BLE] Mobile disparou Speedtest Fibra")
+            elif cmd_name == "brt" or low_raw.startswith("brt "):
+                bv = max(0, min(255, int(js.get("v", low_raw.split()[-1]))))
+                state["brt"] = bv
+                persist_and_queue_ui()
+                log_h(f"[BLE] Mobile ajustou brilho para {bv}")
+        except Exception as ex:
+            log_h(f"[BLE] Erro comando '{raw_c}': {ex}")
+
+    if wifi_scan_col is not None:
+        wifi_scan_col.set_ble_command_callback(_handle_ble_cmd_hl)
+
     def _handle_stop(signum, _frame):
         log_h(f"Sinal {signum} recebido. Encerrando agente CYD headless...")
         state["running"] = False
@@ -10840,7 +11598,7 @@ def run_headless_daemon(
     signal.signal(signal.SIGINT, _handle_stop)
 
     log_h("CYD Cyber Deck iniciado em modo HEADLESS (segundo plano).")
-    last_telemetry_t = 0.0
+    last_telemetry_m = 0.0
     last_fired_alerts = {}
     last_dispatched_brt = -1
     last_storm_alert_state = False
@@ -10851,6 +11609,7 @@ def run_headless_daemon(
         while state["running"]:
             try:
                 now = time.time()
+                now_m = time.monotonic()
                 mkt_metrics = mkt_col.get_market_dict()
 
                 pomo_done_ev = pomo_eng.tick()
@@ -10877,8 +11636,8 @@ def run_headless_daemon(
                             pending_cov_t0 = now + 8.0
                             start_media_cover_transfer(cov_id, cov_bytes)
 
-                if now - last_telemetry_t >= cli_args.interval:
-                    last_telemetry_t = now
+                if now_m - last_telemetry_m >= cli_args.interval:
+                    last_telemetry_m = now_m
                     sys_metrics = col.sample_sys()
 
                     rotated_news = gems_eng.tick_scheduler()
@@ -10888,12 +11647,46 @@ def run_headless_daemon(
                         })
 
                     wth_payload = wth_col.get_cyd_payload()
-                    payload = {
-                        "sys": sys_metrics,
+                    full_sync_req = bool(state["ui_dirty"])
+                    if full_sync_req:
+                        state["ui_dirty"] = False
+                        state["last_ui_sync"] = now
+
+                    optional_blocks = {
+                        "ui": get_ui_dict(),
                         "pomo": pomo_eng.get_payload(),
                         "media": media_col.get_cyd_payload(state["synced_cover_id"]),
                         "wth": wth_payload,
                     }
+
+                    if full_sync_req or (now_m - state["last_mkt_sync"] >= 2.0):
+                        state["last_mkt_sync"] = now_m
+                        if mkt_metrics.get("usd", 0) > 0 or mkt_metrics.get("btc", 0) > 0:
+                            optional_blocks["mkt"] = mkt_metrics
+                        optional_blocks["portf"] = mkt_col.compute_portfolio(
+                            state["portfolio"],
+                            state["portfolio_pnl_mode"],
+                        )[0]
+                        need_q = full_sync_req or diff_tracker_hl.needs_news_queue()
+                        optional_blocks["news"] = gems_eng.get_cyd_news_payload(
+                            include_queue=need_q,
+                            force=need_q,
+                        )
+                        if need_q:
+                            diff_tracker_hl.mark_news_queue_synced()
+                        if wifi_scan_col is not None:
+                            optional_blocks["wrad"] = wifi_scan_col.get_cyd_payload()
+                        if net_col is not None:
+                            optional_blocks["neta"] = net_col.get_cyd_payload()
+                        if sec_col is not None:
+                            optional_blocks["sec"] = sec_col.get_cyd_payload()
+
+                    payload = diff_tracker_hl.build_delta(
+                        always_blocks={"sys": sys_metrics},
+                        optional_blocks=optional_blocks,
+                        force_all=full_sync_req,
+                        now_m=now_m,
+                    )
 
                     curr_storm = bool(wth_payload.get("alrt", False))
                     if curr_storm and not last_storm_alert_state:
@@ -10905,32 +11698,24 @@ def run_headless_daemon(
                         payload["alrt"] = trig["alrt"]
                         log_h(f"ALERTA: {trig['rule_name']} ({trig['curr_val']:.1f} {trig['op']} {trig['target_val']:.1f})")
 
-                    if state["ui_dirty"] or (now - state["last_ui_sync"] >= 10.0):
-                        payload["ui"] = get_ui_dict()
-                        state["ui_dirty"] = False
-                        state["last_ui_sync"] = now
-
-                    if (now - state["last_mkt_sync"] >= 2.0) or ("ui" in payload):
-                        if mkt_metrics.get("usd", 0) > 0 or mkt_metrics.get("btc", 0) > 0:
-                            payload["mkt"] = mkt_metrics
-                            state["last_mkt_sync"] = now
-                        payload["portf"] = mkt_col.compute_portfolio(
-                            state["portfolio"],
-                            state["portfolio_pnl_mode"],
-                        )[0]
-                        payload["news"] = gems_eng.get_cyd_news_payload(
-                            include_queue=("ui" in payload),
-                            force=("ui" in payload),
-                        )
-                        if wifi_scan_col is not None:
-                            payload["wrad"] = wifi_scan_col.get_cyd_payload()
-                        if net_col is not None:
-                            payload["neta"] = net_col.get_cyd_payload()
+                    if sec_col is not None:
+                        sec_al = sec_col.consume_pending_alarm()
+                        if sec_al:
+                            payload["alrt"] = sec_al["alrt"]
+                            payload["sec"] = sec_col.get_cyd_payload()
+                            log_h(f"ALARME IDS CYD: {sec_al['msg']}")
 
                     serial_mgr.send_telemetry(payload)
+
+                    if wifi_scan_col is not None:
+                        ble_int = 1.2 if wifi_scan_col.is_ble_connected() else 4.5
+                        if (now - state.get("last_ble_push", 0.0)) >= ble_int:
+                            state["last_ble_push"] = now
+                            ble_snap = build_ble_live_snapshot(state, sys_metrics, mkt_metrics, net_col, sec_col, wifi_scan_col)
+                            wifi_scan_col.push_ble_snapshot(ble_snap)
             except Exception as ex:
                 log_h(f"Erro no loop headless: {ex}")
-            time.sleep(0.10)
+            time.sleep(0.08)
     finally:
         serial_mgr.stop()
         if wifi_scan_col is not None:
@@ -10943,6 +11728,11 @@ def run_headless_daemon(
                 net_col.stop()
             except Exception:
                 pass
+        if sec_col is not None:
+            try:
+                sec_col.stop()
+            except Exception:
+                pass
         try:
             col.stop()
         except Exception:
@@ -10950,6 +11740,11 @@ def run_headless_daemon(
         if mobile_server:
             try:
                 mobile_server.shutdown()
+            except Exception:
+                pass
+        if https_server_hl:
+            try:
+                https_server_hl.shutdown()
             except Exception:
                 pass
         log_h("Agente CYD headless encerrado.")
@@ -10967,7 +11762,7 @@ def main():
     args = ap.parse_args()
 
     cfg = load_ui_config()
-    col = Collector(game_processes=args.game_proc)
+    col = Collector(game_processes=args.game_proc, poll_interval=min(0.5, max(0.25, float(args.interval))))
     mkt_col = MarketCollector(crypto_interval=3.0, stock_interval=12.0)
     media_col = MediaCollector(source_pref=cfg.get("media_source_pref", "auto"))
     pomo_eng = PomodoroEngine(
@@ -10991,6 +11786,12 @@ def main():
     net_col = net_analyzer.NetworkAnalyzerCollector(
         plan_mbps=int(cfg.get("net_plan_mbps", 700) or 700),
         scanner_ip_fn=lambda: wifi_scan_col.get_ui_snapshot().get("scanner_ip", ""),
+        auto_start=not (args.stdout or args.once),
+    )
+    sec_col = security_monitor.SecurityMonitorCollector(
+        net_col=net_col,
+        wifi_scan_col=wifi_scan_col,
+        poll_interval_s=4.0,
         auto_start=not (args.stdout or args.once),
     )
     def _persist_ai_cfg(delta: dict):
@@ -11017,6 +11818,7 @@ def main():
         wifi_scan_col=wifi_scan_col,
         net_col=net_col,
         ai_eng=ai_eng,
+        sec_col=sec_col,
     )
     time.sleep(0.55)
 
@@ -11056,10 +11858,10 @@ def main():
             time.sleep(args.interval)
 
     if args.headless:
-        run_headless_daemon(col, mkt_col, media_col, pomo_eng, wth_col, news_col, args, term_eng=term_eng, wifi_scan_col=wifi_scan_col, net_col=net_col, ai_eng=ai_eng)
+        run_headless_daemon(col, mkt_col, media_col, pomo_eng, wth_col, news_col, args, term_eng=term_eng, wifi_scan_col=wifi_scan_col, net_col=net_col, ai_eng=ai_eng, sec_col=sec_col)
         return
 
-    launch_flet_gui(col, mkt_col, media_col, pomo_eng, wth_col, news_col, args, term_eng=term_eng, wifi_scan_col=wifi_scan_col, net_col=net_col, ai_eng=ai_eng)
+    launch_flet_gui(col, mkt_col, media_col, pomo_eng, wth_col, news_col, args, term_eng=term_eng, wifi_scan_col=wifi_scan_col, net_col=net_col, ai_eng=ai_eng, sec_col=sec_col)
 
 
 if __name__ == "__main__":

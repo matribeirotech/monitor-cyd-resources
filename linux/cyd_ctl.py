@@ -54,8 +54,9 @@ SCREENS = [
     (9,  "Spotify & YT Music",  ("media", "midia", "spotify", "music")),
     (10, "Clima & News Feed",   ("news", "clima", "weather", "noticias")),
     (11, "Terminal CYD",        ("term", "terminal", "shell", "cmd")),
-    (12, "Radar Wi-Fi RF",      ("radar", "wifi", "rf", "scan")),
+    (12, "Radar Wi-Fi & Fluxo", ("radar", "wifi", "rf", "scan", "fluxo")),
     (13, "Rede & Roteador",     ("net", "rede", "router", "roteador", "vivo", "speed")),
+    (14, "Seguranca & IDS",     ("sec", "seg", "ids", "security", "logs", "invasao")),
 ]
 
 SCREEN_COUNT = len(SCREENS)
@@ -138,9 +139,18 @@ def cmd_status(_args):
     )
     if wrad:
         st_w = "ONLINE" if wrad.get("online") else "OFFLINE"
+        ble_s = f"BLE:ON({wrad.get('ble_clients', 0)})" if wrad.get("ble_connected") else f"BLE:ADV(+{wrad.get('ble_pwr_dbm', 9)}dBm)"
         print(
-            f"Radar Wi-Fi: {st_w} ({wrad.get('port', '--')}) | {wrad.get('total', 0)} APs | "
+            f"Radar Wi-Fi: {st_w} ({wrad.get('port', '--')}) | {ble_s} | {wrad.get('total', 0)} APs | "
             f"Melhor: {wrad.get('best_rssi', 0)} dBm | Livre: CH{wrad.get('free_ch', 1)} | Cheio: CH{wrad.get('busiest_ch', 0)}"
+        )
+    sec = st.get("security", {})
+    if sec:
+        print(
+            f"Seguranca  : {sec.get('status', 'SEGURO')} (LVL {sec.get('level', 0)}) | "
+            f"AUTH:{sec.get('auth_fails', 0)} ERR:{sec.get('sys_errors', 0)} "
+            f"SCAN:{sec.get('port_scans', 0)} INTR:{sec.get('unknown_lan', 0)} | "
+            f"Portas:{sec.get('open_ports_count', 0)} | Ult IP: {sec.get('last_ip', '---')}"
         )
     if neta:
         spd = neta.get("speedtest", {})
@@ -406,6 +416,56 @@ def cmd_ai(args):
     print(res.get("markdown") or "\n".join(res.get("cyd_lines", [])))
 
 
+def cmd_sec(args):
+    act = (args.sec_action or "status").lower().strip()
+    if act in ("ack", "clear", "ok"):
+        api_post("/api/security", {"action": "ack"})
+        print("Alertas IDS reconhecidos • Status retornado para SEGURO.")
+        return
+    if act in ("trust", "baseline"):
+        api_post("/api/security", {"action": "trust"})
+        print("Baseline de seguranca (LAN MACs e portas LISTEN) atualizado.")
+        return
+    if act in ("sim", "test", "invasao"):
+        if not args.no_switch:
+            api_post("/api/screen", {"screen": 14})
+        api_post("/api/security", {"action": "sim"})
+        print("Simulacao de invasao disparada na Tela 14 da CYD (Buzzer + LED vermelho)!")
+        return
+    if act == "scan":
+        api_post("/api/security", {"action": "scan"})
+        time.sleep(1.0)
+    st = api_get("/api/status")
+    sc = st.get("security", {})
+    print(f"CYD Seguranca & IDS (Tela 14) — Status: {sc.get('status', 'SEGURO')} (Nivel {sc.get('level', 0)})")
+    print(
+        f"  Contadores : AUTH={sc.get('auth_fails', 0)} | ERR={sc.get('sys_errors', 0)} | "
+        f"SCAN={sc.get('port_scans', 0)} | INTR={sc.get('unknown_lan', 0)} | "
+        f"ARP_SPOOF={'SIM!' if sc.get('arp_spoof') else 'NAO'}"
+    )
+    print(
+        f"  Rede Local : {sc.get('open_ports_count', 0)} portas LISTEN | "
+        f"{sc.get('ext_conns_count', 0)} conexoes externas | Ult IP suspeito: {sc.get('last_ip', '---')}"
+    )
+    print("-" * 72)
+    for ev in (sc.get("events") or [])[:12]:
+        tag = "CRIT" if ev.get("sev", 0) >= 2 else ("WARN" if ev.get("sev", 0) == 1 else "INFO")
+        print(f"  [{tag}] {ev.get('ts', ev.get('hm', '--:--'))}  {ev.get('cat', ''):<6} {ev.get('msg', '')}")
+
+
+def cmd_ble(_args):
+    st = api_get("/api/status")
+    wr = st.get("wifi_radar", {})
+    hp = st.get("https_port", 8443)
+    print("ESP32-WROOM-32U Bluetooth Longo Alcance (+9 dBm • Antena Externa)")
+    print(f"  Dispositivo : {wr.get('ble_name', 'CYD-RADAR-32U')} | Potencia: +{wr.get('ble_pwr_dbm', 9)} dBm")
+    print(f"  Status BLE  : {'CONECTADO' if wr.get('ble_connected') else 'ADVERTISING'} ({wr.get('ble_clients', 0)} cliente(s))")
+    print(f"  Bridge 32U  : {'ONLINE' if wr.get('online') else 'OFFLINE'} ({wr.get('scanner_ip') or wr.get('port', '--')})")
+    print(f"  UUID NUS    : 6e400001-b5a3-f393-e0a9-e50e24dcca9e")
+    if hp:
+        print(f"  Web BLE URL : https://<IP_DO_PC>:{hp}/ble")
+
+
 def main():
     # Atalho super pratico: `cyd 12`, `cyd 13`, `cyd diag`
     if len(sys.argv) == 2 and (sys.argv[1].isdigit() or sys.argv[1].lower() in ("next", "prev", "list", "status", "lan", "diag")):
@@ -426,8 +486,14 @@ def main():
     ap = argparse.ArgumentParser(prog="cyd", description="CLI Linux do CYD Cyber Deck (troca de telas, Radar Wi-Fi RF, Terminal e Analise de Rede)")
     sub = ap.add_subparsers(dest="command")
 
-    p_scr = sub.add_parser("screen", aliases=["s"], help="Muda a tela da CYD (numero 0..13 ou apelido)")
-    p_scr.add_argument("target", help="Numero (0..13) ou nome (ex: radar, net, gpu, term, market)")
+    p_scr = sub.add_parser("screen", aliases=["s"], help="Muda a tela da CYD (numero 0..14 ou apelido)")
+    p_scr.add_argument("target", help="Numero (0..14) ou nome (ex: sec, radar, net, gpu, term, market)")
+
+    p_sec = sub.add_parser("sec", aliases=["ids", "seg"], help="Monitor de Seguranca, IDS & Logs (Tela 14): status|ack|trust|sim|scan")
+    p_sec.add_argument("sec_action", nargs="?", default="status", help="status | ack | trust | sim | scan")
+    p_sec.add_argument("--no-switch", action="store_true", help="Nao troca a CYD para Tela 14 ao simular")
+
+    sub.add_parser("ble", aliases=["bt"], help="Mostra status do Bluetooth Longo Alcance na ESP32-WROOM-32U")
 
     sub.add_parser("next", aliases=["n"], help="Avanca para a proxima tela")
     sub.add_parser("prev", aliases=["p"], help="Volta para a tela anterior")
@@ -486,6 +552,10 @@ def main():
 
     if c in ("screen", "s"):
         cmd_screen(args.target)
+    elif c in ("sec", "ids", "seg"):
+        cmd_sec(args)
+    elif c in ("ble", "bt"):
+        cmd_ble(args)
     elif c in ("next", "n"):
         cmd_step(1)
     elif c in ("prev", "p"):
